@@ -16,6 +16,7 @@ import (
 
 	"github.com/hyj28/unring/internal/ghshim"
 	"github.com/hyj28/unring/internal/httpsproxy"
+	"github.com/hyj28/unring/internal/localrollback"
 	"github.com/hyj28/unring/internal/pgproxy"
 )
 
@@ -54,21 +55,23 @@ type Unintercepted struct {
 
 // Record is the structured, per-session audit document.
 type Record struct {
-	Version       int                `json:"version"`
-	ID            string             `json:"id"`
-	StartedAt     time.Time          `json:"started_at"`
-	EndedAt       time.Time          `json:"ended_at,omitempty"`
-	Command       []string           `json:"command"`
-	Decision      string             `json:"decision"`
-	Outcome       string             `json:"outcome"`
-	ExitCode      int                `json:"exit_code"`
-	Error         string             `json:"error,omitempty"`
-	Postgres      pgproxy.Summary    `json:"postgres"`
-	HTTPS         httpsproxy.Summary `json:"https"`
-	GH            ghshim.Summary     `json:"gh"`
-	Approvals     []Approval         `json:"irreversible_actions"`
-	Unintercepted []Unintercepted    `json:"unintercepted"`
-	BlindSpots    []string           `json:"structural_blind_spots"`
+	Version       int                   `json:"version"`
+	ID            string                `json:"id"`
+	StartedAt     time.Time             `json:"started_at"`
+	EndedAt       time.Time             `json:"ended_at,omitempty"`
+	Command       []string              `json:"command"`
+	Decision      string                `json:"decision"`
+	Outcome       string                `json:"outcome"`
+	ExitCode      int                   `json:"exit_code"`
+	Error         string                `json:"error,omitempty"`
+	Postgres      pgproxy.Summary       `json:"postgres"`
+	HTTPS         httpsproxy.Summary    `json:"https"`
+	GH            ghshim.Summary        `json:"gh"`
+	Outbound      bool                  `json:"outbound_enabled"`
+	Files         localrollback.Summary `json:"files"`
+	Approvals     []Approval            `json:"irreversible_actions"`
+	Unintercepted []Unintercepted       `json:"unintercepted"`
+	BlindSpots    []string              `json:"structural_blind_spots"`
 }
 
 // Store owns the on-disk audit log beneath unring's per-user state directory.

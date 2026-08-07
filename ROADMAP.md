@@ -98,11 +98,22 @@ The zero-compromise demo. Validated in the brief as V1/V2; build it first.
 - [x] M8.1 Undo actions declared per adapter, executed on discard
 - [x] M8.2 Slack `chat.delete`; document precisely what GitHub cannot undo
 
+## M9 — Local file rollback
+
+- [x] M9.1 Snapshot the project and narrow high-risk paths before the child starts,
+      using APFS clones with an explicit per-entry/full-copy fallback
+- [x] M9.2 Record created, modified, and deleted files with `ctime` in the scan oracle;
+      report every path that could not be captured
+- [x] M9.3 `unring restore` lists and restores individual paths, refuses post-session
+      conflicts by default, and writes the snapshot version alongside
+- [x] M9.4 Cap retained snapshot space and evict oldest sessions; expose current usage
+- [x] M9.5 Make HTTPS adapters and the `gh` shim opt-in with `--outbound`
+
 ---
 
 ## Explicitly out of scope for v1
 
-Filesystem copy-on-write (git already solves it) · MySQL · teams, approval flows,
+FSEvents acceleration · lazy database `BEGIN` · MySQL · teams, approval flows,
 multi-user · multi-agent concurrency control · web UI.
 
 ## Open questions

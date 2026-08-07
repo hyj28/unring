@@ -11,9 +11,322 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hyj28/unring/internal/httpsproxy"
 )
+
+func TestFileChangesAreRecordedListedAndRestoredIndividually(t *testing.T) {
+	stateDir := t.TempDir()
+	watched := t.TempDir()
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+
+	writeTestFile(t, filepath.Join(watched, "modified-safe.txt"), "SAFE-BEFORE")
+	writeTestFile(t, filepath.Join(watched, "modified-conflict.txt"), "conflict-before")
+	writeTestFile(t, filepath.Join(watched, "deleted.txt"), "deleted-before")
+	writeTestFile(t, filepath.Join(watched, "untouched.txt"), "untouched")
+	reference := filepath.Join(watched, "mtime-reference")
+	writeTestFile(t, reference, "reference")
+	originalTime := time.Date(2026, time.January, 2, 3, 4, 5, 123456789, time.Local)
+	for _, path := range []string{
+		filepath.Join(watched, "modified-safe.txt"),
+		filepath.Join(watched, "modified-conflict.txt"),
+		reference,
+	} {
+		if err := os.Chtimes(path, originalTime, originalTime); err != nil {
+			t.Fatalf("set literal original mtime: %v", err)
+		}
+	}
+
+	binary := buildTestBinary(t)
+	command := exec.Command(binary, "run", "--watch", watched, "--", "/bin/sh", "-c", `
+printf 'SAFE--AFTER' > modified-safe.txt
+touch -r mtime-reference modified-safe.txt
+printf 'conflict--after' > modified-conflict.txt
+touch -r mtime-reference modified-conflict.txt
+printf 'created-by-child' > created.txt
+rm deleted.txt
+exit 23
+`)
+	command.Dir = watched
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() != 23 {
+		t.Fatalf("file-changing child exit = %v, want 23\n%s", err, output)
+	}
+	text := string(output)
+	if !strings.Contains(text, "Files changed: 1 created, 2 modified, 1 deleted.") {
+		t.Fatalf("file summary omitted literal change counts:\n%s", text)
+	}
+	for _, unwanted := range []string{"Commit or discard?", "Up/down: select"} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("file-only session prompted with %q:\n%s", unwanted, text)
+		}
+	}
+
+	sessionID := newestSessionID(t, binary)
+	logCommand := exec.Command(binary, "log", "--json", sessionID)
+	logCommand.Env = os.Environ()
+	logOutput, err := logCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("read file-session JSON log: %v\n%s", err, logOutput)
+	}
+	for _, want := range []string{
+		`"kind": "created"`, `"kind": "modified"`, `"kind": "deleted"`,
+		`"path": "` + filepath.Join(watched, "created.txt") + `"`,
+		`"path": "` + filepath.Join(watched, "modified-safe.txt") + `"`,
+		`"path": "` + filepath.Join(watched, "deleted.txt") + `"`,
+	} {
+		if !strings.Contains(string(logOutput), want) {
+			t.Fatalf("file-session JSON missing %q:\n%s", want, logOutput)
+		}
+	}
+
+	listing := exec.Command(binary, "restore", sessionID)
+	listing.Env = os.Environ()
+	listOutput, err := listing.CombinedOutput()
+	if err != nil {
+		t.Fatalf("list restorable changes: %v\n%s", err, listOutput)
+	}
+	for _, want := range []string{"created", "modified", "deleted", "created.txt", "modified-safe.txt", "deleted.txt"} {
+		if !strings.Contains(string(listOutput), want) {
+			t.Fatalf("restore listing missing %q:\n%s", want, listOutput)
+		}
+	}
+
+	restore := exec.Command(binary, "restore", sessionID, "modified-safe.txt", "deleted.txt")
+	restore.Dir = watched
+	restore.Env = os.Environ()
+	restoreOutput, err := restore.CombinedOutput()
+	if err != nil {
+		t.Fatalf("restore selected files: %v\n%s", err, restoreOutput)
+	}
+	assertTestFile(t, filepath.Join(watched, "modified-safe.txt"), "SAFE-BEFORE")
+	assertTestFile(t, filepath.Join(watched, "deleted.txt"), "deleted-before")
+	assertTestFile(t, filepath.Join(watched, "created.txt"), "created-by-child")
+	assertTestFile(t, filepath.Join(watched, "untouched.txt"), "untouched")
+	assertTestFile(t, filepath.Join(watched, "modified-conflict.txt"), "conflict--after")
+
+	writeTestFile(t, filepath.Join(watched, "modified-conflict.txt"), "changed-after-session")
+	conflictingRestore := exec.Command(binary, "restore", sessionID, "modified-conflict.txt")
+	conflictingRestore.Dir = watched
+	conflictingRestore.Env = os.Environ()
+	conflictOutput, err := conflictingRestore.CombinedOutput()
+	if err == nil {
+		t.Fatalf("conflicting restore unexpectedly succeeded:\n%s", conflictOutput)
+	}
+	conflictText := string(conflictOutput)
+	for _, want := range []string{"refused", "modified-conflict.txt", "changed after the session ended", "--force"} {
+		if !strings.Contains(conflictText, want) {
+			t.Fatalf("conflict refusal missing %q:\n%s", want, conflictText)
+		}
+	}
+	assertTestFile(t, filepath.Join(watched, "modified-conflict.txt"), "changed-after-session")
+	sidecars, err := filepath.Glob(filepath.Join(watched, "modified-conflict.txt.unring-*.snapshot"))
+	if err != nil || len(sidecars) != 1 {
+		t.Fatalf("conflict sidecars = %v, %v, want exactly one", sidecars, err)
+	}
+	assertTestFile(t, sidecars[0], "conflict-before")
+
+	forcedRestore := exec.Command(binary, "restore", "--force", sessionID, "modified-conflict.txt")
+	forcedRestore.Dir = watched
+	forcedRestore.Env = os.Environ()
+	forcedOutput, err := forcedRestore.CombinedOutput()
+	if err != nil {
+		t.Fatalf("forced restore: %v\n%s", err, forcedOutput)
+	}
+	assertTestFile(t, filepath.Join(watched, "modified-conflict.txt"), "conflict-before")
+
+	removeCreated := exec.Command(binary, "restore", sessionID, "created.txt")
+	removeCreated.Dir = watched
+	removeCreated.Env = os.Environ()
+	removeOutput, err := removeCreated.CombinedOutput()
+	if err != nil {
+		t.Fatalf("restore selected created file to absence: %v\n%s", err, removeOutput)
+	}
+	if _, err := os.Stat(filepath.Join(watched, "created.txt")); !os.IsNotExist(err) {
+		t.Fatalf("restoring a created file did not remove it: %v", err)
+	}
+}
+
+func TestUnsnapshottedPathIsReportedAtStartAndInSessionRecord(t *testing.T) {
+	stateDir := t.TempDir()
+	watched := t.TempDir()
+	unreadable := filepath.Join(watched, "unreadable.txt")
+	writeTestFile(t, unreadable, "not-readable")
+	if err := os.Chmod(unreadable, 0); err != nil {
+		t.Fatalf("make snapshot reproducer unreadable: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o600) })
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+
+	binary := buildTestBinary(t)
+	command := exec.Command(binary, "run", "--watch", watched, "--", "/usr/bin/true")
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run with partially unreadable tree: %v\n%s", err, output)
+	}
+	for _, want := range []string{"FILE NOT SNAPSHOTTED", unreadable} {
+		if !strings.Contains(string(output), want) {
+			t.Fatalf("start warning missing %q:\n%s", want, output)
+		}
+	}
+
+	sessionID := newestSessionID(t, binary)
+	logCommand := exec.Command(binary, "log", "--json", sessionID)
+	logCommand.Env = os.Environ()
+	logOutput, err := logCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("read incomplete-snapshot JSON: %v\n%s", err, logOutput)
+	}
+	for _, want := range []string{`"uncaptured_paths": [`, `"path": "` + unreadable + `"`} {
+		if !strings.Contains(string(logOutput), want) {
+			t.Fatalf("session record missing %q:\n%s", want, logOutput)
+		}
+	}
+}
+
+func TestSnapshotRetentionEvictsOldestAndReportsUsage(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	binary := buildTestBinary(t)
+
+	firstWatch := t.TempDir()
+	writeTestFile(t, filepath.Join(firstWatch, "eight-bytes"), "12345678")
+	first := exec.Command(binary, "run", "--snapshot-cap-bytes", "12000", "--watch", firstWatch, "--", "/usr/bin/true")
+	first.Env = os.Environ()
+	if output, err := first.CombinedOutput(); err != nil {
+		t.Fatalf("first retained session: %v\n%s", err, output)
+	}
+	firstID := newestSessionID(t, binary)
+	time.Sleep(time.Millisecond)
+
+	secondWatch := t.TempDir()
+	writeTestFile(t, filepath.Join(secondWatch, "eight-bytes"), "abcdefgh")
+	second := exec.Command(binary, "run", "--snapshot-cap-bytes", "12000", "--watch", secondWatch, "--", "/usr/bin/true")
+	second.Env = os.Environ()
+	secondOutput, err := second.CombinedOutput()
+	if err != nil {
+		t.Fatalf("second retained session: %v\n%s", err, secondOutput)
+	}
+	if !strings.Contains(string(secondOutput), "retention evicted oldest snapshot "+firstID) {
+		t.Fatalf("retention output did not name oldest session:\n%s", secondOutput)
+	}
+
+	usage := exec.Command(binary, "snapshots")
+	usage.Env = append(os.Environ(), "UNRING_SNAPSHOT_CAP_BYTES=12000")
+	usageOutput, err := usage.CombinedOutput()
+	if err != nil {
+		t.Fatalf("inspect snapshot usage: %v\n%s", err, usageOutput)
+	}
+	if want := "bytes used of 12000 bytes; 1 sessions retained."; !strings.Contains(string(usageOutput), want) {
+		t.Fatalf("snapshot usage missing %q:\n%s", want, usageOutput)
+	}
+
+	oldLog := exec.Command(binary, "log", "--json", firstID)
+	oldLog.Env = os.Environ()
+	oldOutput, err := oldLog.CombinedOutput()
+	if err != nil {
+		t.Fatalf("read evicted session record: %v\n%s", err, oldOutput)
+	}
+	if !strings.Contains(string(oldOutput), `"retained": false`) {
+		t.Fatalf("evicted audit record still claims retention:\n%s", oldOutput)
+	}
+}
+
+func TestOutboundInterceptionIsOffByDefault(t *testing.T) {
+	stateDir := t.TempDir()
+	watched := t.TempDir()
+	fakeDirectory := t.TempDir()
+	realGHMarker := filepath.Join(t.TempDir(), "real-gh-ran")
+	fakeGH := filepath.Join(fakeDirectory, "gh")
+	if err := os.WriteFile(fakeGH, []byte(
+		"#!/bin/sh\nprintf 'REAL GH RAN\\n'\nprintf ran > \""+realGHMarker+"\"\n",
+	), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	t.Setenv("PATH", fakeDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HTTPS_PROXY", "http://inherited-proxy.invalid:4321")
+
+	binary := buildTestBinary(t)
+	command := exec.Command(binary, "run", "--watch", watched, "--", "/bin/sh", "-c",
+		`printf 'proxy=<%s> shim=<%s>\n' "$HTTPS_PROXY" "$UNRING_GH_SHIM"; gh issue create`)
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("default outbound-off run: %v\n%s", err, output)
+	}
+	text := string(output)
+	for _, want := range []string{"REAL GH RAN", "proxy=<http://inherited-proxy.invalid:4321>", "shim=<>"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("outbound-off output missing %q:\n%s", want, text)
+		}
+	}
+	for _, unwanted := range []string{"gh action needs approval", "HTTPS action needs approval", "No interactive terminal; declining"} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("outbound-off session unexpectedly prompted with %q:\n%s", unwanted, text)
+		}
+	}
+	if _, err := os.Stat(realGHMarker); err != nil {
+		t.Fatalf("real gh was not run with shim disabled: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "ca")); !os.IsNotExist(err) {
+		t.Fatalf("outbound-off session created HTTPS CA/proxy state: %v", err)
+	}
+
+	sessionID := newestSessionID(t, binary)
+	logCommand := exec.Command(binary, "log", "--json", sessionID)
+	logCommand.Env = os.Environ()
+	logOutput, err := logCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("read outbound-off JSON: %v\n%s", err, logOutput)
+	}
+	if !strings.Contains(string(logOutput), `"outbound_enabled": false`) {
+		t.Fatalf("audit did not record outbound disabled:\n%s", logOutput)
+	}
+}
+
+func newestSessionID(t *testing.T, binary string) string {
+	t.Helper()
+	command := exec.Command(binary, "log", "--json")
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("list JSON sessions: %v\n%s", err, output)
+	}
+	var records []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(output, &records); err != nil || len(records) == 0 {
+		t.Fatalf("decode JSON sessions: %v\n%s", err, output)
+	}
+	return records[0].ID
+}
+
+func writeTestFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func assertTestFile(t *testing.T, path, want string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if got := string(data); got != want {
+		t.Fatalf("%s = %q, want %q", path, got, want)
+	}
+}
 
 func TestRunWithoutDatabaseRunsChildPropagatesExitAndRecordsCoverage(t *testing.T) {
 	stateDir := t.TempDir()
@@ -84,6 +397,7 @@ func TestRunWithoutDatabaseDirectGHMutationIsGatedByShim(t *testing.T) {
 	binary := buildTestBinary(t)
 	command := exec.Command(
 		binary,
+		"--outbound",
 		"gh",
 		"issue",
 		"create",
@@ -152,6 +466,7 @@ func TestRunWithoutDatabaseStillInterceptsHTTPS(t *testing.T) {
 		binary,
 		"run",
 		"--discard",
+		"--outbound",
 		"--",
 		curl,
 		"--silent",
@@ -252,7 +567,7 @@ func TestControlPlaneOnlyCLIReviewIsVisible(t *testing.T) {
 				t.Setenv("DATABASE_URL", "")
 			}
 
-			command := exec.Command(binary, "run", "--", fakeClaude)
+			command := exec.Command(binary, "run", "--outbound", "--", fakeClaude)
 			command.Env = os.Environ()
 			output, err := command.CombinedOutput()
 			if err != nil {
@@ -421,7 +736,7 @@ func TestDatabaseFreeStartupFailureRemainsNotStartedInAudit(t *testing.T) {
 	t.Setenv("UNRING_ADAPTERS", filepath.Join(t.TempDir(), "does-not-exist.yaml"))
 
 	binary := buildTestBinary(t)
-	command := exec.Command(binary, "run", "--", "/bin/echo", "must-not-run")
+	command := exec.Command(binary, "run", "--outbound", "--", "/bin/echo", "must-not-run")
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
 	var exitError *exec.ExitError
