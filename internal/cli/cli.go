@@ -182,14 +182,6 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		fmt.Fprintln(stderr, "unring: --snapshot-cap-bytes must be non-negative")
 		return usageExitCode
 	}
-	if capBytes < 0 {
-		var err error
-		capBytes, err = localrollback.RetentionCap()
-		if err != nil {
-			fmt.Fprintf(stderr, "unring: %v\n", err)
-			return usageExitCode
-		}
-	}
 	watchPaths := []string(watched)
 	if len(watchPaths) == 0 {
 		workingDirectory, err := os.Getwd()
@@ -212,6 +204,16 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	auditStore, err := audit.OpenStore()
 	if err != nil {
 		fmt.Fprintf(stderr, "unring: open audit log: %v\n", err)
+		return internalErrorExitCode
+	}
+	if capBytes < 0 {
+		capBytes, err = localrollback.RetentionCapForState(auditStore.StateDir())
+		if err != nil {
+			fmt.Fprintf(stderr, "unring: read snapshot retention cap: %v\n", err)
+			return usageExitCode
+		}
+	} else if err := localrollback.SaveRetentionCap(auditStore.StateDir(), capBytes); err != nil {
+		fmt.Fprintf(stderr, "unring: save snapshot retention cap: %v\n", err)
 		return internalErrorExitCode
 	}
 	auditSession, err := auditStore.Begin(command, time.Now())
@@ -548,7 +550,9 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		auditError = joinErrorText(auditError, result.Err)
 	}
 	fileSummary = fileSession.Seal(time.Now())
-	if evicted, _, retentionErr := localrollback.EnforceRetention(auditStore.StateDir(), capBytes, ""); retentionErr != nil {
+	if evicted, usage, retentionErr := localrollback.EnforceRetention(
+		auditStore.StateDir(), capBytes, auditRecord.ID,
+	); retentionErr != nil {
 		fmt.Fprintf(stderr, "unring: enforce snapshot retention: %v\n", retentionErr)
 	} else {
 		for _, evictedID := range evicted {
@@ -561,6 +565,11 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 				evictedRecord.Files.Retained = false
 				_ = auditStore.Save(evictedRecord)
 			}
+		}
+		if usage.Exact && usage.Bytes > usage.CapBytes {
+			fmt.Fprintf(stderr,
+				"unring: current snapshot remains retained; measured snapshot usage is %d bytes, above the %d-byte cap. It becomes eligible for eviction after this session.\n",
+				usage.Bytes, usage.CapBytes)
 		}
 	}
 	if !fileSummary.Complete {
@@ -833,6 +842,15 @@ func printSnapshotStarted(output io.Writer, summary localrollback.Summary) {
 	for _, evicted := range summary.Evicted {
 		fmt.Fprintf(output, "unring: retention evicted oldest snapshot %s.\n", evicted)
 	}
+	if summary.StorageExact && summary.StorageBytes > summary.RetentionCap {
+		fmt.Fprintf(output,
+			"unring: current snapshot uses %d measured bytes, above the %d-byte cap; it is retained for this session and becomes eligible for eviction later.\n",
+			summary.StorageBytes, summary.RetentionCap)
+	} else if !summary.StorageExact {
+		fmt.Fprintf(output,
+			"unring: snapshot storage is an upper-bound estimate of %d bytes; retention will not evict snapshots based on that estimate.\n",
+			summary.StorageBytes)
+	}
 }
 
 func printFileChanges(output io.Writer, sessionID string, summary localrollback.Summary) {
@@ -856,7 +874,11 @@ func printFileChanges(output io.Writer, sessionID string, summary localrollback.
 	for _, change := range summary.Changes {
 		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
 	}
-	fmt.Fprintf(output, "Restore later with: unring restore %s\n", sessionID)
+	if summary.Retained {
+		fmt.Fprintf(output, "Restore later with: unring restore %s\n", sessionID)
+	} else {
+		fmt.Fprintln(output, "Snapshot data is no longer retained; these paths cannot be restored from this session.")
+	}
 }
 
 func printAuditFiles(output io.Writer, summary localrollback.Summary) {
@@ -864,8 +886,12 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 		return
 	}
 	fmt.Fprintln(output, "\nFILES — RESTORABLE INDIVIDUALLY")
-	fmt.Fprintf(output, "  Snapshot: %s; %d storage bytes (%d logical); retained: %t\n",
-		summary.Storage, summary.StorageBytes, summary.LogicalBytes, summary.Retained)
+	storageLabel := "measured storage bytes"
+	if !summary.StorageExact {
+		storageLabel = "storage-byte upper bound"
+	}
+	fmt.Fprintf(output, "  Snapshot: %s; %d %s (%d logical); retained: %t\n",
+		summary.Storage, summary.StorageBytes, storageLabel, summary.LogicalBytes, summary.Retained)
 	for _, failure := range summary.Uncaptured {
 		fmt.Fprintf(output, "  NOT SNAPSHOTTED: %s: %s\n", failure.Path, failure.Error)
 	}
@@ -1256,6 +1282,8 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		switch result.Status {
 		case "restored":
 			fmt.Fprintf(stdout, "restored  %s\n", result.Path)
+		case "already-restored":
+			fmt.Fprintf(stdout, "already restored  %s\n", result.Path)
 		case "refused":
 			exitCode = internalErrorExitCode
 			fmt.Fprintf(stderr, "refused   %s: changed after the session ended; not overwritten\n", result.Path)
@@ -1294,7 +1322,7 @@ func snapshotsCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "unring: open state store: %v\n", err)
 		return internalErrorExitCode
 	}
-	capBytes, err := localrollback.RetentionCap()
+	capBytes, err := localrollback.RetentionCapForState(store.StateDir())
 	if err != nil {
 		fmt.Fprintf(stderr, "unring: %v\n", err)
 		return usageExitCode
@@ -1304,8 +1332,13 @@ func snapshotsCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "unring: inspect snapshot storage: %v\n", err)
 		return internalErrorExitCode
 	}
-	fmt.Fprintf(stdout, "Snapshot storage: %d bytes used of %d bytes; %d sessions retained.\n",
-		usage.Bytes, usage.CapBytes, usage.Sessions)
+	if usage.Exact {
+		fmt.Fprintf(stdout, "Snapshot storage: %d bytes used of %d bytes; %d sessions retained.\n",
+			usage.Bytes, usage.CapBytes, usage.Sessions)
+	} else {
+		fmt.Fprintf(stdout, "Snapshot storage: upper-bound estimate %d bytes of %d bytes; %d sessions retained.\n",
+			usage.Bytes, usage.CapBytes, usage.Sessions)
+	}
 	return 0
 }
 

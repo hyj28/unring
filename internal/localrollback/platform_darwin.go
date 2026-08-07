@@ -34,6 +34,21 @@ func changeTime(info fs.FileInfo) int64 {
 	return 0
 }
 
+func linkCount(info fs.FileInfo) uint64 {
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		return uint64(stat.Nlink)
+	}
+	return 1
+}
+
+func filesystemAvailableBytes(path string) (int64, bool, error) {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(path, &stat); err != nil {
+		return 0, false, err
+	}
+	return int64(stat.Bavail) * int64(stat.Bsize), true, nil
+}
+
 func allocatedSize(info fs.FileInfo) int64 {
 	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
 		return stat.Blocks * 512

@@ -33,6 +33,7 @@ func TestBuiltBinaryRunsInteractiveChild(t *testing.T) {
 	command := exec.Command(
 		binary,
 		"run",
+		"--watch", t.TempDir(),
 		"--",
 		"/bin/sh",
 		"-c",
@@ -78,6 +79,7 @@ func TestCommitFlagCannotOverrideSignaledChild(t *testing.T) {
 		binary,
 		"run",
 		"--commit",
+		"--watch", t.TempDir(),
 		"--",
 		"/bin/sh",
 		"-c",
@@ -110,7 +112,7 @@ func TestReadOnlySessionPrintsOnlyQuietDisclosure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("find true command: %v", err)
 	}
-	command := exec.Command(binary, "run", "--", truePath)
+	command := exec.Command(binary, "run", "--watch", t.TempDir(), "--", truePath)
 	command.Env = os.Environ()
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -159,7 +161,7 @@ if [ "$create_status" -eq 0 ]; then
 fi
 exit "$create_status"
 `
-	command := exec.Command(binary, "run", "--discard", "--outbound", "--", "/bin/sh", "-c", childScript)
+	command := exec.Command(binary, "run", "--discard", "--outbound", "--watch", t.TempDir(), "--", "/bin/sh", "-c", childScript)
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
 	var exitError *exec.ExitError
@@ -194,7 +196,7 @@ func TestGHVersionPassesThroughWithoutApproval(t *testing.T) {
 	t.Setenv("PATH", fakeDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	binary := buildTestBinary(t)
-	command := exec.Command(binary, "run", "--discard", "--outbound", "--", "gh", "--version")
+	command := exec.Command(binary, "run", "--discard", "--outbound", "--watch", t.TempDir(), "--", "gh", "--version")
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
 	var exitError *exec.ExitError
@@ -223,7 +225,7 @@ func TestNonTerminalReviewUsesPlainTextWithoutANSI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("find true command: %v", err)
 	}
-	command := exec.Command(binary, "run", "--", truePath)
+	command := exec.Command(binary, "run", "--watch", t.TempDir(), "--", truePath)
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -285,6 +287,7 @@ func TestBuiltBinaryDiscardsStoppedInteractiveChild(t *testing.T) {
 		binary,
 		"run",
 		"--commit",
+		"--watch", t.TempDir(),
 		"--",
 		os.Args[0],
 		"-test.run=^TestStoppedInteractiveChildProcess$",
@@ -380,6 +383,7 @@ func TestBuiltBinaryRunsInteractivePsql(t *testing.T) {
 	command := exec.Command(
 		binary,
 		"run",
+		"--watch", t.TempDir(),
 		"--",
 		psqlPath,
 		"-X",
@@ -458,6 +462,7 @@ func TestApprovedIrreversibleActionAlwaysGetsReview(t *testing.T) {
 	command := exec.Command(
 		binary,
 		"run",
+		"--watch", t.TempDir(),
 		"--",
 		psqlPath,
 		"-X",
@@ -499,6 +504,7 @@ func TestApprovedIrreversibleActionAlwaysGetsReview(t *testing.T) {
 
 func buildTestBinary(t *testing.T) string {
 	t.Helper()
+	t.Setenv("HOME", t.TempDir())
 
 	repositoryRoot, err := filepath.Abs("../..")
 	if err != nil {

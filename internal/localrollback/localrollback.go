@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -28,6 +30,7 @@ type Entry struct {
 	CTime      int64  `json:"ctime_ns"`
 	Mode       uint32 `json:"mode"`
 	Type       string `json:"type"`
+	Links      uint64 `json:"links,omitempty"`
 	LinkTarget string `json:"link_target,omitempty"`
 }
 
@@ -64,6 +67,7 @@ type Summary struct {
 	Storage       string           `json:"storage"`
 	LogicalBytes  int64            `json:"logical_bytes"`
 	StorageBytes  int64            `json:"storage_bytes"`
+	StorageExact  bool             `json:"storage_bytes_exact"`
 	CopiedBytes   int64            `json:"copied_bytes"`
 	RetentionCap  int64            `json:"retention_cap_bytes"`
 	Retained      bool             `json:"retained"`
@@ -73,6 +77,7 @@ type Summary struct {
 
 type rootManifest struct {
 	Path       string            `json:"path"`
+	Source     string            `json:"source"`
 	Existed    bool              `json:"existed"`
 	Snapshot   string            `json:"snapshot"`
 	Before     map[string]Entry  `json:"before"`
@@ -93,7 +98,9 @@ type manifest struct {
 	Storage      string           `json:"storage"`
 	LogicalBytes int64            `json:"logical_bytes"`
 	StorageBytes int64            `json:"storage_bytes"`
+	StorageExact bool             `json:"storage_bytes_exact"`
 	CopiedBytes  int64            `json:"copied_bytes"`
+	RetentionCap int64            `json:"retention_cap_bytes"`
 }
 
 // Session owns the in-progress snapshot for a wrapped child.
@@ -108,6 +115,7 @@ type Usage struct {
 	Bytes    int64
 	CapBytes int64
 	Sessions int
+	Exact    bool
 }
 
 // DefaultWatchPaths returns the deliberately narrow default scope: the project
@@ -139,6 +147,57 @@ func RetentionCap() (int64, error) {
 	capBytes, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || capBytes < 0 {
 		return 0, fmt.Errorf("UNRING_SNAPSHOT_CAP_BYTES must be a non-negative integer, got %q", value)
+	}
+	return capBytes, nil
+}
+
+// SaveRetentionCap persists an explicitly selected cap so `unring snapshots`
+// and later sessions report and enforce the same unit and value.
+func SaveRetentionCap(stateDir string, capBytes int64) error {
+	if capBytes < 0 {
+		return errors.New("snapshot retention cap cannot be negative")
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return err
+	}
+	path := filepath.Join(stateDir, "snapshot-retention-cap")
+	temporary, err := os.CreateTemp(stateDir, ".snapshot-retention-cap-*.tmp")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := fmt.Fprintf(temporary, "%d\n", capBytes); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
+}
+
+// RetentionCapForState returns the environment override, then the persisted
+// cap selected by a prior run, then the default.
+func RetentionCapForState(stateDir string) (int64, error) {
+	if strings.TrimSpace(os.Getenv("UNRING_SNAPSHOT_CAP_BYTES")) != "" {
+		return RetentionCap()
+	}
+	data, err := os.ReadFile(filepath.Join(stateDir, "snapshot-retention-cap"))
+	if errors.Is(err, os.ErrNotExist) {
+		return DefaultRetentionBytes, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	value := strings.TrimSpace(string(data))
+	capBytes, parseErr := strconv.ParseInt(value, 10, 64)
+	if parseErr != nil || capBytes < 0 {
+		return 0, fmt.Errorf("stored snapshot retention cap is invalid: %q", value)
 	}
 	return capBytes, nil
 }
@@ -175,12 +234,19 @@ func Start(stateDir, sessionID string, watched []string, capBytes int64, now tim
 		return nil, Summary{}, fmt.Errorf("restrict temporary snapshot: %w", err)
 	}
 
-	m := manifest{Version: manifestVersion, SessionID: sessionID, StartedAt: now.UTC(), Complete: false}
+	m := manifest{
+		Version: manifestVersion, SessionID: sessionID, StartedAt: now.UTC(),
+		Complete: false, RetentionCap: capBytes,
+	}
 	absoluteStateDir, err := filepath.Abs(stateDir)
 	if err != nil {
 		return nil, Summary{}, fmt.Errorf("resolve state directory: %w", err)
 	}
 	m.Excluded = []string{filepath.Clean(absoluteStateDir)}
+	availableBefore, storageMeasured, storageMeasureErr := filesystemAvailableBytes(snapshotRoot)
+	if storageMeasureErr != nil {
+		return nil, Summary{}, fmt.Errorf("measure snapshot storage before capture: %w", storageMeasureErr)
+	}
 	var failures []CaptureFailure
 	methods := make(map[string]bool)
 	for index, root := range roots {
@@ -208,26 +274,35 @@ func Start(stateDir, sessionID string, watched []string, capBytes int64, now tim
 		return nil, Summary{}, fmt.Errorf("publish file snapshot: %w", err)
 	}
 	cleanup = false
-	m.StorageBytes, err = allocatedTree(finalDir)
-	if err != nil {
+	availableAfter, measuredAfter, storageMeasureErr := filesystemAvailableBytes(snapshotRoot)
+	if storageMeasureErr != nil {
 		_ = os.RemoveAll(finalDir)
-		return nil, Summary{}, fmt.Errorf("measure file snapshot storage: %w", err)
+		return nil, Summary{}, fmt.Errorf("measure snapshot storage after capture: %w", storageMeasureErr)
+	}
+	m.StorageExact = storageMeasured && measuredAfter
+	if m.StorageExact {
+		m.StorageBytes = consumedBytes(availableBefore, availableAfter)
+		if manifestBytes, manifestErr := allocatedPath(filepath.Join(finalDir, "manifest.json")); manifestErr != nil {
+			_ = os.RemoveAll(finalDir)
+			return nil, Summary{}, fmt.Errorf("measure snapshot manifest allocation: %w", manifestErr)
+		} else if manifestBytes > m.StorageBytes {
+			m.StorageBytes = manifestBytes
+		}
+	} else {
+		m.StorageBytes, err = allocatedTree(finalDir)
+		if err != nil {
+			_ = os.RemoveAll(finalDir)
+			return nil, Summary{}, fmt.Errorf("measure file snapshot storage upper bound: %w", err)
+		}
 	}
 	if err := writeManifest(finalDir, m); err != nil {
 		_ = os.RemoveAll(finalDir)
 		return nil, Summary{}, err
 	}
-	if m.StorageBytes > capBytes {
-		_ = os.RemoveAll(finalDir)
-		return nil, Summary{}, fmt.Errorf(
-			"file snapshot needs %d bytes, exceeding the %d-byte retention cap; child was not started",
-			m.StorageBytes, capBytes,
-		)
-	}
-
 	summary := Summary{
 		Watched: roots, Uncaptured: failures, Complete: false,
-		Storage: m.Storage, LogicalBytes: m.LogicalBytes, StorageBytes: m.StorageBytes, CopiedBytes: m.CopiedBytes,
+		Storage: m.Storage, LogicalBytes: m.LogicalBytes, StorageBytes: m.StorageBytes,
+		StorageExact: m.StorageExact, CopiedBytes: m.CopiedBytes,
 		RetentionCap: capBytes, Retained: true,
 	}
 	session := &Session{dir: finalDir, manifest: m, summary: summary}
@@ -243,10 +318,23 @@ func Start(stateDir, sessionID string, watched []string, capBytes int64, now tim
 
 // Seal scans the watched paths after the child exits and records the diff.
 func (s *Session) Seal(now time.Time) Summary {
+	availableBefore, measuredBefore, measureBeforeErr := filesystemAvailableBytes(s.dir)
 	after := make(map[string]Entry)
 	var scanFailures []CaptureFailure
 	for _, root := range s.manifest.Roots {
-		entries, failures, err := scanRoot(root.Path, s.manifest.Excluded)
+		if !root.Existed || root.Source == "" {
+			continue
+		}
+		currentSource, resolveErr := filepath.EvalSymlinks(root.Path)
+		if resolveErr != nil || filepath.Clean(currentSource) != filepath.Clean(root.Source) {
+			message := "watched root no longer resolves to its snapshotted target"
+			if resolveErr != nil {
+				message += ": " + resolveErr.Error()
+			}
+			scanFailures = append(scanFailures, CaptureFailure{Path: root.Path, Error: message})
+			continue
+		}
+		entries, failures, err := scanMappedRoot(root.Source, root.Path, s.manifest.Excluded)
 		if err != nil {
 			scanFailures = append(scanFailures, CaptureFailure{Path: root.Path, Error: err.Error()})
 			continue
@@ -281,20 +369,41 @@ func (s *Session) Seal(now time.Time) Summary {
 		s.manifest.Complete = false
 		s.manifest.Error = joinText(s.manifest.Error, err.Error())
 	}
-	if storageBytes, err := allocatedTree(s.dir); err != nil {
+	availableAfter, measuredAfter, measureAfterErr := filesystemAvailableBytes(s.dir)
+	if measureBeforeErr != nil || measureAfterErr != nil {
+		measureErr := errors.Join(measureBeforeErr, measureAfterErr)
 		s.manifest.Complete = false
-		s.manifest.Error = joinText(s.manifest.Error, "measure retained snapshot: "+err.Error())
-	} else {
-		s.manifest.StorageBytes = storageBytes
+		s.manifest.Error = joinText(s.manifest.Error, "measure retained snapshot: "+measureErr.Error())
+	} else if s.manifest.StorageExact && measuredBefore && measuredAfter {
+		s.manifest.StorageBytes += consumedBytes(availableBefore, availableAfter)
+		if manifestBytes, err := allocatedPath(filepath.Join(s.dir, "manifest.json")); err != nil {
+			s.manifest.Complete = false
+			s.manifest.Error = joinText(s.manifest.Error, "measure snapshot manifest allocation: "+err.Error())
+		} else if manifestBytes > s.manifest.StorageBytes {
+			s.manifest.StorageBytes = manifestBytes
+		}
 		if err := writeManifest(s.dir, s.manifest); err != nil {
 			s.manifest.Complete = false
 			s.manifest.Error = joinText(s.manifest.Error, err.Error())
+		}
+	} else {
+		s.manifest.StorageExact = false
+		if storageBytes, err := allocatedTree(s.dir); err != nil {
+			s.manifest.Complete = false
+			s.manifest.Error = joinText(s.manifest.Error, "measure retained snapshot upper bound: "+err.Error())
+		} else {
+			s.manifest.StorageBytes = storageBytes
+			if err := writeManifest(s.dir, s.manifest); err != nil {
+				s.manifest.Complete = false
+				s.manifest.Error = joinText(s.manifest.Error, err.Error())
+			}
 		}
 	}
 	s.summary.Changes = changes
 	s.summary.Complete = s.manifest.Complete
 	s.summary.Error = s.manifest.Error
 	s.summary.StorageBytes = s.manifest.StorageBytes
+	s.summary.StorageExact = s.manifest.StorageExact
 	return s.summary
 }
 
@@ -309,9 +418,24 @@ func (s *Session) Snapshot() Summary {
 func captureRoot(root, destination string, excluded []string) (rootManifest, []CaptureFailure, map[string]bool, int64, int64, error) {
 	state := rootManifest{Path: root, Before: make(map[string]Entry), Uncaptured: make(map[string]string)}
 	methods := make(map[string]bool)
-	info, err := os.Lstat(root)
+	source, resolveErr := filepath.EvalSymlinks(root)
+	if errors.Is(resolveErr, os.ErrNotExist) {
+		failure := CaptureFailure{Path: root, Error: "watched path does not exist"}
+		state.Uncaptured[root] = failure.Error
+		return state, []CaptureFailure{failure}, methods, 0, 0, nil
+	}
+	if resolveErr != nil {
+		failure := CaptureFailure{Path: root, Error: "resolve watched path: " + resolveErr.Error()}
+		state.Uncaptured[root] = failure.Error
+		return state, []CaptureFailure{failure}, methods, 0, 0, nil
+	}
+	source = filepath.Clean(source)
+	state.Source = source
+	info, err := os.Lstat(source)
 	if errors.Is(err, os.ErrNotExist) {
-		return state, nil, methods, 0, 0, nil
+		failure := CaptureFailure{Path: root, Error: "watched path does not exist"}
+		state.Uncaptured[root] = failure.Error
+		return state, []CaptureFailure{failure}, methods, 0, 0, nil
 	}
 	if err != nil {
 		failure := CaptureFailure{Path: root, Error: err.Error()}
@@ -319,38 +443,194 @@ func captureRoot(root, destination string, excluded []string) (rootManifest, []C
 		return state, []CaptureFailure{failure}, methods, 0, 0, nil
 	}
 	state.Existed = true
-	before, scanFailures, err := scanRoot(root, excluded)
+	beforeCandidate, beforeFailures, err := scanMappedRoot(source, root, excluded)
 	if err != nil {
-		return state, scanFailures, methods, 0, 0, err
-	}
-	state.Before = before
-	for _, failure := range scanFailures {
-		state.Uncaptured[failure.Path] = failure.Error
+		return state, beforeFailures, methods, 0, 0, err
 	}
 
-	if info.IsDir() && !containsExcludedPath(root, excluded) {
+	var captureFailures []CaptureFailure
+	var copiedBytes int64
+	if info.IsDir() && !containsExcludedPath(source, excluded) {
 		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
-			return state, scanFailures, methods, 0, 0, err
+			return state, beforeFailures, methods, 0, 0, err
 		}
-		if method, err := cloneDirectory(root, destination); err == nil {
+		if method, err := cloneDirectory(source, destination); err == nil {
 			methods[method] = true
-			return state, scanFailures, methods, logicalSize(before), 0, nil
+		} else {
+			if err := os.RemoveAll(destination); err != nil {
+				return state, beforeFailures, methods, 0, 0, fmt.Errorf("remove failed recursive clone: %w", err)
+			}
+			var fallbackMethods map[string]bool
+			captureFailures, fallbackMethods, copiedBytes, err = captureIndividually(source, destination, excluded)
+			captureFailures = translateFailures(captureFailures, source, root)
+			if err != nil {
+				return state, mergeFailures(beforeFailures, captureFailures), methods, 0, copiedBytes, err
+			}
+			for method := range fallbackMethods {
+				methods[method] = true
+			}
 		}
-		if err := os.RemoveAll(destination); err != nil {
-			return state, scanFailures, methods, 0, 0, fmt.Errorf("remove failed recursive clone: %w", err)
+	} else {
+		var fallbackMethods map[string]bool
+		captureFailures, fallbackMethods, copiedBytes, err = captureIndividually(source, destination, excluded)
+		captureFailures = translateFailures(captureFailures, source, root)
+		if err != nil {
+			return state, mergeFailures(beforeFailures, captureFailures), methods, 0, copiedBytes, err
+		}
+		for method := range fallbackMethods {
+			methods[method] = true
 		}
 	}
 
-	fallbackFailures, fallbackMethods, copiedBytes, err := captureIndividually(root, destination, excluded)
-	for _, failure := range fallbackFailures {
+	afterCandidate, afterFailures, err := scanMappedRoot(source, root, excluded)
+	if err != nil {
+		return state, mergeFailures(beforeFailures, captureFailures, afterFailures), methods, 0, copiedBytes, err
+	}
+	snapshotEntries, snapshotFailures, err := scanSnapshotRoot(destination, root)
+	if err != nil {
+		return state, mergeFailures(beforeFailures, captureFailures, afterFailures, snapshotFailures), methods, 0, copiedBytes, err
+	}
+	failures := reconcileCapture(root, beforeCandidate, afterCandidate, snapshotEntries,
+		mergeFailures(beforeFailures, captureFailures, afterFailures, snapshotFailures))
+	for _, failure := range failures {
 		state.Uncaptured[failure.Path] = failure.Error
-		delete(state.Before, failure.Path)
 	}
-	for method := range fallbackMethods {
-		methods[method] = true
+	for path, entry := range beforeCandidate {
+		if !coveredBy(path, failurePrefixes(failures)) {
+			state.Before[path] = entry
+		}
 	}
-	failures := mergeFailures(scanFailures, fallbackFailures)
 	return state, failures, methods, logicalSize(state.Before), copiedBytes, err
+}
+
+func scanMappedRoot(sourceRoot, reportedRoot string, excluded []string) (map[string]Entry, []CaptureFailure, error) {
+	entries, failures, err := scanRoot(sourceRoot, excluded)
+	translated := make(map[string]Entry, len(entries))
+	for path, entry := range entries {
+		relative, relErr := filepath.Rel(sourceRoot, path)
+		if relErr != nil {
+			failures = append(failures, CaptureFailure{Path: reportedRoot, Error: relErr.Error()})
+			continue
+		}
+		reported := reportedRoot
+		if relative != "." {
+			reported = filepath.Join(reportedRoot, relative)
+		}
+		translated[reported] = entry
+	}
+	return translated, translateFailures(failures, sourceRoot, reportedRoot), err
+}
+
+func translateFailures(failures []CaptureFailure, sourceRoot, reportedRoot string) []CaptureFailure {
+	translated := make([]CaptureFailure, 0, len(failures))
+	for _, failure := range failures {
+		relative, err := filepath.Rel(sourceRoot, failure.Path)
+		if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+			failure.Path = reportedRoot
+			if relative != "." {
+				failure.Path = filepath.Join(reportedRoot, relative)
+			}
+		}
+		translated = append(translated, failure)
+	}
+	return translated
+}
+
+func scanSnapshotRoot(snapshotRoot, originalRoot string) (map[string]Entry, []CaptureFailure, error) {
+	entries, failures, err := scanRoot(snapshotRoot, nil)
+	translated := make(map[string]Entry, len(entries))
+	for path, entry := range entries {
+		relative, relErr := filepath.Rel(snapshotRoot, path)
+		if relErr != nil {
+			failures = append(failures, CaptureFailure{Path: originalRoot, Error: relErr.Error()})
+			continue
+		}
+		original := originalRoot
+		if relative != "." {
+			original = filepath.Join(originalRoot, relative)
+		}
+		translated[original] = entry
+	}
+	for index := range failures {
+		if relative, relErr := filepath.Rel(snapshotRoot, failures[index].Path); relErr == nil {
+			failures[index].Path = filepath.Join(originalRoot, relative)
+		}
+	}
+	return translated, failures, err
+}
+
+func reconcileCapture(
+	root string,
+	before, after, snapshot map[string]Entry,
+	existingFailures []CaptureFailure,
+) []CaptureFailure {
+	failures := append([]CaptureFailure(nil), existingFailures...)
+	failed := failurePrefixes(failures)
+	paths := make(map[string]bool)
+	for path := range before {
+		paths[path] = true
+	}
+	for path := range after {
+		paths[path] = true
+	}
+	for path := range snapshot {
+		paths[path] = true
+	}
+	ordered := make([]string, 0, len(paths))
+	for path := range paths {
+		ordered = append(ordered, path)
+	}
+	sort.Strings(ordered)
+	for _, path := range ordered {
+		if coveredBy(path, failed) {
+			continue
+		}
+		beforeEntry, beforeExists := before[path]
+		afterEntry, afterExists := after[path]
+		snapshotEntry, snapshotExists := snapshot[path]
+		if !beforeExists || !afterExists || beforeEntry != afterEntry {
+			failures = append(failures, CaptureFailure{Path: path, Error: "path changed while its snapshot was being captured"})
+			failed[path] = true
+			continue
+		}
+		if !snapshotExists || !snapshotMatchesSource(snapshotEntry, beforeEntry) {
+			failures = append(failures, CaptureFailure{Path: path, Error: "captured path does not match the stable source metadata"})
+			failed[path] = true
+			continue
+		}
+		switch {
+		case beforeEntry.Type == "other":
+			failures = append(failures, CaptureFailure{Path: path, Error: "unsupported file type is outside snapshot coverage"})
+			failed[path] = true
+		case beforeEntry.Type == "file" && beforeEntry.Links > 1:
+			failures = append(failures, CaptureFailure{Path: path, Error: "hard-linked files are outside snapshot coverage; restoring one path could silently break the link group"})
+			failed[path] = true
+		case beforeEntry.Type == "symlink":
+			if target, statErr := os.Stat(path); statErr == nil && target.IsDir() {
+				failures = append(failures, CaptureFailure{Path: path, Error: "symlinked directory target is not followed or snapshotted"})
+				failed[path] = true
+			}
+		}
+	}
+	return mergeFailures(failures)
+}
+
+func snapshotMatchesSource(snapshot, source Entry) bool {
+	if snapshot.Type != source.Type || snapshot.LinkTarget != source.LinkTarget {
+		return false
+	}
+	if source.Type == "file" && snapshot.Size != source.Size {
+		return false
+	}
+	return true
+}
+
+func failurePrefixes(failures []CaptureFailure) map[string]bool {
+	prefixes := make(map[string]bool, len(failures))
+	for _, failure := range failures {
+		prefixes[failure.Path] = true
+	}
+	return prefixes
 }
 
 func captureIndividually(root, destination string, excluded []string) ([]CaptureFailure, map[string]bool, int64, error) {
@@ -488,9 +768,6 @@ func scanRoot(root string, excluded []string) (map[string]Entry, []CaptureFailur
 			}
 			return nil
 		}
-		if directoryEntry.IsDir() {
-			return nil
-		}
 		info, infoErr := directoryEntry.Info()
 		if infoErr != nil {
 			failures = append(failures, CaptureFailure{Path: path, Error: infoErr.Error()})
@@ -532,9 +809,11 @@ func containsExcludedPath(root string, excluded []string) bool {
 func entryFromInfo(path string, info fs.FileInfo) (Entry, error) {
 	entry := Entry{
 		Size: info.Size(), MTime: info.ModTime().UnixNano(), CTime: changeTime(info),
-		Mode: uint32(info.Mode()), Type: "file",
+		Mode: uint32(info.Mode()), Type: "file", Links: linkCount(info),
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
+	if info.IsDir() {
+		entry.Type = "directory"
+	} else if info.Mode()&os.ModeSymlink != 0 {
 		entry.Type = "symlink"
 		target, err := os.Readlink(path)
 		if err != nil {
@@ -559,7 +838,7 @@ func diff(before, after map[string]Entry, uncaptured map[string]bool) []Change {
 			changes = append(changes, Change{Kind: "deleted", Path: path, Before: &beforeCopy})
 			continue
 		}
-		if oldEntry != newEntry {
+		if entriesDiffer(oldEntry, newEntry) {
 			beforeCopy, afterCopy := oldEntry, newEntry
 			changes = append(changes, Change{Kind: "modified", Path: path, Before: &beforeCopy, After: &afterCopy})
 		}
@@ -573,6 +852,13 @@ func diff(before, after map[string]Entry, uncaptured map[string]bool) []Change {
 	}
 	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
 	return changes
+}
+
+func entriesDiffer(before, after Entry) bool {
+	if before.Type == "directory" && after.Type == "directory" {
+		return before.Mode != after.Mode
+	}
+	return before != after
 }
 
 func coveredBy(path string, prefixes map[string]bool) bool {
@@ -659,6 +945,21 @@ func allocatedTree(root string) (int64, error) {
 		return nil
 	})
 	return total, err
+}
+
+func allocatedPath(path string) (int64, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0, err
+	}
+	return allocatedSize(info), nil
+}
+
+func consumedBytes(before, after int64) int64 {
+	if after >= before {
+		return 0
+	}
+	return before - after
 }
 
 func storageDescription(methods map[string]bool) string {
@@ -758,9 +1059,14 @@ func readManifest(directory string) (manifest, error) {
 	return value, nil
 }
 
-// EnforceRetention evicts oldest completed snapshots until the logical-size cap is met.
+// EnforceRetention evicts oldest completed snapshots until the measured allocation cap is met.
 // The active session is kept; callers reject it separately if it alone exceeds the cap.
 func EnforceRetention(stateDir string, capBytes int64, activeSession string) ([]string, Usage, error) {
+	unlockRetention, err := acquireSnapshotLock(stateDir, "retention", unix.LOCK_EX)
+	if err != nil {
+		return nil, Usage{}, err
+	}
+	defer unlockRetention()
 	root := filepath.Join(stateDir, "snapshots")
 	entries, err := os.ReadDir(root)
 	if errors.Is(err, os.ErrNotExist) {
@@ -773,6 +1079,7 @@ func EnforceRetention(stateDir string, capBytes int64, activeSession string) ([]
 		id      string
 		started time.Time
 		bytes   int64
+		exact   bool
 	}
 	var snapshots []retained
 	for _, entry := range entries {
@@ -783,11 +1090,10 @@ func EnforceRetention(stateDir string, capBytes int64, activeSession string) ([]
 		if readErr != nil {
 			return nil, Usage{}, fmt.Errorf("read retained snapshot %s: %w", entry.Name(), readErr)
 		}
-		bytes := value.StorageBytes
-		if bytes == 0 {
-			bytes = value.LogicalBytes
-		}
-		snapshots = append(snapshots, retained{id: entry.Name(), started: value.StartedAt, bytes: bytes})
+		snapshots = append(snapshots, retained{
+			id: entry.Name(), started: value.StartedAt,
+			bytes: value.StorageBytes, exact: value.StorageExact,
+		})
 	}
 	sort.Slice(snapshots, func(i, j int) bool {
 		if snapshots[i].started.Equal(snapshots[j].started) {
@@ -795,39 +1101,54 @@ func EnforceRetention(stateDir string, capBytes int64, activeSession string) ([]
 		}
 		return snapshots[i].started.Before(snapshots[j].started)
 	})
-	var total int64
+	var total, enforcedTotal int64
+	exact := true
 	for _, snapshot := range snapshots {
 		total += snapshot.bytes
+		if snapshot.exact {
+			enforcedTotal += snapshot.bytes
+		} else {
+			exact = false
+		}
 	}
 	var evicted []string
 	for _, snapshot := range snapshots {
-		if total <= capBytes {
+		if enforcedTotal <= capBytes {
 			break
 		}
-		if snapshot.id == activeSession {
+		if snapshot.id == activeSession || !snapshot.exact {
 			continue
+		}
+		unlock, lockErr := acquireSnapshotLock(stateDir, snapshot.id, unix.LOCK_EX)
+		if lockErr != nil {
+			return evicted, Usage{}, lockErr
 		}
 		path := filepath.Join(root, snapshot.id)
 		if err := os.RemoveAll(path); err != nil {
+			unlock()
 			return evicted, Usage{}, fmt.Errorf("evict snapshot %s: %w", snapshot.id, err)
 		}
+		unlock()
 		total -= snapshot.bytes
+		enforcedTotal -= snapshot.bytes
 		evicted = append(evicted, snapshot.id)
 	}
-	return evicted, Usage{Bytes: total, CapBytes: capBytes, Sessions: len(snapshots) - len(evicted)}, nil
+	return evicted, Usage{
+		Bytes: total, CapBytes: capBytes, Sessions: len(snapshots) - len(evicted), Exact: exact,
+	}, nil
 }
 
-// StorageUsage reports current retained logical bytes and session count.
+// StorageUsage reports current retained measured bytes and session count.
 func StorageUsage(stateDir string, capBytes int64) (Usage, error) {
 	root := filepath.Join(stateDir, "snapshots")
 	entries, err := os.ReadDir(root)
 	if errors.Is(err, os.ErrNotExist) {
-		return Usage{CapBytes: capBytes}, nil
+		return Usage{CapBytes: capBytes, Exact: true}, nil
 	}
 	if err != nil {
 		return Usage{}, fmt.Errorf("inspect retained snapshots: %w", err)
 	}
-	usage := Usage{CapBytes: capBytes}
+	usage := Usage{CapBytes: capBytes, Exact: true}
 	for _, entry := range entries {
 		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 			continue
@@ -836,11 +1157,10 @@ func StorageUsage(stateDir string, capBytes int64) (Usage, error) {
 		if readErr != nil {
 			return Usage{}, fmt.Errorf("read retained snapshot %s: %w", entry.Name(), readErr)
 		}
-		bytes := value.StorageBytes
-		if bytes == 0 {
-			bytes = value.LogicalBytes
+		usage.Bytes += value.StorageBytes
+		if !value.StorageExact {
+			usage.Exact = false
 		}
-		usage.Bytes += bytes
 		usage.Sessions++
 	}
 	return usage, nil

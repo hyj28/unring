@@ -151,6 +151,143 @@ exit 23
 	}
 }
 
+func TestRestoreAllRestoresEveryChangedPathIncludingDirectories(t *testing.T) {
+	stateDir := t.TempDir()
+	root := t.TempDir()
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	modified := filepath.Join(root, "modified.txt")
+	deleted := filepath.Join(root, "deleted.txt")
+	writeTestFile(t, modified, "before-modified")
+	writeTestFile(t, deleted, "before-deleted")
+
+	binary := buildTestBinary(t)
+	command := exec.Command(binary, "run", "--watch", root, "--", "/bin/sh", "-c",
+		"printf 'after-modified' > modified.txt; rm deleted.txt; mkdir empty-created; printf 'created' > created.txt")
+	command.Dir = root
+	command.Env = os.Environ()
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("run file changes: %v\n%s", err, output)
+	}
+	sessionID := newestSessionID(t, binary)
+	restore := exec.Command(binary, "restore", "--all", sessionID)
+	restore.Env = os.Environ()
+	output, err := restore.CombinedOutput()
+	if err != nil {
+		t.Fatalf("restore --all: %v\n%s", err, output)
+	}
+	for _, path := range []string{modified, deleted, filepath.Join(root, "created.txt"), filepath.Join(root, "empty-created")} {
+		if !strings.Contains(string(output), path) {
+			t.Fatalf("restore --all output omitted %s:\n%s", path, output)
+		}
+	}
+	assertTestFile(t, modified, "before-modified")
+	assertTestFile(t, deleted, "before-deleted")
+	for _, path := range []string{filepath.Join(root, "created.txt"), filepath.Join(root, "empty-created")} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("created path %s remains after --all: %v", path, err)
+		}
+	}
+}
+
+func TestSymlinkedWatchRootIsProtectedAndNestedSymlinkIsDisclosed(t *testing.T) {
+	stateDir := t.TempDir()
+	target := t.TempDir()
+	link := filepath.Join(t.TempDir(), "Documents")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	protected := filepath.Join(target, "taxes.pdf")
+	writeTestFile(t, protected, "taxes-before")
+	nestedTarget := t.TempDir()
+	nested := filepath.Join(target, "external-data")
+	if err := os.Symlink(nestedTarget, nested); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	binary := buildTestBinary(t)
+	command := exec.Command(binary, "run", "--watch", link, "--", "/bin/rm", filepath.Join(link, "taxes.pdf"))
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("symlink-root run: %v\n%s", err, output)
+	}
+	text := string(output)
+	for _, want := range []string{"FILE NOT SNAPSHOTTED", nested, filepath.Join(link, "taxes.pdf"), "deleted"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("symlink coverage output missing %q:\n%s", want, text)
+		}
+	}
+	sessionID := newestSessionID(t, binary)
+	restore := exec.Command(binary, "restore", "--all", sessionID)
+	restore.Env = os.Environ()
+	if restoreOutput, err := restore.CombinedOutput(); err != nil {
+		t.Fatalf("restore symlink-root file: %v\n%s", err, restoreOutput)
+	}
+	assertTestFile(t, protected, "taxes-before")
+}
+
+func TestMissingWatchedRootIsReportedAtStartAndInAudit(t *testing.T) {
+	stateDir := t.TempDir()
+	missing := filepath.Join(t.TempDir(), "Dcouments")
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	binary := buildTestBinary(t)
+	command := exec.Command(binary, "run", "--watch", missing, "--", "/usr/bin/true")
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("missing-watch run: %v\n%s", err, output)
+	}
+	for _, want := range []string{"FILE NOT SNAPSHOTTED", missing, "does not exist"} {
+		if !strings.Contains(string(output), want) {
+			t.Fatalf("missing root warning omitted %q:\n%s", want, output)
+		}
+	}
+	logCommand := exec.Command(binary, "log", "--json", newestSessionID(t, binary))
+	logCommand.Env = os.Environ()
+	logOutput, err := logCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("missing-watch audit: %v\n%s", err, logOutput)
+	}
+	for _, want := range []string{`"path": "` + missing + `"`, `"error": "watched path does not exist"`} {
+		if !strings.Contains(string(logOutput), want) {
+			t.Fatalf("missing root audit omitted %q:\n%s", want, logOutput)
+		}
+	}
+}
+
+func TestCurrentSnapshotOverCapRemainsRestorable(t *testing.T) {
+	stateDir := t.TempDir()
+	root := t.TempDir()
+	file := filepath.Join(root, "file")
+	writeTestFile(t, file, "before")
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	binary := buildTestBinary(t)
+	command := exec.Command(binary, "run", "--snapshot-cap-bytes", "1", "--watch", root, "--", "/bin/sh", "-c", "printf after! > file")
+	command.Dir = root
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("over-cap current session: %v\n%s", err, output)
+	}
+	text := string(output)
+	sessionID := newestSessionID(t, binary)
+	for _, want := range []string{"current snapshot", "remains retained", "Restore later with: unring restore " + sessionID} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("over-cap session output omitted %q:\n%s", want, text)
+		}
+	}
+	restore := exec.Command(binary, "restore", sessionID, file)
+	restore.Env = os.Environ()
+	if restoreOutput, err := restore.CombinedOutput(); err != nil {
+		t.Fatalf("restore retained over-cap current snapshot: %v\n%s", err, restoreOutput)
+	}
+	assertTestFile(t, file, "before")
+}
+
 func TestUnsnapshottedPathIsReportedAtStartAndInSessionRecord(t *testing.T) {
 	stateDir := t.TempDir()
 	watched := t.TempDir()
@@ -219,7 +356,7 @@ func TestSnapshotRetentionEvictsOldestAndReportsUsage(t *testing.T) {
 	}
 
 	usage := exec.Command(binary, "snapshots")
-	usage.Env = append(os.Environ(), "UNRING_SNAPSHOT_CAP_BYTES=12000")
+	usage.Env = os.Environ()
 	usageOutput, err := usage.CombinedOutput()
 	if err != nil {
 		t.Fatalf("inspect snapshot usage: %v\n%s", err, usageOutput)
@@ -337,6 +474,7 @@ func TestRunWithoutDatabaseRunsChildPropagatesExitAndRecordsCoverage(t *testing.
 	command := exec.Command(
 		binary,
 		"run",
+		"--watch", t.TempDir(),
 		"--",
 		"/bin/sh",
 		"-c",
@@ -467,6 +605,7 @@ func TestRunWithoutDatabaseStillInterceptsHTTPS(t *testing.T) {
 		"run",
 		"--discard",
 		"--outbound",
+		"--watch", t.TempDir(),
 		"--",
 		curl,
 		"--silent",
@@ -567,7 +706,7 @@ func TestControlPlaneOnlyCLIReviewIsVisible(t *testing.T) {
 				t.Setenv("DATABASE_URL", "")
 			}
 
-			command := exec.Command(binary, "run", "--outbound", "--", fakeClaude)
+			command := exec.Command(binary, "run", "--outbound", "--watch", t.TempDir(), "--", fakeClaude)
 			command.Env = os.Environ()
 			output, err := command.CombinedOutput()
 			if err != nil {
@@ -673,7 +812,7 @@ func TestGitPushOnlyRunGetsStructuralBlindSpotDisclosure(t *testing.T) {
 	}
 	t.Setenv("PATH", fakeDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	command := exec.Command(binary, "run", "--", "git", "push")
+	command := exec.Command(binary, "run", "--watch", t.TempDir(), "--", "git", "push")
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -703,7 +842,7 @@ func TestConfiguredQuietSessionPrintsOnlyDisclosure(t *testing.T) {
 		t.Fatalf("write fake git: %v", err)
 	}
 	t.Setenv("PATH", fakeDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
-	command := exec.Command(binary, "run", "--discard", "--", "git", "push")
+	command := exec.Command(binary, "run", "--discard", "--watch", t.TempDir(), "--", "git", "push")
 	command.Env = os.Environ()
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -736,7 +875,7 @@ func TestDatabaseFreeStartupFailureRemainsNotStartedInAudit(t *testing.T) {
 	t.Setenv("UNRING_ADAPTERS", filepath.Join(t.TempDir(), "does-not-exist.yaml"))
 
 	binary := buildTestBinary(t)
-	command := exec.Command(binary, "run", "--outbound", "--", "/bin/echo", "must-not-run")
+	command := exec.Command(binary, "run", "--outbound", "--watch", t.TempDir(), "--", "/bin/echo", "must-not-run")
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
 	var exitError *exec.ExitError

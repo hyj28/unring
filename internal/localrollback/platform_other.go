@@ -29,4 +29,8 @@ func readable(path string) error {
 
 func changeTime(fs.FileInfo) int64 { return 0 }
 
+func linkCount(fs.FileInfo) uint64 { return 1 }
+
+func filesystemAvailableBytes(string) (int64, bool, error) { return 0, false, nil }
+
 func allocatedSize(info fs.FileInfo) int64 { return info.Size() }
