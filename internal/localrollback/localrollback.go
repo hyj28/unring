@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	// DefaultRetentionBytes is the default logical-size cap for retained snapshots.
+	// DefaultRetentionBytes is the default measured-allocation cap for retained snapshots.
 	DefaultRetentionBytes int64 = 5 << 30
 	manifestVersion             = 1
 )
@@ -227,7 +227,7 @@ func Start(stateDir, sessionID string, watched []string, capBytes int64, now tim
 	cleanup := true
 	defer func() {
 		if cleanup {
-			_ = os.RemoveAll(temporary)
+			_ = removeSnapshotTree(temporary)
 		}
 	}()
 	if err := os.Chmod(temporary, 0o700); err != nil {
@@ -276,14 +276,14 @@ func Start(stateDir, sessionID string, watched []string, capBytes int64, now tim
 	cleanup = false
 	availableAfter, measuredAfter, storageMeasureErr := filesystemAvailableBytes(snapshotRoot)
 	if storageMeasureErr != nil {
-		_ = os.RemoveAll(finalDir)
+		_ = removeSnapshotTree(finalDir)
 		return nil, Summary{}, fmt.Errorf("measure snapshot storage after capture: %w", storageMeasureErr)
 	}
 	m.StorageExact = storageMeasured && measuredAfter
 	if m.StorageExact {
 		m.StorageBytes = consumedBytes(availableBefore, availableAfter)
 		if manifestBytes, manifestErr := allocatedPath(filepath.Join(finalDir, "manifest.json")); manifestErr != nil {
-			_ = os.RemoveAll(finalDir)
+			_ = removeSnapshotTree(finalDir)
 			return nil, Summary{}, fmt.Errorf("measure snapshot manifest allocation: %w", manifestErr)
 		} else if manifestBytes > m.StorageBytes {
 			m.StorageBytes = manifestBytes
@@ -291,12 +291,12 @@ func Start(stateDir, sessionID string, watched []string, capBytes int64, now tim
 	} else {
 		m.StorageBytes, err = allocatedTree(finalDir)
 		if err != nil {
-			_ = os.RemoveAll(finalDir)
+			_ = removeSnapshotTree(finalDir)
 			return nil, Summary{}, fmt.Errorf("measure file snapshot storage upper bound: %w", err)
 		}
 	}
 	if err := writeManifest(finalDir, m); err != nil {
-		_ = os.RemoveAll(finalDir)
+		_ = removeSnapshotTree(finalDir)
 		return nil, Summary{}, err
 	}
 	summary := Summary{
@@ -308,7 +308,7 @@ func Start(stateDir, sessionID string, watched []string, capBytes int64, now tim
 	session := &Session{dir: finalDir, manifest: m, summary: summary}
 	evicted, _, err := EnforceRetention(stateDir, capBytes, sessionID)
 	if err != nil {
-		_ = os.RemoveAll(finalDir)
+		_ = removeSnapshotTree(finalDir)
 		return nil, Summary{}, err
 	}
 	summary.Evicted = evicted
@@ -342,6 +342,7 @@ func (s *Session) Seal(now time.Time) Summary {
 		for path, entry := range entries {
 			after[path] = entry
 		}
+		failures = append(failures, coverageFailures(entries, root.Uncaptured)...)
 		scanFailures = append(scanFailures, failures...)
 	}
 	before := make(map[string]Entry)
@@ -407,6 +408,30 @@ func (s *Session) Seal(now time.Time) Summary {
 	return s.summary
 }
 
+func coverageFailures(entries map[string]Entry, alreadyUncaptured map[string]string) []CaptureFailure {
+	known := make(map[string]bool, len(alreadyUncaptured))
+	for path := range alreadyUncaptured {
+		known[path] = true
+	}
+	var failures []CaptureFailure
+	for path, entry := range entries {
+		if coveredBy(path, known) {
+			continue
+		}
+		switch {
+		case entry.Type == "other":
+			failures = append(failures, CaptureFailure{Path: path, Error: "unsupported file type is outside snapshot coverage"})
+		case entry.Type == "file" && entry.Links > 1:
+			failures = append(failures, CaptureFailure{Path: path, Error: "hard-linked files are outside snapshot coverage; restoring one path could silently break the link group"})
+		case entry.Type == "symlink":
+			if target, err := os.Stat(path); err == nil && target.IsDir() {
+				failures = append(failures, CaptureFailure{Path: path, Error: "symlinked directory target is not followed or snapshotted"})
+			}
+		}
+	}
+	return failures
+}
+
 // Snapshot returns the session's current detached summary.
 func (s *Session) Snapshot() Summary {
 	data, _ := json.Marshal(s.summary)
@@ -443,7 +468,11 @@ func captureRoot(root, destination string, excluded []string) (rootManifest, []C
 		return state, []CaptureFailure{failure}, methods, 0, 0, nil
 	}
 	state.Existed = true
-	beforeCandidate, beforeFailures, err := scanMappedRoot(source, root, excluded)
+	// clonefile assigns fresh inode ctimes to the clone, so source ctime cannot
+	// be reconstructed by scanning the clone alone. Bracket capture with source
+	// metadata guards, but never use either guard as the captured membership:
+	// reconcileCapture admits only stable paths found in the snapshot scan.
+	sourceGuardBefore, beforeFailures, err := scanMappedRoot(source, root, excluded)
 	if err != nil {
 		return state, beforeFailures, methods, 0, 0, err
 	}
@@ -457,7 +486,7 @@ func captureRoot(root, destination string, excluded []string) (rootManifest, []C
 		if method, err := cloneDirectory(source, destination); err == nil {
 			methods[method] = true
 		} else {
-			if err := os.RemoveAll(destination); err != nil {
+			if err := removeSnapshotTree(destination); err != nil {
 				return state, beforeFailures, methods, 0, 0, fmt.Errorf("remove failed recursive clone: %w", err)
 			}
 			var fallbackMethods map[string]bool
@@ -482,24 +511,20 @@ func captureRoot(root, destination string, excluded []string) (rootManifest, []C
 		}
 	}
 
-	afterCandidate, afterFailures, err := scanMappedRoot(source, root, excluded)
-	if err != nil {
-		return state, mergeFailures(beforeFailures, captureFailures, afterFailures), methods, 0, copiedBytes, err
-	}
 	snapshotEntries, snapshotFailures, err := scanSnapshotRoot(destination, root)
 	if err != nil {
-		return state, mergeFailures(beforeFailures, captureFailures, afterFailures, snapshotFailures), methods, 0, copiedBytes, err
+		return state, mergeFailures(beforeFailures, captureFailures, snapshotFailures), methods, 0, copiedBytes, err
 	}
-	failures := reconcileCapture(root, beforeCandidate, afterCandidate, snapshotEntries,
+	sourceGuardAfter, afterFailures, err := scanMappedRoot(source, root, excluded)
+	if err != nil {
+		return state, mergeFailures(beforeFailures, captureFailures, snapshotFailures, afterFailures), methods, 0, copiedBytes, err
+	}
+	captured, failures := reconcileCapture(sourceGuardBefore, sourceGuardAfter, snapshotEntries,
 		mergeFailures(beforeFailures, captureFailures, afterFailures, snapshotFailures))
 	for _, failure := range failures {
 		state.Uncaptured[failure.Path] = failure.Error
 	}
-	for path, entry := range beforeCandidate {
-		if !coveredBy(path, failurePrefixes(failures)) {
-			state.Before[path] = entry
-		}
-	}
+	state.Before = captured
 	return state, failures, methods, logicalSize(state.Before), copiedBytes, err
 }
 
@@ -560,10 +585,10 @@ func scanSnapshotRoot(snapshotRoot, originalRoot string) (map[string]Entry, []Ca
 }
 
 func reconcileCapture(
-	root string,
 	before, after, snapshot map[string]Entry,
 	existingFailures []CaptureFailure,
-) []CaptureFailure {
+) (map[string]Entry, []CaptureFailure) {
+	captured := make(map[string]Entry)
 	failures := append([]CaptureFailure(nil), existingFailures...)
 	failed := failurePrefixes(failures)
 	paths := make(map[string]bool)
@@ -611,8 +636,26 @@ func reconcileCapture(
 				failed[path] = true
 			}
 		}
+		if !failed[path] {
+			captured[path] = baselineFromSnapshot(snapshotEntry, beforeEntry)
+		}
 	}
-	return mergeFailures(failures)
+	return captured, mergeFailures(failures)
+}
+
+// baselineFromSnapshot makes the captured tree authoritative for membership,
+// type, link target, and file bytes. The bracketing source scans contribute
+// inode metadata that clone/copy necessarily changes (especially ctime); a
+// path is admitted only when those scans agree, so the metadata describes the
+// same source state as the captured bytes.
+func baselineFromSnapshot(snapshot, stableSource Entry) Entry {
+	baseline := stableSource
+	baseline.Type = snapshot.Type
+	baseline.LinkTarget = snapshot.LinkTarget
+	if snapshot.Type == "file" {
+		baseline.Size = snapshot.Size
+	}
+	return baseline
 }
 
 func snapshotMatchesSource(snapshot, source Entry) bool {
@@ -1060,7 +1103,7 @@ func readManifest(directory string) (manifest, error) {
 }
 
 // EnforceRetention evicts oldest completed snapshots until the measured allocation cap is met.
-// The active session is kept; callers reject it separately if it alone exceeds the cap.
+// The active session is always kept, even if it alone exceeds the cap.
 func EnforceRetention(stateDir string, capBytes int64, activeSession string) ([]string, Usage, error) {
 	unlockRetention, err := acquireSnapshotLock(stateDir, "retention", unix.LOCK_EX)
 	if err != nil {
@@ -1124,7 +1167,7 @@ func EnforceRetention(stateDir string, capBytes int64, activeSession string) ([]
 			return evicted, Usage{}, lockErr
 		}
 		path := filepath.Join(root, snapshot.id)
-		if err := os.RemoveAll(path); err != nil {
+		if err := removeSnapshotTree(path); err != nil {
 			unlock()
 			return evicted, Usage{}, fmt.Errorf("evict snapshot %s: %w", snapshot.id, err)
 		}
@@ -1138,8 +1181,49 @@ func EnforceRetention(stateDir string, capBytes int64, activeSession string) ([]
 	}, nil
 }
 
+// removeSnapshotTree removes captured content even when its original
+// directories were read-only. Unlinking a file does not require write access
+// to the file itself, but walking and unlinking entries requires read, write,
+// and execute access to their parent directories. WalkDir invokes the callback
+// before reading a directory, so adding owner access there also handles nested
+// read-only trees without following captured symlinks.
+func removeSnapshotTree(path string) error {
+	err := filepath.WalkDir(path, func(current string, entry fs.DirEntry, walkErr error) error {
+		if errors.Is(walkErr, os.ErrNotExist) {
+			return nil
+		}
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			return infoErr
+		}
+		mode := info.Mode().Perm()
+		if mode&0o700 == 0o700 {
+			return nil
+		}
+		return os.Chmod(current, mode|0o700)
+	})
+	if err != nil {
+		return fmt.Errorf("make snapshot removable: %w", err)
+	}
+	if err := os.RemoveAll(path); err != nil {
+		return fmt.Errorf("remove snapshot tree: %w", err)
+	}
+	return nil
+}
+
 // StorageUsage reports current retained measured bytes and session count.
 func StorageUsage(stateDir string, capBytes int64) (Usage, error) {
+	unlockRetention, err := acquireSnapshotLock(stateDir, "retention", unix.LOCK_SH)
+	if err != nil {
+		return Usage{}, err
+	}
+	defer unlockRetention()
 	root := filepath.Join(stateDir, "snapshots")
 	entries, err := os.ReadDir(root)
 	if errors.Is(err, os.ErrNotExist) {

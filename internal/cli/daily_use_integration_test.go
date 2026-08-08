@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -214,7 +215,7 @@ func TestSymlinkedWatchRootIsProtectedAndNestedSymlinkIsDisclosed(t *testing.T) 
 		t.Fatalf("symlink-root run: %v\n%s", err, output)
 	}
 	text := string(output)
-	for _, want := range []string{"FILE NOT SNAPSHOTTED", nested, filepath.Join(link, "taxes.pdf"), "deleted"} {
+	for _, want := range []string{"FILE NOT SNAPSHOTTED", filepath.Join(link, "external-data"), filepath.Join(link, "taxes.pdf"), "deleted"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("symlink coverage output missing %q:\n%s", want, text)
 		}
@@ -334,7 +335,9 @@ func TestSnapshotRetentionEvictsOldestAndReportsUsage(t *testing.T) {
 	binary := buildTestBinary(t)
 
 	firstWatch := t.TempDir()
-	writeTestFile(t, filepath.Join(firstWatch, "eight-bytes"), "12345678")
+	for index := 0; index < 128; index++ {
+		writeTestFile(t, filepath.Join(firstWatch, fmt.Sprintf("first-retained-file-%03d", index)), "12345678")
+	}
 	first := exec.Command(binary, "run", "--snapshot-cap-bytes", "12000", "--watch", firstWatch, "--", "/usr/bin/true")
 	first.Env = os.Environ()
 	if output, err := first.CombinedOutput(); err != nil {
@@ -344,7 +347,9 @@ func TestSnapshotRetentionEvictsOldestAndReportsUsage(t *testing.T) {
 	time.Sleep(time.Millisecond)
 
 	secondWatch := t.TempDir()
-	writeTestFile(t, filepath.Join(secondWatch, "eight-bytes"), "abcdefgh")
+	for index := 0; index < 128; index++ {
+		writeTestFile(t, filepath.Join(secondWatch, fmt.Sprintf("second-retained-file-%03d", index)), "abcdefgh")
+	}
 	second := exec.Command(binary, "run", "--snapshot-cap-bytes", "12000", "--watch", secondWatch, "--", "/usr/bin/true")
 	second.Env = os.Environ()
 	secondOutput, err := second.CombinedOutput()

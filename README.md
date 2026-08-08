@@ -58,6 +58,11 @@ replace that default scope. On APFS the fast path uses copy-on-write clones. If 
 is unavailable, unring copies bytes for real and reports that cost. If one unreadable
 path breaks the recursive clone, unring falls back to per-entry capture and names every
 path it could not protect; an omitted path is never silently presented as snapshotted.
+Symlinked watched roots are resolved, so iCloud-backed `~/Documents` and `~/Desktop`
+remain protected while changes are reported using the paths the user watched. Nested
+symlinked directory targets are not followed and are named as not snapshotted. Hard-linked
+files are likewise named as outside coverage because per-path restore cannot preserve a
+link group honestly.
 
 After the child exits, inspect and restore file changes at any later time:
 
@@ -71,8 +76,11 @@ unring snapshots                             # inspect retained usage and the sp
 
 A path changed after the session is refused by default. Its pre-session snapshot is
 written alongside the current file, and only `--force` permits replacement. Snapshot
-retention defaults to 5 GiB of allocated snapshot storage and evicts oldest sessions.
-`UNRING_SNAPSHOT_CAP_BYTES` or `--snapshot-cap-bytes` can set a byte cap explicitly.
+retention defaults to 5 GiB of measured snapshot allocation and evicts oldest sessions.
+An explicit `--snapshot-cap-bytes` value is persisted so `unring snapshots` reports the
+same cap; `UNRING_SNAPSHOT_CAP_BYTES` remains an environment override. Where a filesystem
+cannot expose allocation changes cheaply, unring labels the figure as an upper bound and
+does not evict snapshots based on that estimate.
 
 If this task needs PostgreSQL coverage, point `DATABASE_URL` at the real development
 database first:

@@ -504,7 +504,17 @@ func TestApprovedIrreversibleActionAlwaysGetsReview(t *testing.T) {
 
 func buildTestBinary(t *testing.T) string {
 	t.Helper()
+	moduleCache := strings.TrimSpace(os.Getenv("GOMODCACHE"))
+	if moduleCache == "" {
+		command := exec.Command("go", "env", "GOMODCACHE")
+		output, err := command.Output()
+		if err != nil {
+			t.Fatalf("find existing Go module cache: %v", err)
+		}
+		moduleCache = strings.TrimSpace(string(output))
+	}
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GOMODCACHE", moduleCache)
 
 	repositoryRoot, err := filepath.Abs("../..")
 	if err != nil {

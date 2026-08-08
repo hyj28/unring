@@ -266,18 +266,25 @@ func restoreSnapshotObject(snapshotPath, destination string, metadata *Entry, va
 	if err != nil {
 		return err
 	}
-	defer func() {
-		for index := len(createdParents) - 1; index >= 0; index-- {
-			_ = applyMetadata(createdParents[index].path, createdParents[index].entry)
-		}
-	}()
+	var restoreErr error
 	if metadata.Type == "directory" {
 		if err := os.Mkdir(destination, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-			return err
+			restoreErr = err
+		} else {
+			restoreErr = applyMetadata(destination, *metadata)
 		}
-		return applyMetadata(destination, *metadata)
+	} else {
+		restoreErr = restoreSnapshotAtomically(snapshotPath, destination, metadata)
 	}
-	return restoreSnapshotAtomically(snapshotPath, destination, metadata)
+	return errors.Join(restoreErr, applyCreatedParentMetadata(createdParents))
+}
+
+func applyCreatedParentMetadata(created []restoredParent) error {
+	var result error
+	for index := len(created) - 1; index >= 0; index-- {
+		result = errors.Join(result, applyMetadata(created[index].path, created[index].entry))
+	}
+	return result
 }
 
 func restoreSnapshotAtomically(snapshotPath, destination string, metadata *Entry) error {
@@ -333,19 +340,25 @@ func ensureParentDirectories(value manifest, destination string) ([]restoredPare
 		info, err := os.Stat(path)
 		if err == nil {
 			if !info.IsDir() {
-				return created, fmt.Errorf("restore parent %s is not a directory", path)
+				return created, errors.Join(
+					fmt.Errorf("restore parent %s is not a directory", path),
+					applyCreatedParentMetadata(created),
+				)
 			}
 			continue
 		}
 		if !errors.Is(err, os.ErrNotExist) {
-			return created, err
+			return created, errors.Join(err, applyCreatedParentMetadata(created))
 		}
 		entry, exists := root.Before[path]
 		if !exists || entry.Type != "directory" {
-			return created, fmt.Errorf("snapshot has no directory metadata for missing parent %s", path)
+			return created, errors.Join(
+				fmt.Errorf("snapshot has no directory metadata for missing parent %s", path),
+				applyCreatedParentMetadata(created),
+			)
 		}
 		if err := os.Mkdir(path, 0o700); err != nil {
-			return created, err
+			return created, errors.Join(err, applyCreatedParentMetadata(created))
 		}
 		created = append(created, restoredParent{path: path, entry: entry})
 	}

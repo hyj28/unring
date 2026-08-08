@@ -64,6 +64,23 @@ func TestSymlinkedDirectoryInsideRootIsNamedAsUncaptured(t *testing.T) {
 	assertRollbackFailure(t, summary.Uncaptured, link, "symlinked directory target")
 }
 
+func TestSymlinkedDirectoryIntroducedDuringSessionMakesScanIncomplete(t *testing.T) {
+	root := t.TempDir()
+	session, _, err := Start(t.TempDir(), "new-symlink", []string{root}, DefaultRetentionBytes, time.Now())
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	target := t.TempDir()
+	link := filepath.Join(root, "late-data")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	sealed := session.Seal(time.Now())
+	if sealed.Complete || !strings.Contains(sealed.Error, link) || !strings.Contains(sealed.Error, "not followed") {
+		t.Fatalf("sealed summary = %#v, want named incomplete symlink coverage", sealed)
+	}
+}
+
 func TestCaptureReconciliationRejectsEveryScanCloneRaceShape(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "file")
 	old := Entry{Type: "file", Size: 4, MTime: 10, CTime: 20, Mode: uint32(0o600), Links: 1}
@@ -80,7 +97,7 @@ func TestCaptureReconciliationRejectsEveryScanCloneRaceShape(t *testing.T) {
 		{name: "deleted", before: map[string]Entry{file: old}, after: map[string]Entry{}, snapshot: map[string]Entry{}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			failures := reconcileCapture(filepath.Dir(file), test.before, test.after, test.snapshot, nil)
+			_, failures := reconcileCapture(test.before, test.after, test.snapshot, nil)
 			assertRollbackFailure(t, failures, file, "changed while")
 		})
 	}
@@ -309,6 +326,67 @@ func TestEvictionWaitsForRestoreReaderLock(t *testing.T) {
 	}
 	if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("snapshot still exists after reader released: %v", err)
+	}
+}
+
+func TestRetentionEvictsSnapshotContainingReadOnlyTree(t *testing.T) {
+	stateDir := t.TempDir()
+	directory := filepath.Join(stateDir, "snapshots", "read-only")
+	packageDirectory := filepath.Join(directory, "roots", "000000", "go", "pkg", "mod", "example@v1.0.0")
+	if err := os.MkdirAll(packageDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(packageDirectory, "source.go"), []byte("package example\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManifest(directory, manifest{
+		Version: manifestVersion, SessionID: "read-only", StartedAt: time.Unix(1, 0),
+		StorageBytes: 100, StorageExact: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for current := packageDirectory; current != directory; current = filepath.Dir(current) {
+		if err := os.Chmod(current, 0o555); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	evicted, usage, err := EnforceRetention(stateDir, 0, "")
+	if err != nil {
+		t.Fatalf("evict read-only snapshot: %v", err)
+	}
+	if len(evicted) != 1 || evicted[0] != "read-only" {
+		t.Fatalf("evicted = %#v, want [read-only]", evicted)
+	}
+	if usage.Bytes != 0 || usage.Sessions != 0 {
+		t.Fatalf("usage after eviction = %#v, want zero bytes and sessions", usage)
+	}
+	if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only snapshot remains after eviction: %v", err)
+	}
+}
+
+func TestRetentionReportsSnapshotItCannotEvict(t *testing.T) {
+	stateDir := t.TempDir()
+	snapshotRoot := filepath.Join(stateDir, "snapshots")
+	directory := filepath.Join(snapshotRoot, "blocked")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManifest(directory, manifest{
+		Version: manifestVersion, SessionID: "blocked", StartedAt: time.Unix(1, 0),
+		StorageBytes: 100, StorageExact: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(snapshotRoot, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(snapshotRoot, 0o700) })
+
+	_, _, err := EnforceRetention(stateDir, 0, "")
+	if err == nil || !strings.Contains(err.Error(), "evict snapshot blocked") {
+		t.Fatalf("retention error = %v, want named eviction failure", err)
 	}
 }
 
