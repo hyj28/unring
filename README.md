@@ -64,6 +64,23 @@ symlinked directory targets are not followed and are named as not snapshotted. H
 files are likewise named as outside coverage because per-path restore cannot preserve a
 link group honestly.
 
+**Anything outside the watched scope is neither captured nor reported.** If the agent
+deletes a directory that was not watched, unring holds no copy of it and the change list
+will not mention it — the session simply looks clean. Widen the scope with `--watch` when
+a run might touch something outside it. Note that `--watch` currently *replaces* the
+default scope rather than adding to it.
+
+Two limits are worth knowing before relying on the scope. Data protected by macOS privacy
+controls — the Photos library, for instance — cannot be read by unring at all, so adding
+it to the scope captures nothing; the same restriction applies to the agent unring runs,
+which cannot delete what it cannot read either. And on Linux, where `clonefile` is
+unavailable, capture copies bytes for real, so a wide scope costs real time and real
+writes.
+
+A whole-volume snapshot backstop that removes the scope question entirely is designed but
+not built: see [docs/LOCAL-ROLLBACK-DESIGN.md §8](docs/LOCAL-ROLLBACK-DESIGN.md) and M10 in
+[ROADMAP.md](ROADMAP.md). Until it ships, the scope is the coverage.
+
 After the child exits, inspect and restore file changes at any later time:
 
 ```sh
