@@ -29,9 +29,10 @@ func TestSignalForcesRollback(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	exited := make(chan int, 1)
+	firstWatch := t.TempDir()
 	go func() {
 		exited <- Main([]string{
-			"run", "--commit", "--",
+			"run", "--commit", "--watch", firstWatch, "--",
 			os.Args[0], "-test.run=^TestSignalChildHelper$",
 		}, bytes.NewReader(nil), &stdout, &stderr)
 	}()
@@ -92,7 +93,7 @@ func TestSignalForcesRollback(t *testing.T) {
 	}
 
 	exitCode := Main([]string{
-		"run", "--discard", "--", "/bin/sh", "-c", "exit 37",
+		"run", "--discard", "--watch", t.TempDir(), "--", "/bin/sh", "-c", "exit 37",
 	}, bytes.NewReader(nil), &stdout, &stderr)
 	if exitCode != 37 {
 		t.Fatalf("child exit code = %d, want 37\nstdout:\n%s\nstderr:\n%s",

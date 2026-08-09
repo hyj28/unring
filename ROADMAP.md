@@ -98,11 +98,42 @@ The zero-compromise demo. Validated in the brief as V1/V2; build it first.
 - [x] M8.1 Undo actions declared per adapter, executed on discard
 - [x] M8.2 Slack `chat.delete`; document precisely what GitHub cannot undo
 
+## M9 — Local file rollback
+
+- [x] M9.1 Snapshot the project and narrow high-risk paths before the child starts,
+      using APFS clones with an explicit per-entry/full-copy fallback
+- [x] M9.2 Record created, modified, and deleted files with `ctime` in the scan oracle;
+      report every path that could not be captured
+- [x] M9.3 `unring restore` lists and restores individual paths, refuses post-session
+      conflicts by default, and writes the snapshot version alongside
+- [x] M9.4 Cap retained snapshot space and evict oldest sessions; expose current usage
+- [x] M9.5 Make HTTPS adapters and the `gh` shim opt-in with `--outbound`
+
+## M10 — Volume-snapshot backstop and configurable scope
+
+Design: [docs/LOCAL-ROLLBACK-DESIGN.md §8](docs/LOCAL-ROLLBACK-DESIGN.md). Decisions 13–18.
+The narrow clone scope leaves anything outside it uncaptured and unreported; a whole-volume
+APFS snapshot costs 180 ms and covers the disk.
+
+- [ ] M10.1 Take a whole-volume snapshot at session start as the backstop, keeping the
+      `clonefile` capture for the precise change list and privilege-free restore
+- [ ] M10.2 Widen the change-list scan past the clone scope — home minus `~/Library`,
+      `node_modules`, `.git`, `.cache`, `go/pkg` — and report paths TCC or permissions
+      made unreadable rather than reporting them as unchanged
+- [ ] M10.3 Restore a path from the volume snapshot, stating that it needs `sudo` before
+      asking for it, and failing clearly when the snapshot has been purged
+- [ ] M10.4 Config file at the state directory with `watch` and `exclude` lists; `--watch`
+      becomes additive and `--watch-only` takes over the replacing behaviour
+- [ ] M10.5 Report backstop coverage honestly: no Time Machine, a path excluded from it
+      (`tmutil isexcluded`), or Linux — say so prominently and keep running
+- [ ] M10.6 Skip a nonexistent *default* path silently; report a nonexistent path the user
+      named explicitly
+
 ---
 
 ## Explicitly out of scope for v1
 
-Filesystem copy-on-write (git already solves it) · MySQL · teams, approval flows,
+FSEvents acceleration · lazy database `BEGIN` · MySQL · teams, approval flows,
 multi-user · multi-agent concurrency control · web UI.
 
 ## Open questions
@@ -112,3 +143,9 @@ multi-user · multi-agent concurrency control · web UI.
 - Whether approved lock-conflicting maintenance should be deferred until the final
   decision, so discard omits it entirely; this better fits the promise but changes
   what the agent observes during the session
+- Whether TCC-protected data (the Photos library) is genuinely inside a volume snapshot.
+  Reasoned from the snapshot being a block-layer operation; verifying it needs root
+- Whether `tmutil localsnapshot` works at all with Time Machine unconfigured. Its manual
+  page covers only "volumes included in the Time Machine backup"
+- What Linux should do without `clonefile` or any backstop equivalent. Its protection is a
+  tier below macOS and the documentation has to say so rather than imply parity

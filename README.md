@@ -2,20 +2,19 @@
 
 > **Make everything your agent does undoable.**
 
-> **Current scope:** PostgreSQL, GitHub and Slack through HTTPS adapters, and the
-> `gh` CLI through a PATH shim. SSH, direct sockets, other protocols, and other
-> unshimmed CLIs are outside today's interception coverage.
+> **Current scope:** local file rollback plus transactional PostgreSQL by default;
+> GitHub and Slack through HTTPS adapters and the `gh` PATH shim are opt-in.
 
-`unring` wraps an AI coding agent and intercepts the side effects it has on the real
-world — database writes and outbound API calls. When the run is over you see exactly
-what it did and what it is about to do, then you decide: **commit** or **discard**.
+`unring` wraps an AI coding agent, snapshots the files it can change, and keeps database
+writes reversible. File changes need no end-of-session decision: restore individual
+paths later, when you have enough context to know something is wrong. PostgreSQL and
+opt-in outbound effects retain their existing commit/discard review.
 
 The name comes from *you can't unring a bell*. That is the whole point: now you can.
 
-> **Status: v1 scope complete.** Database activity is transactional. Declarative
-> adapters stage external calls or require approval, unknown mutations fail closed,
-> a per-session `gh` shim covers GitHub CLI traffic, and declared compensations run
-> on discard with their limits shown before the decision.
+Outbound interception is deliberately off by default. A snapshot can give back what is
+yours, but it cannot recall data already sent to another service; use `--outbound` when
+that extra coverage is worth its prompts.
 
 ## Install
 
@@ -53,6 +52,56 @@ unring run -- claude -p 'Implement the requested validation change, run its test
 unring run -- your-one-shot-agent-command
 ```
 
+Before the child starts, unring snapshots the project tree plus `~/Documents`,
+`~/Desktop`, `~/.config`, `~/.ssh`, and `~/.aws`. Use a repeatable `--watch` flag to
+replace that default scope. On APFS the fast path uses copy-on-write clones. If cloning
+is unavailable, unring copies bytes for real and reports that cost. If one unreadable
+path breaks the recursive clone, unring falls back to per-entry capture and names every
+path it could not protect; an omitted path is never silently presented as snapshotted.
+Symlinked watched roots are resolved, so iCloud-backed `~/Documents` and `~/Desktop`
+remain protected while changes are reported using the paths the user watched. Nested
+symlinked directory targets are not followed and are named as not snapshotted. Hard-linked
+files are likewise named as outside coverage because per-path restore cannot preserve a
+link group honestly.
+
+**Anything outside the watched scope is neither captured nor reported.** If the agent
+deletes a directory that was not watched, unring holds no copy of it and the change list
+will not mention it — the session simply looks clean. Widen the scope with `--watch` when
+a run might touch something outside it. Note that `--watch` currently *replaces* the
+default scope rather than adding to it.
+
+Two limits are worth knowing before relying on the scope. Data protected by macOS privacy
+controls — the Photos library, for instance — cannot be read by unring at all, so adding
+it to the scope captures nothing; the same restriction applies to the agent unring runs,
+which cannot delete what it cannot read either. And on Linux, where `clonefile` is
+unavailable, capture copies bytes for real, so a wide scope costs real time and real
+writes.
+
+A whole-volume snapshot backstop that removes the scope question entirely is designed but
+not built: see [docs/LOCAL-ROLLBACK-DESIGN.md §8](docs/LOCAL-ROLLBACK-DESIGN.md) and M10 in
+[ROADMAP.md](ROADMAP.md). Until it ships, the scope is the coverage.
+
+After the child exits, inspect and restore file changes at any later time:
+
+```sh
+unring restore <session-id>                  # list created, modified, deleted paths
+unring restore <session-id> path/to/file     # restore selected paths
+unring restore --all <session-id>            # restore all covered paths; report unavailable ones
+unring restore --force <session-id> path     # explicitly overwrite a conflict
+unring snapshots                             # inspect retained usage and the space cap
+```
+
+A path changed after the session is refused by default. Its pre-session snapshot is
+written alongside the current file, and only `--force` permits replacement. Coverage
+gaps created during a session are named in the change list and audit record; they do not
+prevent restoring independently covered paths. Snapshot retention defaults to 5 GiB of
+measured snapshot allocation and evicts oldest sessions.
+An explicit `--snapshot-cap-bytes` value is persisted so later runs and `unring snapshots`
+report and enforce the same cap. `UNRING_SNAPSHOT_CAP_BYTES` supplies the initial cap for a
+state directory that has no persisted value; the first run persists that effective value.
+Where a filesystem cannot expose allocation changes cheaply, unring labels the figure as
+an upper bound and does not evict snapshots based on that estimate.
+
 If this task needs PostgreSQL coverage, point `DATABASE_URL` at the real development
 database first:
 
@@ -70,8 +119,8 @@ is the wrong review granularity.
 
 PostgreSQL is optional. Precisely, unring considers it **not configured** when
 `DATABASE_URL` is absent, empty, or contains only whitespace. In that mode it does not
-start the PostgreSQL proxy or inject PostgreSQL connection settings, but HTTPS
-interception, the `gh` shim, and the audit log still run. The review explicitly says
+start the PostgreSQL proxy or inject PostgreSQL connection settings, but file snapshots
+and the audit log still run. The review explicitly says
 that no database traffic was intercepted; that statement is not evidence that the
 child did not access a database through inherited `PG*` variables, command arguments,
 a service file, or another client-specific setting.
@@ -86,14 +135,20 @@ PostgreSQL 14 is the minimum supported version. Older servers are rejected at st
 with an explicit version error before any client traffic is accepted; CI exercises
 the integration suite against PostgreSQL 14 and 17 explicitly.
 
-When PostgreSQL is configured, `unring` opens one real transaction and binds both the
-Postgres and HTTPS proxies to ephemeral loopback ports. It injects the connection
+When PostgreSQL is configured, `unring` opens one real transaction and binds the
+Postgres proxy to an ephemeral loopback port. It injects the connection
 variables into the child process only. Every Postgres client connection opened by that
 child uses the same backend transaction; individual protocol exchanges are serialized
 because PostgreSQL has only one backend connection. Closing one client connection does
 not close the transaction.
 
-For network clients, the child receives upper- and lower-case HTTP/HTTPS proxy
+Pass `--outbound` to start HTTPS interception, adapters, and the `gh` shim:
+
+```sh
+unring run --outbound -- your-one-shot-agent-command
+```
+
+With that flag, the child receives upper- and lower-case HTTP/HTTPS proxy
 variables, plus `ALL_PROXY` and `FTP_PROXY`. Existing
 `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, and `CURL_CA_BUNDLE` files are merged with
 unring's local CA rather than discarded. Node.js, curl, and Python's standard library
@@ -136,7 +191,7 @@ process tree for those exact requests. Every match is labeled **AGENT CONTROL PL
 FORWARDED WITHOUT GATING** in the JSON audit and in any session review that is otherwise
 needed. Control-plane calls alone do not manufacture a commit/discard prompt.
 
-`gh` is handled without TLS interception. For each run, unring creates a private
+With `--outbound`, `gh` is handled without TLS interception. For each run, unring creates a private
 directory, places a `gh` shim there, and prepends that directory only to the wrapped
 child's `PATH`. Enumerated reads such as `gh --version`, `gh auth status`,
 `gh issue list`, `gh pr view`, and a method-safe `gh api` GET execute the real pre-resolved
@@ -148,10 +203,11 @@ approval with the exact ambiguity rather than being guessed. The directory
 and socket are removed when the session ends; no shell profile or persistent `PATH`
 is changed.
 
-After the child exits, `unring` reviews intercepted effects and, when a decision is
-needed, asks whether to commit or discard. Without a configured database, the review
-instead says plainly that PostgreSQL was not intercepted. Automation must choose
-explicitly when it has reviewable effects:
+After the child exits, unring records file changes without asking for a file decision.
+If PostgreSQL or opt-in outbound effects require review, it separately asks whether to
+commit or discard them. Without a configured database, the review instead says plainly
+that PostgreSQL was not intercepted. Automation must choose explicitly when it has
+reviewable database or outbound effects:
 
 ```sh
 unring run --commit -- your-command
@@ -177,9 +233,10 @@ make test-integration
 
 Every run creates a structured JSON audit record before the child starts and updates
 it atomically as the session progresses. It includes start and end times, the requested
-decision and confirmed outcome, per-table row changes, schema changes, irreversible
-actions approved or declined, intercepted HTTPS requests, and anything unring saw but
-could not intercept. It also records whether PostgreSQL interception was active or not
+decision and confirmed outcome, watched paths, uncaptured paths, created/modified/deleted
+files and restore outcomes, per-table row changes, schema changes, irreversible actions
+approved or declined, intercepted HTTPS requests, and anything unring saw but could not
+intercept. It also records whether outbound interception was enabled and whether PostgreSQL was active or not
 configured and the fixed structural blind-spot disclosure. Signal termination, a
 recoverable unring panic, and backend loss all retain a record; an unknown database
 outcome is recorded as `unknown`, never as a successful discard.
@@ -201,12 +258,17 @@ readable history.
 unring log                    # list past sessions, newest first
 unring log <session-id>       # human-readable detail; an unambiguous prefix works
 unring log --json <session-id>
+unring restore <session-id>
+unring snapshots
 ```
 
 The per-user state root is `$XDG_STATE_HOME/unring` when `XDG_STATE_HOME` is set,
 otherwise the platform user-config directory plus `unring` (on macOS,
 `~/Library/Application Support/unring`). `UNRING_STATE_DIR` is an explicit override
 for isolated installations and tests.
+
+File snapshots are stored beneath `<state-root>/snapshots/<session-id>`; unring excludes
+its own state root if it is inside a watched project tree.
 
 The CA certificate is stored at `<state-root>/ca/ca.pem`; its private key is
 `<state-root>/ca/ca-key.pem`, inside a mode-`0700` directory with mode-`0600`

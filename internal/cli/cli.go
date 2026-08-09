@@ -27,6 +27,7 @@ import (
 	"github.com/hyj28/unring/internal/childenv"
 	"github.com/hyj28/unring/internal/ghshim"
 	"github.com/hyj28/unring/internal/httpsproxy"
+	"github.com/hyj28/unring/internal/localrollback"
 	"github.com/hyj28/unring/internal/pgproxy"
 	"github.com/hyj28/unring/internal/runner"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -38,8 +39,20 @@ const (
 	usageExitCode         = 2
 	defaultReviewWidth    = 80
 
-	quietSessionDisclosure = "unring: nothing intercepted. Not visible to unring: SSH/git push, raw sockets, unshimmed CLIs."
+	quietSessionDisclosure = "unring: nothing intercepted. Outbound is not covered unless --outbound was given. Not visible to unring: SSH/git push, raw sockets, unshimmed CLIs."
 )
+
+type stringListFlag []string
+
+func (values *stringListFlag) String() string { return strings.Join(*values, ",") }
+
+func (values *stringListFlag) Set(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return errors.New("watched path cannot be empty")
+	}
+	*values = append(*values, value)
+	return nil
+}
 
 type postgresSession interface {
 	Address() string
@@ -103,6 +116,17 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runCommand(args[1:], stdin, stdout, stderr)
 	case "log":
 		return logCommand(args[1:], stdout, stderr)
+	case "restore":
+		return restoreCommand(args[1:], stdout, stderr)
+	case "snapshots":
+		return snapshotsCommand(args[1:], stdout, stderr)
+	case "--outbound":
+		if len(args) == 1 {
+			fmt.Fprintln(stderr, "unring: no child command given")
+			return usageExitCode
+		}
+		runArgs := append([]string{"--outbound", "--", args[1]}, args[2:]...)
+		return runCommand(runArgs, stdin, stdout, stderr)
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return 0
@@ -125,8 +149,12 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	flags.SetOutput(stderr)
 	forceCommit := flags.Bool("commit", false, "commit without prompting")
 	forceDiscard := flags.Bool("discard", false, "discard without prompting")
+	outboundEnabled := flags.Bool("outbound", false, "enable HTTPS interception, adapters, and the gh shim")
+	retentionCap := flags.Int64("snapshot-cap-bytes", -1, "snapshot retention cap in bytes")
+	var watched stringListFlag
+	flags.Var(&watched, "watch", "path to snapshot (repeatable; replaces the default scope)")
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: unring run [--commit | --discard] -- <command> [args...]")
+		fmt.Fprintln(stderr, "Usage: unring run [--commit | --discard] [--outbound] [--watch path] -- <command> [args...]")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr,
 			"Run one bounded command with optional PostgreSQL and supported HTTPS effects held for review.")
@@ -149,16 +177,86 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		flags.Usage()
 		return usageExitCode
 	}
+	capBytes := *retentionCap
+	if capBytes < -1 {
+		fmt.Fprintln(stderr, "unring: --snapshot-cap-bytes must be non-negative")
+		return usageExitCode
+	}
+	watchPaths := []string(watched)
+	if len(watchPaths) == 0 {
+		workingDirectory, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintf(stderr, "unring: find working directory for file snapshot: %v\n", err)
+			return internalErrorExitCode
+		}
+		homeDirectory, err := os.UserHomeDir()
+		if err != nil {
+			fmt.Fprintf(stderr, "unring: find home directory for file snapshot: %v\n", err)
+			return internalErrorExitCode
+		}
+		watchPaths, err = localrollback.DefaultWatchPaths(workingDirectory, homeDirectory)
+		if err != nil {
+			fmt.Fprintf(stderr, "unring: choose file snapshot scope: %v\n", err)
+			return internalErrorExitCode
+		}
+	}
 
 	auditStore, err := audit.OpenStore()
 	if err != nil {
 		fmt.Fprintf(stderr, "unring: open audit log: %v\n", err)
 		return internalErrorExitCode
 	}
+	if capBytes < 0 {
+		capBytes, err = localrollback.RetentionCapForState(auditStore.StateDir())
+		if err != nil {
+			fmt.Fprintf(stderr, "unring: read snapshot retention cap: %v\n", err)
+			return usageExitCode
+		}
+	}
+	if err := localrollback.SaveRetentionCap(auditStore.StateDir(), capBytes); err != nil {
+		fmt.Fprintf(stderr, "unring: save snapshot retention cap: %v\n", err)
+		return internalErrorExitCode
+	}
 	auditSession, err := auditStore.Begin(command, time.Now())
 	if err != nil {
 		fmt.Fprintf(stderr, "unring: begin audit log: %v\n", err)
 		return internalErrorExitCode
+	}
+	auditRecord := auditSession.Snapshot()
+	fileSession, fileSummary, err := localrollback.Start(
+		auditStore.StateDir(), auditRecord.ID, watchPaths, capBytes, auditRecord.StartedAt,
+	)
+	if err != nil {
+		_ = auditSession.Update(func(record *audit.Record) {
+			record.Files = localrollback.Summary{
+				Watched: watchPaths, Complete: false, Error: err.Error(),
+				RetentionCap: capBytes, Retained: false,
+			}
+			record.EndedAt = time.Now().UTC()
+			record.ExitCode = internalErrorExitCode
+			record.Error = err.Error()
+			record.Outcome = "not_started"
+		})
+		fmt.Fprintf(stderr, "unring: create file snapshot: %v\n", err)
+		return internalErrorExitCode
+	}
+	if err := auditSession.Update(func(record *audit.Record) {
+		record.Files = fileSummary
+		record.Outbound = *outboundEnabled
+		if !*outboundEnabled {
+			record.HTTPS = httpsproxy.Summary{Sealed: true, Finalized: true}
+			record.GH = ghshim.Summary{Sealed: true}
+		}
+	}); err != nil {
+		fmt.Fprintf(stderr, "unring: record file snapshot: %v\n", err)
+		return internalErrorExitCode
+	}
+	printSnapshotStarted(stderr, fileSummary)
+	for _, evictedID := range fileSummary.Evicted {
+		if evictedRecord, loadErr := auditStore.Load(evictedID); loadErr == nil {
+			evictedRecord.Files.Retained = false
+			_ = auditStore.Save(evictedRecord)
+		}
 	}
 
 	var proxy postgresSession
@@ -200,6 +298,8 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			record.ExitCode = exitCode
 			record.Error = strings.TrimPrefix(auditError, "\n")
 			record.Decision = requestedDecision
+			record.Outbound = *outboundEnabled
+			record.Files = fileSummary
 			if proxy != nil {
 				record.Postgres = proxy.Summary()
 			}
@@ -232,60 +332,63 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		fmt.Fprintf(stderr, "unring: %v\n", err)
 		return internalErrorExitCode
 	}
-	adapterSet, err := loadAdapters(os.Getenv("UNRING_ADAPTERS"))
-	if err != nil {
-		auditError = err.Error()
-		fmt.Fprintf(stderr, "unring: load HTTPS adapters: %v\n", err)
-		return internalErrorExitCode
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	approvalRequests := make(chan runner.ApprovalRequest)
-	ghSession, err = ghshim.Start(ghshim.Options{
-		Adapters: adapterSet, Stdin: stdin, Stdout: stdout, Stderr: stderr,
-		Approve: func(approvalContext context.Context, request ghshim.ApprovalRequest) (bool, error) {
-			reply := make(chan runner.ApprovalResult, 1)
-			work := runner.ApprovalRequest{
-				Decide: func() (bool, error) {
-					return promptGHApproval(stdin, stdout, request), nil
-				},
-				Reply: reply,
-			}
-			select {
-			case approvalRequests <- work:
-			case <-approvalContext.Done():
-				return false, approvalContext.Err()
-			}
-			select {
-			case result := <-reply:
-				decision := "declined"
-				if result.Approved {
-					decision = "approved"
+	var adapterSet *adapter.Set
+	if *outboundEnabled {
+		adapterSet, err = loadAdapters(os.Getenv("UNRING_ADAPTERS"))
+		if err != nil {
+			cancel()
+			auditError = err.Error()
+			fmt.Fprintf(stderr, "unring: load HTTPS adapters: %v\n", err)
+			return internalErrorExitCode
+		}
+		ghSession, err = ghshim.Start(ghshim.Options{
+			Adapters: adapterSet, Stdin: stdin, Stdout: stdout, Stderr: stderr,
+			Approve: func(approvalContext context.Context, request ghshim.ApprovalRequest) (bool, error) {
+				reply := make(chan runner.ApprovalResult, 1)
+				work := runner.ApprovalRequest{
+					Decide: func() (bool, error) {
+						return promptGHApproval(stdin, stdout, request), nil
+					},
+					Reply: reply,
 				}
-				approvalError := ""
-				if result.Err != nil {
-					decision = "error"
-					approvalError = result.Err.Error()
+				select {
+				case approvalRequests <- work:
+				case <-approvalContext.Done():
+					return false, approvalContext.Err()
 				}
-				if err := auditSession.Update(func(record *audit.Record) {
-					record.Approvals = append(record.Approvals, audit.Approval{
-						Kind: "gh", Statement: request.Invocation, Reason: request.Reason,
-						Decision: decision, Error: approvalError, Time: time.Now().UTC(),
-					})
-				}); err != nil {
-					return false, fmt.Errorf("record gh approval decision: %w", err)
+				select {
+				case result := <-reply:
+					decision := "declined"
+					if result.Approved {
+						decision = "approved"
+					}
+					approvalError := ""
+					if result.Err != nil {
+						decision = "error"
+						approvalError = result.Err.Error()
+					}
+					if err := auditSession.Update(func(record *audit.Record) {
+						record.Approvals = append(record.Approvals, audit.Approval{
+							Kind: "gh", Statement: request.Invocation, Reason: request.Reason,
+							Decision: decision, Error: approvalError, Time: time.Now().UTC(),
+						})
+					}); err != nil {
+						return false, fmt.Errorf("record gh approval decision: %w", err)
+					}
+					return result.Approved, result.Err
+				case <-approvalContext.Done():
+					return false, approvalContext.Err()
 				}
-				return result.Approved, result.Err
-			case <-approvalContext.Done():
-				return false, approvalContext.Err()
-			}
-		},
-	})
-	if err != nil {
-		cancel()
-		auditError = err.Error()
-		fmt.Fprintf(stderr, "unring: start per-session gh shim: %v\n", err)
-		return internalErrorExitCode
+			},
+		})
+		if err != nil {
+			cancel()
+			auditError = err.Error()
+			fmt.Fprintf(stderr, "unring: start per-session gh shim: %v\n", err)
+			return internalErrorExitCode
+		}
 	}
 	if databaseConfigured {
 		startedProxy, startErr := pgproxy.StartWithOptions(ctx, backendConfig, pgproxy.Options{
@@ -341,60 +444,63 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		return internalErrorExitCode
 	}
 
-	authority, err := httpsproxy.EnsureAuthority(auditStore.StateDir())
-	if err != nil {
-		auditError = err.Error()
-		fmt.Fprintf(stderr, "unring: initialize per-user HTTPS CA: %v\n", err)
-		return internalErrorExitCode
-	}
-	httpsProxy, err = httpsproxy.Start(authority, httpsproxy.Options{
-		PassthroughHost:   configuredPassthroughHosts(os.Getenv("UNRING_HTTPS_PASSTHROUGH")),
-		AgentControlPlane: configuredAgentControlPlane(command),
-		Adapters:          adapterSet,
-		StagedUpdated:     stagedAuditUpdater(auditSession),
-		Approve: func(approvalContext context.Context, request httpsproxy.ApprovalRequest) (bool, error) {
-			reply := make(chan runner.ApprovalResult, 1)
-			work := runner.ApprovalRequest{
-				Decide: func() (bool, error) {
-					return promptHTTPSApproval(stdin, stdout, request), nil
-				},
-				Reply: reply,
-			}
-			select {
-			case approvalRequests <- work:
-			case <-approvalContext.Done():
-				return false, approvalContext.Err()
-			}
-			select {
-			case result := <-reply:
-				decision := "declined"
-				if result.Approved {
-					decision = "approved"
+	var authority *httpsproxy.Authority
+	if *outboundEnabled {
+		authority, err = httpsproxy.EnsureAuthority(auditStore.StateDir())
+		if err != nil {
+			auditError = err.Error()
+			fmt.Fprintf(stderr, "unring: initialize per-user HTTPS CA: %v\n", err)
+			return internalErrorExitCode
+		}
+		httpsProxy, err = httpsproxy.Start(authority, httpsproxy.Options{
+			PassthroughHost:   configuredPassthroughHosts(os.Getenv("UNRING_HTTPS_PASSTHROUGH")),
+			AgentControlPlane: configuredAgentControlPlane(command),
+			Adapters:          adapterSet,
+			StagedUpdated:     stagedAuditUpdater(auditSession),
+			Approve: func(approvalContext context.Context, request httpsproxy.ApprovalRequest) (bool, error) {
+				reply := make(chan runner.ApprovalResult, 1)
+				work := runner.ApprovalRequest{
+					Decide: func() (bool, error) {
+						return promptHTTPSApproval(stdin, stdout, request), nil
+					},
+					Reply: reply,
 				}
-				approvalError := ""
-				if result.Err != nil {
-					decision = "error"
-					approvalError = result.Err.Error()
+				select {
+				case approvalRequests <- work:
+				case <-approvalContext.Done():
+					return false, approvalContext.Err()
 				}
-				if err := auditSession.Update(func(record *audit.Record) {
-					record.Approvals = append(record.Approvals, audit.Approval{
-						Kind: "https", Statement: request.Method + " " + request.URL,
-						Reason: request.Reason, Decision: decision,
-						Error: approvalError, Time: time.Now().UTC(),
-					})
-				}); err != nil {
-					return false, fmt.Errorf("record HTTPS approval decision: %w", err)
+				select {
+				case result := <-reply:
+					decision := "declined"
+					if result.Approved {
+						decision = "approved"
+					}
+					approvalError := ""
+					if result.Err != nil {
+						decision = "error"
+						approvalError = result.Err.Error()
+					}
+					if err := auditSession.Update(func(record *audit.Record) {
+						record.Approvals = append(record.Approvals, audit.Approval{
+							Kind: "https", Statement: request.Method + " " + request.URL,
+							Reason: request.Reason, Decision: decision,
+							Error: approvalError, Time: time.Now().UTC(),
+						})
+					}); err != nil {
+						return false, fmt.Errorf("record HTTPS approval decision: %w", err)
+					}
+					return result.Approved, result.Err
+				case <-approvalContext.Done():
+					return false, approvalContext.Err()
 				}
-				return result.Approved, result.Err
-			case <-approvalContext.Done():
-				return false, approvalContext.Err()
-			}
-		},
-	})
-	if err != nil {
-		auditError = err.Error()
-		fmt.Fprintf(stderr, "unring: start HTTPS proxy: %v\n", err)
-		return internalErrorExitCode
+			},
+		})
+		if err != nil {
+			auditError = err.Error()
+			fmt.Fprintf(stderr, "unring: start HTTPS proxy: %v\n", err)
+			return internalErrorExitCode
+		}
 	}
 
 	childEnvironment := os.Environ()
@@ -408,15 +514,17 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			return internalErrorExitCode
 		}
 	}
-	childEnvironment, err = childenv.HTTPS(
-		childEnvironment, httpsProxy.Address(), authority.CertificatePath,
-	)
-	if err != nil {
-		auditError = err.Error()
-		fmt.Fprintf(stderr, "unring: build child HTTPS environment: %v\n", err)
-		return internalErrorExitCode
+	if *outboundEnabled {
+		childEnvironment, err = childenv.HTTPS(
+			childEnvironment, httpsProxy.Address(), authority.CertificatePath,
+		)
+		if err != nil {
+			auditError = err.Error()
+			fmt.Fprintf(stderr, "unring: build child HTTPS environment: %v\n", err)
+			return internalErrorExitCode
+		}
+		childEnvironment = ghSession.Environment(childEnvironment)
 	}
-	childEnvironment = ghSession.Environment(childEnvironment)
 
 	signalChannel := make(chan os.Signal, 2)
 	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
@@ -442,16 +550,53 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	if result.Err != nil {
 		auditError = joinErrorText(auditError, result.Err)
 	}
+	fileSummary = fileSession.Seal(time.Now())
+	if evicted, usage, retentionErr := localrollback.EnforceRetention(
+		auditStore.StateDir(), capBytes, auditRecord.ID,
+	); retentionErr != nil {
+		fmt.Fprintf(stderr, "unring: enforce snapshot retention: %v\n", retentionErr)
+	} else {
+		for _, evictedID := range evicted {
+			fileSummary.Evicted = append(fileSummary.Evicted, evictedID)
+			if evictedID == auditRecord.ID {
+				fileSummary.Retained = false
+			}
+			fmt.Fprintf(stderr, "unring: retention evicted oldest snapshot %s.\n", evictedID)
+			if evictedRecord, loadErr := auditStore.Load(evictedID); loadErr == nil {
+				evictedRecord.Files.Retained = false
+				_ = auditStore.Save(evictedRecord)
+			}
+		}
+		if usage.Exact && usage.Bytes > usage.CapBytes {
+			fmt.Fprintf(stderr,
+				"unring: current snapshot remains retained; measured snapshot usage is %d bytes, above the %d-byte cap. It becomes eligible for eviction after this session.\n",
+				usage.Bytes, usage.CapBytes)
+		}
+	}
+	if !fileSummary.Complete {
+		fmt.Fprintf(stderr, "unring: FILE COVERAGE INCOMPLETE: %s\n", fileSummary.Error)
+	}
+	printFileChanges(stdout, auditRecord.ID, fileSummary)
+	if err := auditSession.Update(func(record *audit.Record) { record.Files = fileSummary }); err != nil {
+		auditError = joinErrorText(auditError, err)
+		fmt.Fprintf(stderr, "unring: record file changes: %v\n", err)
+	}
 
-	ghSealContext, ghSealCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	ghSealErr := ghSession.Seal(ghSealContext)
-	ghSealCancel()
-	ghSummary := ghSession.Summary()
+	ghSummary := ghshim.Summary{Sealed: true}
+	httpsSummary := httpsproxy.Summary{Sealed: true, Finalized: true}
+	var ghSealErr error
+	var httpsSealErr error
+	if *outboundEnabled {
+		ghSealContext, ghSealCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ghSealErr = ghSession.Seal(ghSealContext)
+		ghSealCancel()
+		ghSummary = ghSession.Summary()
 
-	httpsSealContext, httpsSealCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	httpsSealErr := httpsProxy.Seal(httpsSealContext)
-	httpsSealCancel()
-	httpsSummary := httpsProxy.Summary()
+		httpsSealContext, httpsSealCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		httpsSealErr = httpsProxy.Seal(httpsSealContext)
+		httpsSealCancel()
+		httpsSummary = httpsProxy.Summary()
+	}
 
 	sealContext, sealCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	sealErr := proxy.Seal(sealContext)
@@ -495,13 +640,20 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			// commit decision, but they were intercepted and must remain visible.
 			printObservedSummaryWithExternal(stdout, summary, httpsSummary, ghSummary)
 		} else if summary.InterceptionStatus == pgproxy.InterceptionNotConfigured {
+			if !*outboundEnabled {
+				printOutboundDisabled(stdout)
+			}
 			printCoverageOnlyReview(stdout, summary)
 		} else {
 			fmt.Fprintln(stderr, quietSessionDisclosure)
 		}
 		finalizeContext, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		ghFinalizeErr := ghSession.Finalize(finalizeContext, false)
-		httpsFinalizeErr := httpsProxy.Finalize(finalizeContext, false)
+		var ghFinalizeErr error
+		var httpsFinalizeErr error
+		if *outboundEnabled {
+			ghFinalizeErr = ghSession.Finalize(finalizeContext, false)
+			httpsFinalizeErr = httpsProxy.Finalize(finalizeContext, false)
+		}
 		finalizeErr := errors.Join(
 			ghFinalizeErr, httpsFinalizeErr,
 			proxy.Finalize(finalizeContext, pgproxy.DecisionRollback),
@@ -512,8 +664,11 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			auditError = finalizeErr.Error()
 			_ = auditSession.Update(func(record *audit.Record) {
 				record.Postgres = summary
-				updateHTTPSAudit(record, httpsProxy.Summary())
+				if *outboundEnabled {
+					updateHTTPSAudit(record, httpsProxy.Summary())
+				}
 				record.GH = ghSummary
+				record.Files = fileSummary
 				record.Decision = "discard"
 				record.Outcome = "unknown"
 			})
@@ -523,8 +678,11 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		finalized = true
 		if err := auditSession.Update(func(record *audit.Record) {
 			record.Postgres = summary
-			updateHTTPSAudit(record, httpsProxy.Summary())
+			if *outboundEnabled {
+				updateHTTPSAudit(record, httpsProxy.Summary())
+			}
 			record.GH = ghSummary
+			record.Files = fileSummary
 			record.Decision = "discard"
 			record.Outcome = "discarded"
 		}); err != nil {
@@ -538,6 +696,9 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	useTUI := interceptionErr == nil && !interrupted && result.Err == nil &&
 		summary.Changes.Complete && !*forceCommit && !*forceDiscard && shouldUseTUI(stdin, stdout)
 	if !useTUI {
+		if !*outboundEnabled {
+			printOutboundDisabled(stdout)
+		}
 		printSummaryWithExternal(stdout, summary, httpsSummary, ghSummary)
 	}
 
@@ -593,16 +754,22 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	}
 	requestedDecision = auditDecision(decision)
 	commitExternal := decision == pgproxy.DecisionCommit
-	ghFinalizeContext, ghFinalizeCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	ghFinalizeErr := ghSession.Finalize(ghFinalizeContext, commitExternal)
-	ghFinalizeCancel()
+	var ghFinalizeErr error
+	if *outboundEnabled {
+		ghFinalizeContext, ghFinalizeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ghFinalizeErr = ghSession.Finalize(ghFinalizeContext, commitExternal)
+		ghFinalizeCancel()
+	}
 	if ghFinalizeErr != nil {
 		auditError = joinErrorText(auditError, ghFinalizeErr)
 	}
 	commitHTTPS := commitExternal && ghFinalizeErr == nil
-	httpsFinalizeContext, httpsFinalizeCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	httpsFinalizeErr := httpsProxy.Finalize(httpsFinalizeContext, commitHTTPS)
-	httpsFinalizeCancel()
+	var httpsFinalizeErr error
+	if *outboundEnabled {
+		httpsFinalizeContext, httpsFinalizeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		httpsFinalizeErr = httpsProxy.Finalize(httpsFinalizeContext, commitHTTPS)
+		httpsFinalizeCancel()
+	}
 	postgresDecision := decision
 	if httpsFinalizeErr != nil || ghFinalizeErr != nil {
 		// A staged HTTP replay may have partially succeeded. Keep the database
@@ -617,17 +784,23 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	finalized = true
 	if finalizeErr != nil {
 		auditError = joinErrorText(auditError, postgresFinalizeErr)
-		finalHTTPS := httpsProxy.Summary()
+		finalHTTPS := httpsSummary
+		if *outboundEnabled {
+			finalHTTPS = httpsProxy.Summary()
+		}
 		_ = auditSession.Update(func(record *audit.Record) {
 			record.Postgres = proxy.Summary()
-			updateHTTPSAudit(record, finalHTTPS)
-			record.GH = ghSession.Summary()
+			if *outboundEnabled {
+				updateHTTPSAudit(record, finalHTTPS)
+				record.GH = ghSession.Summary()
+			}
+			record.Files = fileSummary
 			record.Outcome = "unknown"
 		})
 		if commitHTTPS && httpsFinalizeErr != nil {
 			printPartialCommitOutcome(stdout, finalHTTPS, postgresFinalizeErr)
 		}
-		if ghFinalizeErr != nil {
+		if *outboundEnabled && ghFinalizeErr != nil {
 			fmt.Fprintln(stdout, "\nGH DISCARD COMPENSATION FAILED OR WAS IMPOSSIBLE")
 			fmt.Fprintln(stdout,
 				"An approved gh mutation really ran and may still exist. Unring is not claiming it was undone.")
@@ -639,8 +812,11 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	}
 	if err := auditSession.Update(func(record *audit.Record) {
 		record.Postgres = proxy.Summary()
-		updateHTTPSAudit(record, httpsProxy.Summary())
-		record.GH = ghSession.Summary()
+		if *outboundEnabled {
+			updateHTTPSAudit(record, httpsProxy.Summary())
+			record.GH = ghSession.Summary()
+		}
+		record.Files = fileSummary
 		record.Outcome = pastTense(decision)
 	}); err != nil {
 		auditError = err.Error()
@@ -653,6 +829,92 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		return result.ExitCode
 	}
 	return result.ExitCode
+}
+
+func printSnapshotStarted(output io.Writer, summary localrollback.Summary) {
+	if strings.Contains(summary.Storage, "full-copy") {
+		fmt.Fprintf(output,
+			"unring: snapshot cloning was unavailable for %d bytes; those bytes were copied in full before the child started.\n",
+			summary.CopiedBytes)
+	}
+	for _, failure := range summary.Uncaptured {
+		fmt.Fprintf(output, "unring: FILE NOT SNAPSHOTTED: %s: %s\n", failure.Path, failure.Error)
+	}
+	for _, evicted := range summary.Evicted {
+		fmt.Fprintf(output, "unring: retention evicted oldest snapshot %s.\n", evicted)
+	}
+	if summary.StorageExact && summary.StorageBytes > summary.RetentionCap {
+		fmt.Fprintf(output,
+			"unring: current snapshot uses %d measured bytes, above the %d-byte cap; it is retained for this session and becomes eligible for eviction later.\n",
+			summary.StorageBytes, summary.RetentionCap)
+	} else if !summary.StorageExact {
+		fmt.Fprintf(output,
+			"unring: snapshot storage is an upper-bound estimate of %d bytes; retention will not evict snapshots based on that estimate.\n",
+			summary.StorageBytes)
+	}
+}
+
+func printFileChanges(output io.Writer, sessionID string, summary localrollback.Summary) {
+	if len(summary.Changes) == 0 {
+		return
+	}
+	created, modified, deleted := 0, 0, 0
+	for _, change := range summary.Changes {
+		switch change.Kind {
+		case "created":
+			created++
+		case "modified":
+			modified++
+		case "deleted":
+			deleted++
+		}
+	}
+	fmt.Fprintf(output,
+		"Files changed: %d created, %d modified, %d deleted. No file decision is needed now.\n",
+		created, modified, deleted)
+	for _, change := range summary.Changes {
+		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
+		if change.UnrestorableReason != "" {
+			fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
+		}
+	}
+	if summary.Retained && hasRestorableFileChange(summary.Changes) {
+		fmt.Fprintf(output, "Restore later with: unring restore %s\n", sessionID)
+	} else if summary.Retained {
+		fmt.Fprintln(output, "No changed path has restorable snapshot data.")
+	} else {
+		fmt.Fprintln(output, "Snapshot data is no longer retained; these paths cannot be restored from this session.")
+	}
+}
+
+func printAuditFiles(output io.Writer, summary localrollback.Summary) {
+	if len(summary.Watched) == 0 {
+		return
+	}
+	fmt.Fprintln(output, "\nFILES — RESTORE COVERAGE")
+	storageLabel := "measured storage bytes"
+	if !summary.StorageExact {
+		storageLabel = "storage-byte upper bound"
+	}
+	fmt.Fprintf(output, "  Snapshot: %s; %d %s (%d logical); retained: %t\n",
+		summary.Storage, summary.StorageBytes, storageLabel, summary.LogicalBytes, summary.Retained)
+	for _, failure := range summary.Uncaptured {
+		fmt.Fprintf(output, "  NOT SNAPSHOTTED: %s: %s\n", failure.Path, failure.Error)
+	}
+	for _, change := range summary.Changes {
+		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
+		if change.UnrestorableReason != "" {
+			fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
+		}
+	}
+	if summary.Error != "" {
+		fmt.Fprintf(output, "  INCOMPLETE: %s\n", summary.Error)
+	}
+}
+
+func printOutboundDisabled(output io.Writer) {
+	fmt.Fprintln(output, "\nOUTBOUND INTERCEPTION DISABLED — HTTPS, adapters, and the gh shim were not started.")
+	fmt.Fprintln(output, "Use --outbound on a future session to opt in; restoring files cannot recall data already sent.")
 }
 
 func printCompensationFailures(output io.Writer, summary httpsproxy.Summary) {
@@ -948,6 +1210,189 @@ func writeJSON(stdout, stderr io.Writer, value any) int {
 	return 0
 }
 
+func restoreCommand(args []string, stdout, stderr io.Writer) int {
+	force := false
+	restoreAll := false
+	var sessionID string
+	var selections []string
+	for index := 0; index < len(args); index++ {
+		switch args[index] {
+		case "--force":
+			force = true
+		case "--all":
+			restoreAll = true
+		case "--path":
+			index++
+			if index >= len(args) {
+				fmt.Fprintln(stderr, "unring: --path requires a value")
+				return usageExitCode
+			}
+			selections = append(selections, args[index])
+		case "-h", "--help":
+			fmt.Fprintln(stdout, "Usage: unring restore [--force] [--all] <session-id> [changed-path ...]")
+			fmt.Fprintln(stdout, "With no changed paths, list the files available to restore.")
+			return 0
+		case "--":
+			selections = append(selections, args[index+1:]...)
+			index = len(args)
+		default:
+			if strings.HasPrefix(args[index], "-") {
+				fmt.Fprintf(stderr, "unring: unknown restore option %q\n", args[index])
+				return usageExitCode
+			}
+			if sessionID == "" {
+				sessionID = args[index]
+			} else {
+				selections = append(selections, args[index])
+			}
+		}
+	}
+	if sessionID == "" {
+		fmt.Fprintln(stderr, "Usage: unring restore [--force] [--all] <session-id> [changed-path ...]")
+		return usageExitCode
+	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: open audit log: %v\n", err)
+		return internalErrorExitCode
+	}
+	record, err := store.Load(sessionID)
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: %v\n", err)
+		return internalErrorExitCode
+	}
+	if len(record.Files.Changes) == 0 {
+		fmt.Fprintf(stdout, "Session %s changed no watched files.\n", record.ID)
+		return 0
+	}
+	if len(selections) == 0 && !restoreAll {
+		printRestoreListing(stdout, record)
+		return 0
+	}
+	if restoreAll {
+		if len(selections) > 0 {
+			fmt.Fprintln(stderr, "unring: --all cannot be combined with selected paths")
+			return usageExitCode
+		}
+		for _, change := range record.Files.Changes {
+			selections = append(selections, change.Path)
+		}
+	}
+	results, err := localrollback.Restore(store.StateDir(), record.ID, selections, force)
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: restore %s: %v\n", record.ID, err)
+		return internalErrorExitCode
+	}
+	exitCode := 0
+	for _, result := range results {
+		restoreEvent := localrollback.RestoreRecord{
+			Path: result.Path, Status: result.Status, Sidecar: result.Sidecar, RestoredAt: time.Now().UTC(),
+		}
+		switch result.Status {
+		case "restored":
+			fmt.Fprintf(stdout, "restored  %s\n", result.Path)
+		case "already-restored":
+			fmt.Fprintf(stdout, "already restored  %s\n", result.Path)
+		case "refused":
+			exitCode = internalErrorExitCode
+			if result.Err != nil {
+				restoreEvent.Error = result.Err.Error()
+				fmt.Fprintf(stderr, "refused   %s: %v; not restored\n", result.Path, result.Err)
+				break
+			}
+			fmt.Fprintf(stderr, "refused   %s: changed after the session ended; not overwritten\n", result.Path)
+			if result.Sidecar != "" {
+				fmt.Fprintf(stderr, "snapshot version written alongside: %s\n", result.Sidecar)
+			} else {
+				fmt.Fprintln(stderr, "pre-session state was absence, so there is no snapshot file to write alongside")
+			}
+			fmt.Fprintln(stderr, "rerun with --force to overwrite the conflict explicitly")
+		case "unavailable":
+			exitCode = internalErrorExitCode
+			if result.Err != nil {
+				restoreEvent.Error = result.Err.Error()
+				fmt.Fprintf(stderr, "unavailable %s: %v\n", result.Path, result.Err)
+			} else {
+				fmt.Fprintf(stderr, "unavailable %s: path was outside snapshot coverage\n", result.Path)
+			}
+		default:
+			exitCode = internalErrorExitCode
+			restoreEvent.Status = "error"
+			if result.Err != nil {
+				restoreEvent.Error = result.Err.Error()
+				fmt.Fprintf(stderr, "error     %s: %v\n", result.Path, result.Err)
+			} else {
+				fmt.Fprintf(stderr, "error     %s\n", result.Path)
+			}
+		}
+		record.Files.RestoreEvents = append(record.Files.RestoreEvents, restoreEvent)
+	}
+	if err := store.Save(record); err != nil {
+		fmt.Fprintf(stderr, "unring: record restore outcome: %v\n", err)
+		return internalErrorExitCode
+	}
+	return exitCode
+}
+
+func snapshotsCommand(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 0 {
+		fmt.Fprintln(stderr, "Usage: unring snapshots")
+		return usageExitCode
+	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: open state store: %v\n", err)
+		return internalErrorExitCode
+	}
+	capBytes, err := localrollback.RetentionCapForState(store.StateDir())
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: %v\n", err)
+		return usageExitCode
+	}
+	usage, err := localrollback.StorageUsage(store.StateDir(), capBytes)
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: inspect snapshot storage: %v\n", err)
+		return internalErrorExitCode
+	}
+	if usage.Exact {
+		fmt.Fprintf(stdout, "Snapshot storage: %d bytes used of %d bytes; %d sessions retained.\n",
+			usage.Bytes, usage.CapBytes, usage.Sessions)
+	} else {
+		fmt.Fprintf(stdout, "Snapshot storage: upper-bound estimate %d bytes of %d bytes; %d sessions retained.\n",
+			usage.Bytes, usage.CapBytes, usage.Sessions)
+	}
+	return 0
+}
+
+func printRestoreListing(output io.Writer, record audit.Record) {
+	fmt.Fprintf(output, "UNRING FILE CHANGES %s\n", record.ID)
+	for _, change := range record.Files.Changes {
+		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
+		if change.UnrestorableReason != "" {
+			fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
+		}
+	}
+	if !record.Files.Retained {
+		fmt.Fprintln(output, "Snapshot data has been evicted; these changes are no longer restorable.")
+		return
+	}
+	if hasRestorableFileChange(record.Files.Changes) {
+		fmt.Fprintf(output, "Restore selected paths with: unring restore %s <path> [...]\n", record.ID)
+		fmt.Fprintf(output, "Restore every restorable path with: unring restore --all %s\n", record.ID)
+	} else {
+		fmt.Fprintln(output, "No changed path has restorable snapshot data.")
+	}
+}
+
+func hasRestorableFileChange(changes []localrollback.Change) bool {
+	for _, change := range changes {
+		if change.UnrestorableReason == "" {
+			return true
+		}
+	}
+	return false
+}
+
 func printAuditRecord(output io.Writer, record audit.Record) {
 	fmt.Fprintf(output, "UNRING SESSION %s\n", record.ID)
 	fmt.Fprintf(output, "Started:  %s\n", record.StartedAt.Local().Format(time.RFC3339))
@@ -958,9 +1403,11 @@ func printAuditRecord(output io.Writer, record audit.Record) {
 	fmt.Fprintf(output, "Decision: %s\n", record.Decision)
 	fmt.Fprintf(output, "Outcome:  %s\n", record.Outcome)
 	fmt.Fprintf(output, "Exit code: %d\n", record.ExitCode)
+	fmt.Fprintf(output, "Outbound interception: %t\n", record.Outbound)
 	if record.Error != "" {
 		fmt.Fprintf(output, "Error: %s\n", record.Error)
 	}
+	printAuditFiles(output, record.Files)
 	if hasOnlyObservedHTTPSActivity(record.Postgres, record.HTTPS, record.GH) {
 		printObservedSummaryWithExternal(output, record.Postgres, record.HTTPS, record.GH)
 	} else {
@@ -1611,16 +2058,18 @@ func pastTense(decision pgproxy.Decision) string {
 }
 
 func printUsage(output io.Writer) {
-	fmt.Fprintln(output, "unring holds an agent's PostgreSQL and supported HTTPS side effects for review")
-	fmt.Fprintln(output, "and then applies one decision: commit or discard.")
+	fmt.Fprintln(output, "unring snapshots an agent's local file changes for later per-file restore.")
+	fmt.Fprintln(output, "PostgreSQL changes still end with one decision: commit or discard; outbound interception is optional.")
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "Primary workflow (one bounded agent task that exits):")
 	fmt.Fprintln(output, "  unring run -- claude -p 'Implement one bounded task, then stop'")
 	fmt.Fprintln(output, "  unring run -- <one-shot-agent-command> [args...]")
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "Usage:")
-	fmt.Fprintln(output, "  unring run [--commit | --discard] -- <command> [args...]")
+	fmt.Fprintln(output, "  unring run [--commit | --discard] [--outbound] [--watch path] -- <command> [args...]")
 	fmt.Fprintln(output, "  unring log [--json] [session-id]")
+	fmt.Fprintln(output, "  unring restore [--force] [--all] <session-id> [changed-path ...]")
+	fmt.Fprintln(output, "  unring snapshots")
 	fmt.Fprintln(output, "  unring <command-on-PATH> [--] [args...]")
 	fmt.Fprintln(output, "  unring claude|codex|opencode [--] [args...]")
 	fmt.Fprintln(output, "  unring --version")
@@ -1629,9 +2078,10 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  export DATABASE_URL='postgresql://user:password@localhost/database'")
 	fmt.Fprintln(output, "  unring run -- <one-shot-agent-command>")
 	fmt.Fprintln(output)
-	fmt.Fprintln(output, "DATABASE_URL may be unset; HTTPS, gh, and audit interception still run, while")
+	fmt.Fprintln(output, "DATABASE_URL may be unset; file snapshots and the audit log still run, while")
 	fmt.Fprintln(output, "the review says PostgreSQL was not intercepted. A nonblank DATABASE_URL must")
 	fmt.Fprintln(output, "parse and reach PostgreSQL 14 or newer or the child will not start.")
+	fmt.Fprintln(output, "Use --outbound to opt into HTTPS interception, adapters, and the gh shim.")
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "Keep database-backed runs bounded: the shared transaction remains open for the")
 	fmt.Fprintln(output, "whole child lifetime, holding locks and delaying cleanup. Without a terminal,")
