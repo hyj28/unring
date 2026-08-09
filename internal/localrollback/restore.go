@@ -56,8 +56,8 @@ func Restore(stateDir, sessionID string, selections []string, force bool) ([]Res
 	if err != nil {
 		return nil, err
 	}
-	if !value.Complete {
-		return nil, fmt.Errorf("snapshot %s has an incomplete post-session scan: %s", sessionID, value.Error)
+	if value.EndedAt.IsZero() {
+		return nil, fmt.Errorf("snapshot %s is incomplete because capture is still in progress and cannot be restored", sessionID)
 	}
 	selected, err := selectChanges(value.Changes, selections)
 	if err != nil {
@@ -67,6 +67,13 @@ func Restore(stateDir, sessionID string, selections []string, force bool) ([]Res
 	rootDirectory := filepath.Join(stateDir, "snapshots", value.SessionID)
 	results := make([]RestoreResult, 0, len(selected))
 	for _, change := range selected {
+		if change.UnrestorableReason != "" {
+			results = append(results, RestoreResult{
+				Path: change.Path, Status: "unavailable",
+				Err: fmt.Errorf("path was outside snapshot coverage: %s", change.UnrestorableReason),
+			})
+			continue
+		}
 		result := restoreOne(rootDirectory, value, change, force)
 		results = append(results, result)
 	}
@@ -136,16 +143,11 @@ func resolveSessionID(stateDir, sessionID string) (string, error) {
 
 func summaryFromManifest(value manifest, retained bool) Summary {
 	var watched []string
-	var failures []CaptureFailure
 	for _, root := range value.Roots {
 		watched = append(watched, root.Path)
-		for path, message := range root.Uncaptured {
-			failures = append(failures, CaptureFailure{Path: path, Error: message})
-		}
 	}
-	sort.Slice(failures, func(i, j int) bool { return failures[i].Path < failures[j].Path })
 	return Summary{
-		Watched: watched, Uncaptured: failures, Changes: value.Changes,
+		Watched: watched, Uncaptured: manifestFailures(value), Changes: value.Changes,
 		Complete: value.Complete, Error: value.Error, Storage: value.Storage,
 		LogicalBytes: value.LogicalBytes, StorageBytes: value.StorageBytes,
 		StorageExact: value.StorageExact, CopiedBytes: value.CopiedBytes,
@@ -198,6 +200,10 @@ func selectChanges(changes []Change, selections []string) ([]Change, error) {
 
 func restoreOne(snapshotRoot string, value manifest, change Change, force bool) RestoreResult {
 	result := RestoreResult{Path: change.Path}
+	if err := verifyRestoreRoot(value, change.Path); err != nil {
+		result.Status, result.Err = "refused", err
+		return result
+	}
 	current, exists, err := currentEntry(change.Path)
 	if err != nil {
 		result.Status, result.Err = "error", err
@@ -366,12 +372,52 @@ func ensureParentDirectories(value manifest, destination string) ([]restoredPare
 }
 
 func manifestRootFor(value manifest, path string) (rootManifest, bool) {
+	var matched rootManifest
+	found := false
 	for _, root := range value.Roots {
 		if path == root.Path || strings.HasPrefix(path, root.Path+string(os.PathSeparator)) {
-			return root, true
+			if !found || len(root.Path) > len(matched.Path) {
+				matched, found = root, true
+			}
 		}
 	}
-	return rootManifest{}, false
+	return matched, found
+}
+
+func verifyRestoreRoot(value manifest, path string) error {
+	root, found := manifestRootFor(value, path)
+	if !found {
+		return fmt.Errorf("snapshot has no watched root for %s", path)
+	}
+	resolved, err := resolveAllowMissing(root.Path)
+	if err != nil {
+		return fmt.Errorf("resolve watched root %s before restore: %w", root.Path, err)
+	}
+	if filepath.Clean(resolved) != filepath.Clean(root.Source) {
+		return fmt.Errorf("watched root %s now resolves to %s instead of snapshotted target %s", root.Path, resolved, root.Source)
+	}
+	return nil
+}
+
+func resolveAllowMissing(path string) (string, error) {
+	current := filepath.Clean(path)
+	var missing []string
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			parts := append([]string{resolved}, missing...)
+			return filepath.Join(parts...), nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", err
+		}
+		missing = append([]string{filepath.Base(current)}, missing...)
+		current = parent
+	}
 }
 
 func currentEntry(path string) (Entry, bool, error) {

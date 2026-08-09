@@ -81,6 +81,108 @@ func TestSymlinkedDirectoryIntroducedDuringSessionMakesScanIncomplete(t *testing
 	}
 }
 
+func TestUncapturedCreatedSubtreeDoesNotBlockOtherRestore(t *testing.T) {
+	stateDir := t.TempDir()
+	root := t.TempDir()
+	protected := filepath.Join(root, "protected.txt")
+	writeRollbackTestFile(t, protected, "before")
+	session, _, err := Start(stateDir, "scoped-coverage", []string{root}, DefaultRetentionBytes, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(protected); err != nil {
+		t.Fatal(err)
+	}
+	target := t.TempDir()
+	unprotected := filepath.Join(root, "linked-build-output")
+	if err := os.Symlink(target, unprotected); err != nil {
+		t.Fatal(err)
+	}
+	sealed := session.Seal(time.Now())
+
+	results, err := Restore(stateDir, "scoped-coverage", []string{protected}, false)
+	if err != nil {
+		t.Fatalf("restore protected path beside uncaptured subtree: %v", err)
+	}
+	if len(results) != 1 || results[0].Status != "restored" {
+		t.Fatalf("restore results = %#v, want protected path restored", results)
+	}
+	assertRollbackTestFile(t, protected, "before")
+	assertRollbackChange(t, sealed.Changes, "created", unprotected)
+	assertRollbackFailure(t, sealed.Uncaptured, unprotected, "not followed")
+}
+
+func TestStateDirectoryExclusionUsesResolvedPath(t *testing.T) {
+	physicalState := t.TempDir()
+	stateLink := filepath.Join(t.TempDir(), "state")
+	if err := os.Symlink(physicalState, stateLink); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	session, _, err := Start(stateLink, "resolved-exclusion", []string{root}, DefaultRetentionBytes, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.EvalSymlinks(stateLink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(session.manifest.Excluded) != 1 || session.manifest.Excluded[0] != want {
+		t.Fatalf("excluded = %#v, want resolved state path %q", session.manifest.Excluded, want)
+	}
+	entries, failures, err := scanRoot(filepath.Dir(want), session.manifest.Excluded)
+	if err != nil || len(failures) != 0 {
+		t.Fatalf("scan around resolved exclusion: failures=%#v err=%v", failures, err)
+	}
+	for path := range entries {
+		if path == want || strings.HasPrefix(path, want+string(os.PathSeparator)) {
+			t.Fatalf("state path entered scan despite resolved exclusion: %s", path)
+		}
+	}
+}
+
+func TestRestoreRefusesRetargetedSymlinkRoot(t *testing.T) {
+	stateDir := t.TempDir()
+	firstTarget := t.TempDir()
+	secondTarget := t.TempDir()
+	root := filepath.Join(t.TempDir(), "Documents")
+	if err := os.Symlink(firstTarget, root); err != nil {
+		t.Fatal(err)
+	}
+	original := filepath.Join(firstTarget, "notes.txt")
+	logical := filepath.Join(root, "notes.txt")
+	writeRollbackTestFile(t, original, "secret")
+	session, _, err := Start(stateDir, "retargeted-root", []string{root}, DefaultRetentionBytes, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(original); err != nil {
+		t.Fatal(err)
+	}
+	session.Seal(time.Now())
+	if err := os.Remove(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secondTarget, root); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := Restore(stateDir, "retargeted-root", []string{logical}, true)
+	if err != nil {
+		t.Fatalf("restore should return a per-path refusal: %v", err)
+	}
+	if len(results) != 1 || results[0].Status != "refused" || results[0].Err == nil ||
+		!strings.Contains(results[0].Err.Error(), "watched root") {
+		t.Fatalf("restore results = %#v, want watched-root refusal", results)
+	}
+	if _, err := os.Lstat(filepath.Join(secondTarget, "notes.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("restore wrote through retargeted root: %v", err)
+	}
+	if _, err := os.Lstat(original); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("original target unexpectedly changed: %v", err)
+	}
+}
+
 func TestCaptureReconciliationRejectsEveryScanCloneRaceShape(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "file")
 	old := Entry{Type: "file", Size: 4, MTime: 10, CTime: 20, Mode: uint32(0o600), Links: 1}
@@ -100,6 +202,28 @@ func TestCaptureReconciliationRejectsEveryScanCloneRaceShape(t *testing.T) {
 			_, failures := reconcileCapture(test.before, test.after, test.snapshot, nil)
 			assertRollbackFailure(t, failures, file, "changed while")
 		})
+	}
+}
+
+func TestCaptureReconciliationRecordsTheStableSourceBaselineItVerified(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "file")
+	stable := Entry{Type: "file", Size: 4, MTime: 10, CTime: 20, Mode: uint32(0o640), Links: 1}
+	snapshot := stable
+	snapshot.MTime = 30
+	snapshot.CTime = 40
+	snapshot.Mode = uint32(0o600)
+
+	captured, failures := reconcileCapture(
+		map[string]Entry{file: stable},
+		map[string]Entry{file: stable},
+		map[string]Entry{file: snapshot},
+		nil,
+	)
+	if len(failures) != 0 {
+		t.Fatalf("capture failures = %#v", failures)
+	}
+	if captured[file] != stable {
+		t.Fatalf("captured baseline = %#v, want verified stable source %#v", captured[file], stable)
 	}
 }
 
@@ -291,6 +415,11 @@ func TestStorageUsageUsesLiteralMeasuredBytesWithoutLogicalFallback(t *testing.T
 	capBytes, err := RetentionCapForState(stateDir)
 	if err != nil || capBytes != 54321 {
 		t.Fatalf("stored cap = %d, %v, want 54321", capBytes, err)
+	}
+	t.Setenv("UNRING_SNAPSHOT_CAP_BYTES", "123")
+	capBytes, err = RetentionCapForState(stateDir)
+	if err != nil || capBytes != 54321 {
+		t.Fatalf("stored cap with environment default = %d, %v, want enforced 54321", capBytes, err)
 	}
 }
 

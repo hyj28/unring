@@ -212,7 +212,8 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			fmt.Fprintf(stderr, "unring: read snapshot retention cap: %v\n", err)
 			return usageExitCode
 		}
-	} else if err := localrollback.SaveRetentionCap(auditStore.StateDir(), capBytes); err != nil {
+	}
+	if err := localrollback.SaveRetentionCap(auditStore.StateDir(), capBytes); err != nil {
 		fmt.Fprintf(stderr, "unring: save snapshot retention cap: %v\n", err)
 		return internalErrorExitCode
 	}
@@ -573,7 +574,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		}
 	}
 	if !fileSummary.Complete {
-		fmt.Fprintf(stderr, "unring: FILE CHANGE SCAN INCOMPLETE: %s\n", fileSummary.Error)
+		fmt.Fprintf(stderr, "unring: FILE COVERAGE INCOMPLETE: %s\n", fileSummary.Error)
 	}
 	printFileChanges(stdout, auditRecord.ID, fileSummary)
 	if err := auditSession.Update(func(record *audit.Record) { record.Files = fileSummary }); err != nil {
@@ -873,9 +874,14 @@ func printFileChanges(output io.Writer, sessionID string, summary localrollback.
 		created, modified, deleted)
 	for _, change := range summary.Changes {
 		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
+		if change.UnrestorableReason != "" {
+			fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
+		}
 	}
-	if summary.Retained {
+	if summary.Retained && hasRestorableFileChange(summary.Changes) {
 		fmt.Fprintf(output, "Restore later with: unring restore %s\n", sessionID)
+	} else if summary.Retained {
+		fmt.Fprintln(output, "No changed path has restorable snapshot data.")
 	} else {
 		fmt.Fprintln(output, "Snapshot data is no longer retained; these paths cannot be restored from this session.")
 	}
@@ -885,7 +891,7 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 	if len(summary.Watched) == 0 {
 		return
 	}
-	fmt.Fprintln(output, "\nFILES — RESTORABLE INDIVIDUALLY")
+	fmt.Fprintln(output, "\nFILES — RESTORE COVERAGE")
 	storageLabel := "measured storage bytes"
 	if !summary.StorageExact {
 		storageLabel = "storage-byte upper bound"
@@ -897,6 +903,9 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 	}
 	for _, change := range summary.Changes {
 		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
+		if change.UnrestorableReason != "" {
+			fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
+		}
 	}
 	if summary.Error != "" {
 		fmt.Fprintf(output, "  INCOMPLETE: %s\n", summary.Error)
@@ -1286,6 +1295,11 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "already restored  %s\n", result.Path)
 		case "refused":
 			exitCode = internalErrorExitCode
+			if result.Err != nil {
+				restoreEvent.Error = result.Err.Error()
+				fmt.Fprintf(stderr, "refused   %s: %v; not restored\n", result.Path, result.Err)
+				break
+			}
 			fmt.Fprintf(stderr, "refused   %s: changed after the session ended; not overwritten\n", result.Path)
 			if result.Sidecar != "" {
 				fmt.Fprintf(stderr, "snapshot version written alongside: %s\n", result.Sidecar)
@@ -1293,6 +1307,14 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintln(stderr, "pre-session state was absence, so there is no snapshot file to write alongside")
 			}
 			fmt.Fprintln(stderr, "rerun with --force to overwrite the conflict explicitly")
+		case "unavailable":
+			exitCode = internalErrorExitCode
+			if result.Err != nil {
+				restoreEvent.Error = result.Err.Error()
+				fmt.Fprintf(stderr, "unavailable %s: %v\n", result.Path, result.Err)
+			} else {
+				fmt.Fprintf(stderr, "unavailable %s: path was outside snapshot coverage\n", result.Path)
+			}
 		default:
 			exitCode = internalErrorExitCode
 			restoreEvent.Status = "error"
@@ -1346,13 +1368,29 @@ func printRestoreListing(output io.Writer, record audit.Record) {
 	fmt.Fprintf(output, "UNRING FILE CHANGES %s\n", record.ID)
 	for _, change := range record.Files.Changes {
 		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
+		if change.UnrestorableReason != "" {
+			fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
+		}
 	}
 	if !record.Files.Retained {
 		fmt.Fprintln(output, "Snapshot data has been evicted; these changes are no longer restorable.")
 		return
 	}
-	fmt.Fprintf(output, "Restore selected paths with: unring restore %s <path> [...]\n", record.ID)
-	fmt.Fprintf(output, "Restore every path with: unring restore --all %s\n", record.ID)
+	if hasRestorableFileChange(record.Files.Changes) {
+		fmt.Fprintf(output, "Restore selected paths with: unring restore %s <path> [...]\n", record.ID)
+		fmt.Fprintf(output, "Restore every restorable path with: unring restore --all %s\n", record.ID)
+	} else {
+		fmt.Fprintln(output, "No changed path has restorable snapshot data.")
+	}
+}
+
+func hasRestorableFileChange(changes []localrollback.Change) bool {
+	for _, change := range changes {
+		if change.UnrestorableReason == "" {
+			return true
+		}
+	}
+	return false
 }
 
 func printAuditRecord(output io.Writer, record audit.Record) {

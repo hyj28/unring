@@ -42,10 +42,11 @@ type CaptureFailure struct {
 
 // Change is one created, modified, or deleted path.
 type Change struct {
-	Kind   string `json:"kind"`
-	Path   string `json:"path"`
-	Before *Entry `json:"before,omitempty"`
-	After  *Entry `json:"after,omitempty"`
+	Kind               string `json:"kind"`
+	Path               string `json:"path"`
+	Before             *Entry `json:"before,omitempty"`
+	After              *Entry `json:"after,omitempty"`
+	UnrestorableReason string `json:"unrestorable_reason,omitempty"`
 }
 
 // RestoreRecord is a durable account of one requested restore.
@@ -181,14 +182,16 @@ func SaveRetentionCap(stateDir string, capBytes int64) error {
 	return os.Rename(temporaryPath, path)
 }
 
-// RetentionCapForState returns the environment override, then the persisted
-// cap selected by a prior run, then the default.
+// RetentionCapForState returns the last cap explicitly persisted for this
+// state directory, then the environment default, then the built-in default.
+// A persisted cap must win so inspection cannot report a value different from
+// the value that the most recent explicit run enforced.
 func RetentionCapForState(stateDir string) (int64, error) {
-	if strings.TrimSpace(os.Getenv("UNRING_SNAPSHOT_CAP_BYTES")) != "" {
-		return RetentionCap()
-	}
 	data, err := os.ReadFile(filepath.Join(stateDir, "snapshot-retention-cap"))
 	if errors.Is(err, os.ErrNotExist) {
+		if strings.TrimSpace(os.Getenv("UNRING_SNAPSHOT_CAP_BYTES")) != "" {
+			return RetentionCap()
+		}
 		return DefaultRetentionBytes, nil
 	}
 	if err != nil {
@@ -242,7 +245,11 @@ func Start(stateDir, sessionID string, watched []string, capBytes int64, now tim
 	if err != nil {
 		return nil, Summary{}, fmt.Errorf("resolve state directory: %w", err)
 	}
-	m.Excluded = []string{filepath.Clean(absoluteStateDir)}
+	resolvedStateDir, err := filepath.EvalSymlinks(absoluteStateDir)
+	if err != nil {
+		return nil, Summary{}, fmt.Errorf("resolve state directory symlinks: %w", err)
+	}
+	m.Excluded = []string{filepath.Clean(resolvedStateDir)}
 	availableBefore, storageMeasured, storageMeasureErr := filesystemAvailableBytes(snapshotRoot)
 	if storageMeasureErr != nil {
 		return nil, Summary{}, fmt.Errorf("measure snapshot storage before capture: %w", storageMeasureErr)
@@ -319,9 +326,21 @@ func Start(stateDir, sessionID string, watched []string, capBytes int64, now tim
 // Seal scans the watched paths after the child exits and records the diff.
 func (s *Session) Seal(now time.Time) Summary {
 	availableBefore, measuredBefore, measureBeforeErr := filesystemAvailableBytes(s.dir)
+	before := make(map[string]Entry)
+	diffExcluded := make(map[string]bool)
+	for _, root := range s.manifest.Roots {
+		for path, entry := range root.Before {
+			before[path] = entry
+		}
+		for path := range root.Uncaptured {
+			diffExcluded[path] = true
+		}
+	}
 	after := make(map[string]Entry)
 	var scanFailures []CaptureFailure
-	for _, root := range s.manifest.Roots {
+	var coverageGaps []CaptureFailure
+	for index := range s.manifest.Roots {
+		root := &s.manifest.Roots[index]
 		if !root.Existed || root.Source == "" {
 			continue
 		}
@@ -331,40 +350,48 @@ func (s *Session) Seal(now time.Time) Summary {
 			if resolveErr != nil {
 				message += ": " + resolveErr.Error()
 			}
-			scanFailures = append(scanFailures, CaptureFailure{Path: root.Path, Error: message})
+			failure := CaptureFailure{Path: root.Path, Error: message}
+			scanFailures = append(scanFailures, failure)
+			diffExcluded[failure.Path] = true
+			root.Uncaptured[failure.Path] = failure.Error
 			continue
 		}
 		entries, failures, err := scanMappedRoot(root.Source, root.Path, s.manifest.Excluded)
 		if err != nil {
-			scanFailures = append(scanFailures, CaptureFailure{Path: root.Path, Error: err.Error()})
+			failure := CaptureFailure{Path: root.Path, Error: err.Error()}
+			scanFailures = append(scanFailures, failure)
+			diffExcluded[failure.Path] = true
+			root.Uncaptured[failure.Path] = failure.Error
 			continue
 		}
 		for path, entry := range entries {
 			after[path] = entry
 		}
-		failures = append(failures, coverageFailures(entries, root.Uncaptured)...)
-		scanFailures = append(scanFailures, failures...)
-	}
-	before := make(map[string]Entry)
-	uncaptured := make(map[string]bool)
-	for _, root := range s.manifest.Roots {
-		for path, entry := range root.Before {
-			before[path] = entry
+		for _, failure := range failures {
+			scanFailures = append(scanFailures, failure)
+			diffExcluded[failure.Path] = true
+			root.Uncaptured[failure.Path] = failure.Error
 		}
-		for path := range root.Uncaptured {
-			uncaptured[path] = true
+		for _, failure := range coverageFailures(entries, root.Uncaptured) {
+			coverageGaps = append(coverageGaps, failure)
+			root.Uncaptured[failure.Path] = failure.Error
 		}
 	}
-	for _, failure := range scanFailures {
-		uncaptured[failure.Path] = true
+	changes := diff(before, after, diffExcluded)
+	coveragePrefixes := failurePrefixes(coverageGaps)
+	coverageMessages := failureMessages(coverageGaps)
+	for index := range changes {
+		changes[index].UnrestorableReason = overlappingFailure(
+			changes[index].Path, coveragePrefixes, coverageMessages,
+		)
 	}
-	changes := diff(before, after, uncaptured)
+	allFailures := mergeFailures(scanFailures, coverageGaps)
 	s.manifest.EndedAt = now.UTC()
 	s.manifest.After = after
 	s.manifest.Changes = changes
-	s.manifest.Complete = len(scanFailures) == 0
-	if len(scanFailures) > 0 {
-		s.manifest.Error = formatFailures("post-session scan could not inspect", scanFailures)
+	s.manifest.Complete = len(allFailures) == 0
+	if len(allFailures) > 0 {
+		s.manifest.Error = formatFailures("post-session coverage incomplete", allFailures)
 	}
 	if err := writeManifest(s.dir, s.manifest); err != nil {
 		s.manifest.Complete = false
@@ -401,6 +428,7 @@ func (s *Session) Seal(now time.Time) Summary {
 		}
 	}
 	s.summary.Changes = changes
+	s.summary.Uncaptured = manifestFailures(s.manifest)
 	s.summary.Complete = s.manifest.Complete
 	s.summary.Error = s.manifest.Error
 	s.summary.StorageBytes = s.manifest.StorageBytes
@@ -470,8 +498,9 @@ func captureRoot(root, destination string, excluded []string) (rootManifest, []C
 	state.Existed = true
 	// clonefile assigns fresh inode ctimes to the clone, so source ctime cannot
 	// be reconstructed by scanning the clone alone. Bracket capture with source
-	// metadata guards, but never use either guard as the captured membership:
-	// reconcileCapture admits only stable paths found in the snapshot scan.
+	// metadata guards and admit a baseline only when the captured membership,
+	// type, link target, and file size match that stable source state. Snapshot
+	// bytes and the source metadata baseline therefore describe the same instant.
 	sourceGuardBefore, beforeFailures, err := scanMappedRoot(source, root, excluded)
 	if err != nil {
 		return state, beforeFailures, methods, 0, 0, err
@@ -637,25 +666,10 @@ func reconcileCapture(
 			}
 		}
 		if !failed[path] {
-			captured[path] = baselineFromSnapshot(snapshotEntry, beforeEntry)
+			captured[path] = beforeEntry
 		}
 	}
 	return captured, mergeFailures(failures)
-}
-
-// baselineFromSnapshot makes the captured tree authoritative for membership,
-// type, link target, and file bytes. The bracketing source scans contribute
-// inode metadata that clone/copy necessarily changes (especially ctime); a
-// path is admitted only when those scans agree, so the metadata describes the
-// same source state as the captured bytes.
-func baselineFromSnapshot(snapshot, stableSource Entry) Entry {
-	baseline := stableSource
-	baseline.Type = snapshot.Type
-	baseline.LinkTarget = snapshot.LinkTarget
-	if snapshot.Type == "file" {
-		baseline.Size = snapshot.Size
-	}
-	return baseline
 }
 
 func snapshotMatchesSource(snapshot, source Entry) bool {
@@ -674,6 +688,40 @@ func failurePrefixes(failures []CaptureFailure) map[string]bool {
 		prefixes[failure.Path] = true
 	}
 	return prefixes
+}
+
+func failureMessages(failures []CaptureFailure) map[string]string {
+	messages := make(map[string]string, len(failures))
+	for _, failure := range failures {
+		messages[failure.Path] = failure.Error
+	}
+	return messages
+}
+
+func overlappingFailure(path string, prefixes map[string]bool, messages map[string]string) string {
+	var matched string
+	for prefix := range prefixes {
+		if path == prefix || strings.HasPrefix(path, prefix+string(os.PathSeparator)) ||
+			strings.HasPrefix(prefix, path+string(os.PathSeparator)) {
+			if matched == "" || len(prefix) < len(matched) {
+				matched = prefix
+			}
+		}
+	}
+	if matched == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s: %s", matched, messages[matched])
+}
+
+func manifestFailures(value manifest) []CaptureFailure {
+	var failures []CaptureFailure
+	for _, root := range value.Roots {
+		for path, message := range root.Uncaptured {
+			failures = append(failures, CaptureFailure{Path: path, Error: message})
+		}
+	}
+	return mergeFailures(failures)
 }
 
 func captureIndividually(root, destination string, excluded []string) ([]CaptureFailure, map[string]bool, int64, error) {

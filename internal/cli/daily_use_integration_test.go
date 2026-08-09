@@ -191,6 +191,73 @@ func TestRestoreAllRestoresEveryChangedPathIncludingDirectories(t *testing.T) {
 	}
 }
 
+func TestUnrestorableCreatedPathIsListedWithoutBlockingProtectedRestore(t *testing.T) {
+	stateDir := t.TempDir()
+	root := t.TempDir()
+	target := t.TempDir()
+	protected := filepath.Join(root, "protected.txt")
+	linked := filepath.Join(root, "linked-build-output")
+	writeTestFile(t, protected, "before")
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+
+	binary := buildTestBinary(t)
+	command := exec.Command(binary, "run", "--watch", root, "--", "/bin/sh", "-c",
+		"rm protected.txt; ln -s \"$1\" linked-build-output", "unring-test", target)
+	command.Dir = root
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run beside newly unprotectable path: %v\n%s", err, output)
+	}
+	text := string(output)
+	for _, want := range []string{protected, linked, "created", "deleted", "NOT RESTORABLE", "Restore later with:"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("session output missing %q:\n%s", want, text)
+		}
+	}
+
+	sessionID := newestSessionID(t, binary)
+	logCommand := exec.Command(binary, "log", "--json", sessionID)
+	logCommand.Env = os.Environ()
+	logOutput, err := logCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("read scoped-coverage audit: %v\n%s", err, logOutput)
+	}
+	for _, want := range []string{`"path": "` + linked + `"`, `"unrestorable_reason":`, `"uncaptured_paths": [`} {
+		if !strings.Contains(string(logOutput), want) {
+			t.Fatalf("scoped-coverage audit missing %q:\n%s", want, logOutput)
+		}
+	}
+	listing := exec.Command(binary, "restore", sessionID)
+	listing.Env = os.Environ()
+	listingOutput, err := listing.CombinedOutput()
+	if err != nil {
+		t.Fatalf("list partial restore: %v\n%s", err, listingOutput)
+	}
+	for _, want := range []string{protected, linked, "NOT RESTORABLE", "Restore every restorable path"} {
+		if !strings.Contains(string(listingOutput), want) {
+			t.Fatalf("restore listing missing %q:\n%s", want, listingOutput)
+		}
+	}
+
+	restore := exec.Command(binary, "restore", "--all", sessionID)
+	restore.Env = os.Environ()
+	restoreOutput, err := restore.CombinedOutput()
+	if err == nil {
+		t.Fatalf("restore --all did not report unavailable path:\n%s", restoreOutput)
+	}
+	for _, want := range []string{"restored  " + protected, "unavailable " + linked, "outside snapshot coverage"} {
+		if !strings.Contains(string(restoreOutput), want) {
+			t.Fatalf("partial restore output missing %q:\n%s", want, restoreOutput)
+		}
+	}
+	assertTestFile(t, protected, "before")
+	if _, err := os.Lstat(linked); err != nil {
+		t.Fatalf("unrestorable path was unexpectedly changed: %v", err)
+	}
+}
+
 func TestSymlinkedWatchRootIsProtectedAndNestedSymlinkIsDisclosed(t *testing.T) {
 	stateDir := t.TempDir()
 	target := t.TempDir()
@@ -227,6 +294,53 @@ func TestSymlinkedWatchRootIsProtectedAndNestedSymlinkIsDisclosed(t *testing.T) 
 		t.Fatalf("restore symlink-root file: %v\n%s", err, restoreOutput)
 	}
 	assertTestFile(t, protected, "taxes-before")
+}
+
+func TestRestoreRefusesAWatchRootRetargetEvenWithForce(t *testing.T) {
+	stateDir := t.TempDir()
+	firstTarget := t.TempDir()
+	secondTarget := t.TempDir()
+	root := filepath.Join(t.TempDir(), "Documents")
+	if err := os.Symlink(firstTarget, root); err != nil {
+		t.Fatal(err)
+	}
+	original := filepath.Join(firstTarget, "notes.txt")
+	logical := filepath.Join(root, "notes.txt")
+	writeTestFile(t, original, "secret")
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	binary := buildTestBinary(t)
+
+	run := exec.Command(binary, "run", "--watch", root, "--", "/bin/rm", logical)
+	run.Env = os.Environ()
+	if output, err := run.CombinedOutput(); err != nil {
+		t.Fatalf("delete through original watched root: %v\n%s", err, output)
+	}
+	if err := os.Remove(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secondTarget, root); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionID := newestSessionID(t, binary)
+	restore := exec.Command(binary, "restore", "--force", sessionID, logical)
+	restore.Env = os.Environ()
+	output, err := restore.CombinedOutput()
+	if err == nil {
+		t.Fatalf("restore through retargeted watched root unexpectedly succeeded:\n%s", output)
+	}
+	for _, want := range []string{"refused", root, secondTarget, firstTarget, "not restored"} {
+		if !strings.Contains(string(output), want) {
+			t.Fatalf("retarget refusal missing %q:\n%s", want, output)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(secondTarget, "notes.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("restore wrote into the new watched-root target: %v", err)
+	}
+	if _, err := os.Lstat(original); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("restore unexpectedly changed the original target: %v", err)
+	}
 }
 
 func TestMissingWatchedRootIsReportedAtStartAndInAudit(t *testing.T) {
@@ -378,6 +492,29 @@ func TestSnapshotRetentionEvictsOldestAndReportsUsage(t *testing.T) {
 	}
 	if !strings.Contains(string(oldOutput), `"retained": false`) {
 		t.Fatalf("evicted audit record still claims retention:\n%s", oldOutput)
+	}
+}
+
+func TestSnapshotsReportsTheCapAnExplicitRunEnforced(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	t.Setenv("UNRING_SNAPSHOT_CAP_BYTES", "1000")
+	binary := buildTestBinary(t)
+
+	run := exec.Command(binary, "run", "--snapshot-cap-bytes", "5000", "--watch", t.TempDir(), "--", "/usr/bin/true")
+	run.Env = os.Environ()
+	if output, err := run.CombinedOutput(); err != nil {
+		t.Fatalf("run with explicit cap: %v\n%s", err, output)
+	}
+	usage := exec.Command(binary, "snapshots")
+	usage.Env = os.Environ()
+	output, err := usage.CombinedOutput()
+	if err != nil {
+		t.Fatalf("inspect persisted explicit cap: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "of 5000 bytes") || strings.Contains(string(output), "of 1000 bytes") {
+		t.Fatalf("snapshot usage did not report the enforced 5000-byte cap:\n%s", output)
 	}
 }
 

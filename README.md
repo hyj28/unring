@@ -69,18 +69,21 @@ After the child exits, inspect and restore file changes at any later time:
 ```sh
 unring restore <session-id>                  # list created, modified, deleted paths
 unring restore <session-id> path/to/file     # restore selected paths
-unring restore --all <session-id>            # restore every changed path
+unring restore --all <session-id>            # restore all covered paths; report unavailable ones
 unring restore --force <session-id> path     # explicitly overwrite a conflict
 unring snapshots                             # inspect retained usage and the space cap
 ```
 
 A path changed after the session is refused by default. Its pre-session snapshot is
-written alongside the current file, and only `--force` permits replacement. Snapshot
-retention defaults to 5 GiB of measured snapshot allocation and evicts oldest sessions.
-An explicit `--snapshot-cap-bytes` value is persisted so `unring snapshots` reports the
-same cap; `UNRING_SNAPSHOT_CAP_BYTES` remains an environment override. Where a filesystem
-cannot expose allocation changes cheaply, unring labels the figure as an upper bound and
-does not evict snapshots based on that estimate.
+written alongside the current file, and only `--force` permits replacement. Coverage
+gaps created during a session are named in the change list and audit record; they do not
+prevent restoring independently covered paths. Snapshot retention defaults to 5 GiB of
+measured snapshot allocation and evicts oldest sessions.
+An explicit `--snapshot-cap-bytes` value is persisted so later runs and `unring snapshots`
+report and enforce the same cap. `UNRING_SNAPSHOT_CAP_BYTES` supplies the initial cap for a
+state directory that has no persisted value; the first run persists that effective value.
+Where a filesystem cannot expose allocation changes cheaply, unring labels the figure as
+an upper bound and does not evict snapshots based on that estimate.
 
 If this task needs PostgreSQL coverage, point `DATABASE_URL` at the real development
 database first:
