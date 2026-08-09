@@ -517,6 +517,15 @@ func buildTestBinary(t *testing.T) string {
 		}
 		moduleCache = strings.TrimSpace(string(output))
 	}
+	buildCache := strings.TrimSpace(os.Getenv("GOCACHE"))
+	if buildCache == "" {
+		command := exec.Command("go", "env", "GOCACHE")
+		output, err := command.Output()
+		if err != nil {
+			t.Fatalf("find existing Go build cache: %v", err)
+		}
+		buildCache = strings.TrimSpace(string(output))
+	}
 	// Every built CLI inherits a fabricated default snapshot scope. Most run
 	// invocations pass --watch explicitly; shortcut invocations cannot do that
 	// without changing the behavior under test, so isolate both inputs used by
@@ -524,7 +533,11 @@ func buildTestBinary(t *testing.T) string {
 	// so the binary itself is still built from the real checkout.
 	t.Setenv("HOME", t.TempDir())
 	t.Chdir(t.TempDir())
+	// Both Go caches default to a location under HOME, so the fabricated HOME
+	// above would otherwise hand every test an empty build cache and recompile
+	// libpg_query from source once per test.
 	t.Setenv("GOMODCACHE", moduleCache)
+	t.Setenv("GOCACHE", buildCache)
 
 	binary := filepath.Join(t.TempDir(), "unring")
 	build := exec.Command("go", "build", "-o", binary, "./cmd/unring")
