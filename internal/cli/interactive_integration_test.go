@@ -504,6 +504,10 @@ func TestApprovedIrreversibleActionAlwaysGetsReview(t *testing.T) {
 
 func buildTestBinary(t *testing.T) string {
 	t.Helper()
+	repositoryRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatalf("resolve repository root: %v", err)
+	}
 	moduleCache := strings.TrimSpace(os.Getenv("GOMODCACHE"))
 	if moduleCache == "" {
 		command := exec.Command("go", "env", "GOMODCACHE")
@@ -513,13 +517,15 @@ func buildTestBinary(t *testing.T) string {
 		}
 		moduleCache = strings.TrimSpace(string(output))
 	}
+	// Every built CLI inherits a fabricated default snapshot scope. Most run
+	// invocations pass --watch explicitly; shortcut invocations cannot do that
+	// without changing the behavior under test, so isolate both inputs used by
+	// DefaultWatchPaths instead. This must happen after resolving repositoryRoot
+	// so the binary itself is still built from the real checkout.
 	t.Setenv("HOME", t.TempDir())
+	t.Chdir(t.TempDir())
 	t.Setenv("GOMODCACHE", moduleCache)
 
-	repositoryRoot, err := filepath.Abs("../..")
-	if err != nil {
-		t.Fatalf("resolve repository root: %v", err)
-	}
 	binary := filepath.Join(t.TempDir(), "unring")
 	build := exec.Command("go", "build", "-o", binary, "./cmd/unring")
 	build.Dir = repositoryRoot
