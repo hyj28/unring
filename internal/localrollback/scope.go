@@ -186,9 +186,10 @@ func ResolveScope(options ScopeOptions) (Scope, error) {
 		}
 		scanExcludedNames = []string{"node_modules", ".git", ".cache"}
 	}
-	changeListScope := ChangeListScopeHomeAndClone
+	changeListScope := ChangeListScopeCloneOnly
 	var changeListRoots []string
 	if scanRoot != "" {
+		changeListScope = ChangeListScopeHomeAndClone
 		changeListRoots = append(changeListRoots, scanRoot)
 	}
 	changeListRoots = append(changeListRoots, filtered...)

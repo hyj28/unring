@@ -916,7 +916,7 @@ func printScanFinishing(output io.Writer, summary localrollback.Summary) {
 		return
 	}
 	fmt.Fprintf(output,
-		"unring: rescanning %s and checking Time Machine inclusion for changed directories; large change sets may take time.\n",
+		"unring: rescanning %s and checking Time Machine inclusion for changed paths; large change sets may take time.\n",
 		summary.ScanRoot)
 }
 

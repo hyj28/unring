@@ -211,7 +211,11 @@ func restoreVolumeOne(platform VolumeSnapshotPlatform, value manifest, change Ch
 		result.Err = fmt.Errorf("mount volume snapshot %s with root privileges: %w", change.VolumeSnapshot.Name, err)
 		return result
 	}
-	snapshotPath, err := mountedSnapshotPath(mountPoint, change.VolumeSnapshot.MountPoint, change.Path)
+	snapshotSourcePath := change.Path
+	if change.VolumeSnapshotPath != "" {
+		snapshotSourcePath = change.VolumeSnapshotPath
+	}
+	snapshotPath, err := mountedSnapshotPath(mountPoint, change.VolumeSnapshot.MountPoint, snapshotSourcePath)
 	refusedAfterMount := false
 	if err == nil && possibleRestored {
 		var matches bool
@@ -344,13 +348,8 @@ func orderRestoreChanges(changes []Change) []Change {
 }
 
 func restoreRank(change Change) int {
-	if change.Kind == "created" {
-		if change.After != nil && change.After.Type == "directory" {
-			return 3
-		}
-		return 2
-	}
-	if change.Before != nil && change.Before.Type == "directory" {
+	if change.Before != nil && change.Before.Type == "directory" ||
+		change.After != nil && change.After.Type == "directory" {
 		return 1
 	}
 	return 0

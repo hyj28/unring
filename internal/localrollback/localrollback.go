@@ -47,6 +47,7 @@ type CaptureFailure struct {
 type Change struct {
 	Kind               string          `json:"kind"`
 	Path               string          `json:"path"`
+	VolumeSnapshotPath string          `json:"volume_snapshot_path,omitempty"`
 	Before             *Entry          `json:"before,omitempty"`
 	After              *Entry          `json:"after,omitempty"`
 	RestoreSource      string          `json:"restore_source,omitempty"`
@@ -92,12 +93,13 @@ type Summary struct {
 }
 
 type rootManifest struct {
-	Path       string            `json:"path"`
-	Source     string            `json:"source"`
-	Existed    bool              `json:"existed"`
-	Snapshot   string            `json:"snapshot"`
-	Before     map[string]Entry  `json:"before"`
-	Uncaptured map[string]string `json:"uncaptured,omitempty"`
+	Path             string            `json:"path"`
+	Source           string            `json:"source"`
+	Existed          bool              `json:"existed"`
+	Snapshot         string            `json:"snapshot"`
+	Before           map[string]Entry  `json:"before"`
+	UncapturedBefore map[string]Entry  `json:"uncaptured_before,omitempty"`
+	Uncaptured       map[string]string `json:"uncaptured,omitempty"`
 }
 
 type manifest struct {
@@ -355,7 +357,7 @@ func start(
 	}
 	var scanBefore map[string]Entry
 	if scanError != "" {
-		m.ScanFailures = append(m.ScanFailures, CaptureFailure{Path: scanRoot, Error: scanError})
+		m.ScanFailures = append(m.ScanFailures, CaptureFailure{Path: "home directory", Error: scanError})
 	} else if scanRoot != "" {
 		scanStarted := time.Now()
 		scanBefore, m.ScanFailures, err = scanRootWithNames(scanRoot, m.ScanExcluded, m.ScanExcludedNames)
@@ -438,7 +440,17 @@ func attachManifestFailure(value *manifest, failure CaptureFailure) bool {
 		}
 	}
 	if matched >= 0 {
-		value.Roots[matched].Uncaptured[failure.Path] = failure.Error
+		root := &value.Roots[matched]
+		root.Uncaptured[failure.Path] = failure.Error
+		if root.UncapturedBefore == nil {
+			root.UncapturedBefore = make(map[string]Entry)
+		}
+		prefix := map[string]bool{failure.Path: true}
+		for path, entry := range root.Before {
+			if coveredBy(path, prefix) {
+				root.UncapturedBefore[path] = entry
+			}
+		}
 		return true
 	}
 	return false
@@ -458,6 +470,16 @@ func (s *Session) Seal(now time.Time) Summary {
 		}
 	}
 	after := make(map[string]Entry)
+	rootAfter := make([]map[string]Entry, len(s.manifest.Roots))
+	rootScanned := make([]bool, len(s.manifest.Roots))
+	rootDiffExcluded := make([]map[string]bool, len(s.manifest.Roots))
+	initialUncaptured := make([]map[string]bool, len(s.manifest.Roots))
+	for index, root := range s.manifest.Roots {
+		initialUncaptured[index] = make(map[string]bool, len(root.Uncaptured))
+		for path := range root.Uncaptured {
+			initialUncaptured[index][path] = true
+		}
+	}
 	var scanFailures []CaptureFailure
 	var coverageGaps []CaptureFailure
 	for index := range s.manifest.Roots {
@@ -485,12 +507,16 @@ func (s *Session) Seal(now time.Time) Summary {
 			root.Uncaptured[failure.Path] = failure.Error
 			continue
 		}
+		rootAfter[index] = entries
+		rootScanned[index] = true
+		rootDiffExcluded[index] = make(map[string]bool, len(failures))
 		for path, entry := range entries {
 			after[path] = entry
 		}
 		for _, failure := range failures {
 			scanFailures = append(scanFailures, failure)
 			diffExcluded[failure.Path] = true
+			rootDiffExcluded[index][failure.Path] = true
 			root.Uncaptured[failure.Path] = failure.Error
 		}
 		for _, failure := range coverageFailures(entries, root.Uncaptured) {
@@ -540,6 +566,22 @@ func (s *Session) Seal(now time.Time) Summary {
 		changeIndexes[changes[index].Path] = index
 	}
 	exclusionChecks := make(map[string]timeMachineExclusionCheck)
+	for index, root := range s.manifest.Roots {
+		if !rootScanned[index] || len(initialUncaptured[index]) == 0 {
+			continue
+		}
+		observedBefore := entriesCoveredBy(root.UncapturedBefore, initialUncaptured[index])
+		observedAfter := entriesCoveredBy(rootAfter[index], initialUncaptured[index])
+		for _, change := range diff(observedBefore, observedAfter, rootDiffExcluded[index], nil) {
+			if _, exists := changeIndexes[change.Path]; exists {
+				continue
+			}
+			change.VolumeSnapshotPath = physicalPathForRoot(root, change.Path)
+			classifyWideChange(&change, s.platform, &s.manifest.Backstop, exclusionChecks)
+			changeIndexes[change.Path] = len(changes)
+			changes = append(changes, change)
+		}
+	}
 	for _, change := range wideChanges {
 		change, cloneCovered := mapWideChangeToClonePath(change, s.manifest.Roots)
 		if _, exists := changeIndexes[change.Path]; exists {
@@ -610,6 +652,7 @@ func (s *Session) Seal(now time.Time) Summary {
 }
 
 func mapWideChangeToClonePath(change Change, roots []rootManifest) (Change, bool) {
+	originalPath := change.Path
 	matchedRoot := -1
 	matchedPrefix := ""
 	for index, root := range roots {
@@ -632,6 +675,9 @@ func mapWideChangeToClonePath(change Change, roots []rootManifest) (Change, bool
 		change.Path = filepath.Join(root.Path, relative)
 	} else {
 		change.Path = root.Path
+	}
+	if filepath.Clean(change.Path) != filepath.Clean(originalPath) {
+		change.VolumeSnapshotPath = originalPath
 	}
 	if !root.Existed {
 		return change, false
@@ -669,31 +715,86 @@ func classifyWideChange(change *Change, platform VolumeSnapshotPlatform, backsto
 		return
 	}
 	checkPath := change.Path
-	if entry == nil || entry.Type != "directory" {
-		checkPath = filepath.Dir(change.Path)
+	if change.After == nil {
+		checkPath = nearestExistingAncestor(filepath.Dir(change.Path))
 	}
-	check, ok := checks[checkPath]
+	check, checkedPath, ok := inheritedExcludedCheck(checkPath, checks)
 	if !ok {
 		check.excluded, check.err = platform.IsExcluded(checkPath)
 		checks[checkPath] = check
+		checkedPath = checkPath
 	}
 	if check.err != nil {
 		change.UnrestorableReason = "could not verify that the path was included in the Time Machine backstop: " + check.err.Error()
 		return
 	}
 	if check.excluded {
-		failure := CaptureFailure{Path: checkPath, Error: "excluded from the Time Machine backup"}
+		failure := CaptureFailure{Path: checkedPath, Error: "excluded from the Time Machine backup"}
 		backstop.Excluded = mergeFailures(backstop.Excluded, []CaptureFailure{failure})
 		change.UnrestorableReason = "path was excluded from the Time Machine backup"
 		return
 	}
-	snapshot, covered := snapshotForPath(platform, *backstop, change.Path)
+	snapshotPath := change.Path
+	if change.VolumeSnapshotPath != "" {
+		snapshotPath = change.VolumeSnapshotPath
+	}
+	snapshot, covered := snapshotForPath(platform, *backstop, snapshotPath)
 	if !covered {
 		change.UnrestorableReason = "the path's volume has no recorded local snapshot for this session"
 		return
 	}
 	change.RestoreSource = RestoreSourceVolume
 	change.VolumeSnapshot = &snapshot
+}
+
+func inheritedExcludedCheck(path string, checks map[string]timeMachineExclusionCheck) (timeMachineExclusionCheck, string, bool) {
+	matched := ""
+	for checkedPath, check := range checks {
+		if !check.excluded || check.err != nil {
+			continue
+		}
+		if path == checkedPath || strings.HasPrefix(path, checkedPath+string(os.PathSeparator)) {
+			if len(checkedPath) > len(matched) {
+				matched = checkedPath
+			}
+		}
+	}
+	if matched == "" {
+		return timeMachineExclusionCheck{}, "", false
+	}
+	return checks[matched], matched, true
+}
+
+func nearestExistingAncestor(path string) string {
+	path = filepath.Clean(path)
+	for {
+		if _, err := os.Lstat(path); err == nil || !errors.Is(err, os.ErrNotExist) {
+			return path
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return path
+		}
+		path = parent
+	}
+}
+
+func entriesCoveredBy(entries map[string]Entry, prefixes map[string]bool) map[string]Entry {
+	covered := make(map[string]Entry)
+	for path, entry := range entries {
+		if coveredBy(path, prefixes) {
+			covered[path] = entry
+		}
+	}
+	return covered
+}
+
+func physicalPathForRoot(root rootManifest, logicalPath string) string {
+	relative, err := filepath.Rel(root.Path, logicalPath)
+	if err != nil || relative == "." {
+		return root.Source
+	}
+	return filepath.Join(root.Source, relative)
 }
 
 func coverageFailures(entries map[string]Entry, alreadyUncaptured map[string]string) []CaptureFailure {
@@ -810,11 +911,23 @@ func captureRoot(root, destination string, excluded []string) (rootManifest, []C
 	}
 	captured, failures := reconcileCapture(sourceGuardBefore, sourceGuardAfter, snapshotEntries,
 		mergeFailures(beforeFailures, captureFailures, afterFailures, snapshotFailures))
+	stableObserved := stableObservedEntries(sourceGuardBefore, sourceGuardAfter)
+	state.UncapturedBefore = entriesCoveredBy(stableObserved, failurePrefixes(failures))
 	for _, failure := range failures {
 		state.Uncaptured[failure.Path] = failure.Error
 	}
 	state.Before = captured
 	return state, failures, methods, logicalSize(state.Before), copiedBytes, err
+}
+
+func stableObservedEntries(before, after map[string]Entry) map[string]Entry {
+	stable := make(map[string]Entry)
+	for path, entry := range before {
+		if afterEntry, exists := after[path]; exists && afterEntry == entry {
+			stable[path] = entry
+		}
+	}
+	return stable
 }
 
 func scanMappedRoot(sourceRoot, reportedRoot string, excluded []string) (map[string]Entry, []CaptureFailure, error) {
