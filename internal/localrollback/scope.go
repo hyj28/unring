@@ -15,6 +15,12 @@ import (
 
 const scopeConfigFilename = "config.yaml"
 
+const (
+	ChangeListScopeCloneOnly    = "clone-only"
+	ChangeListScopeHomeAndClone = "home-and-clone"
+	ChangeListScopeWatchOnly    = "watch-only"
+)
+
 // ScopeOptions identifies every input used to choose the file snapshot scope.
 type ScopeOptions struct {
 	StateDir         string
@@ -30,6 +36,8 @@ type Scope struct {
 	Watched           []string
 	Excluded          []string
 	Uncaptured        []CaptureFailure
+	ChangeListScope   string
+	ChangeListRoots   []string
 	ScanRoot          string
 	ScanExcluded      []string
 	ScanExcludedNames []string
@@ -178,8 +186,15 @@ func ResolveScope(options ScopeOptions) (Scope, error) {
 		}
 		scanExcludedNames = []string{"node_modules", ".git", ".cache"}
 	}
+	changeListScope := ChangeListScopeHomeAndClone
+	changeListRoots := append([]string{scanRoot}, filtered...)
+	if len(options.WatchOnly) > 0 {
+		changeListScope = ChangeListScopeWatchOnly
+		changeListRoots = append([]string(nil), filtered...)
+	}
 	return Scope{
 		Watched: filtered, Excluded: excluded, Uncaptured: uncaptured,
+		ChangeListScope: changeListScope, ChangeListRoots: changeListRoots,
 		ScanRoot: scanRoot, ScanExcluded: scanExcluded,
 		ScanExcludedNames: scanExcludedNames,
 		ScanError:         scanError,

@@ -110,6 +110,7 @@ func RestoreRecorded(stateDir, sessionID string, summary Summary, selections []s
 	if err != nil {
 		return nil, err
 	}
+	selected = orderRestoreChanges(selected)
 	unlock, err := acquireSnapshotLock(stateDir, sessionID, unix.LOCK_SH)
 	if err != nil {
 		return nil, err
@@ -397,6 +398,8 @@ func summaryFromManifest(value manifest, retained bool) Summary {
 		LogicalBytes: value.LogicalBytes, StorageBytes: value.StorageBytes,
 		StorageExact: value.StorageExact, CopiedBytes: value.CopiedBytes,
 		RetentionCap: value.RetentionCap, Retained: retained,
+		ChangeListScope: value.ChangeListScope,
+		ChangeListRoots: append([]string(nil), value.ChangeListRoots...),
 		ScanRoot: value.ScanRoot, ScanExcluded: append([]string(nil), value.ScanExcluded...),
 		ScanFailures:    append([]CaptureFailure(nil), value.ScanFailures...),
 		ScanBeforeFiles: value.ScanBeforeFiles, ScanAfterFiles: value.ScanAfterFiles,

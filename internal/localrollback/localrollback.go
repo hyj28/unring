@@ -79,6 +79,8 @@ type Summary struct {
 	Retained         bool             `json:"retained"`
 	Evicted          []string         `json:"evicted_sessions,omitempty"`
 	RestoreEvents    []RestoreRecord  `json:"restores,omitempty"`
+	ChangeListScope  string           `json:"change_list_scope,omitempty"`
+	ChangeListRoots  []string         `json:"change_list_roots,omitempty"`
 	ScanRoot         string           `json:"change_scan_root,omitempty"`
 	ScanExcluded     []string         `json:"change_scan_excluded,omitempty"`
 	ScanFailures     []CaptureFailure `json:"change_scan_failures,omitempty"`
@@ -115,6 +117,8 @@ type manifest struct {
 	StorageExact      bool             `json:"storage_bytes_exact"`
 	CopiedBytes       int64            `json:"copied_bytes"`
 	RetentionCap      int64            `json:"retention_cap_bytes"`
+	ChangeListScope   string           `json:"change_list_scope,omitempty"`
+	ChangeListRoots   []string         `json:"change_list_roots,omitempty"`
 	ScanRoot          string           `json:"scan_root,omitempty"`
 	ScanExcluded      []string         `json:"scan_excluded,omitempty"`
 	ScanExcludedNames []string         `json:"scan_excluded_names,omitempty"`
@@ -235,13 +239,13 @@ func RetentionCapForState(stateDir string) (int64, error) {
 // platform's recursive fast path, then falls back to per-entry capture so that
 // one unreadable path does not erase coverage for the rest of a tree.
 func Start(stateDir, sessionID string, watched []string, capBytes int64, now time.Time) (*Session, Summary, error) {
-	return start(stateDir, sessionID, watched, nil, nil, "", nil, nil, "", capBytes, now)
+	return start(stateDir, sessionID, watched, nil, nil, ChangeListScopeCloneOnly, watched, "", nil, nil, "", capBytes, now)
 }
 
 // StartWithExclusions captures watched paths while omitting physically resolved
 // config exclusions in addition to unring's own state directory.
 func StartWithExclusions(stateDir, sessionID string, watched, excluded []string, capBytes int64, now time.Time) (*Session, Summary, error) {
-	return start(stateDir, sessionID, watched, excluded, nil, "", nil, nil, "", capBytes, now)
+	return start(stateDir, sessionID, watched, excluded, nil, ChangeListScopeCloneOnly, watched, "", nil, nil, "", capBytes, now)
 }
 
 // StartScope captures a previously resolved scope, including any explicit
@@ -249,6 +253,7 @@ func StartWithExclusions(stateDir, sessionID string, watched, excluded []string,
 func StartScope(stateDir, sessionID string, scope Scope, capBytes int64, now time.Time) (*Session, Summary, error) {
 	return start(
 		stateDir, sessionID, scope.Watched, scope.Excluded, scope.Uncaptured,
+		scope.ChangeListScope, scope.ChangeListRoots,
 		scope.ScanRoot, scope.ScanExcluded, scope.ScanExcludedNames, scope.ScanError,
 		capBytes, now,
 	)
@@ -258,6 +263,8 @@ func start(
 	stateDir, sessionID string,
 	watched, excluded []string,
 	preflightFailures []CaptureFailure,
+	changeListScope string,
+	changeListRoots []string,
 	scanRoot string,
 	scanExcluded, scanExcludedNames []string,
 	scanError string,
@@ -295,6 +302,8 @@ func start(
 	m := manifest{
 		Version: manifestVersion, SessionID: sessionID, StartedAt: now.UTC(),
 		Complete: false, RetentionCap: capBytes, ScanRoot: scanRoot,
+		ChangeListScope: changeListScope,
+		ChangeListRoots: append([]string(nil), changeListRoots...),
 		ScanExcluded:      append([]string(nil), scanExcluded...),
 		ScanExcludedNames: append([]string(nil), scanExcludedNames...),
 	}
@@ -396,6 +405,8 @@ func start(
 		Storage: m.Storage, LogicalBytes: m.LogicalBytes, StorageBytes: m.StorageBytes,
 		StorageExact: m.StorageExact, CopiedBytes: m.CopiedBytes,
 		RetentionCap: capBytes, Retained: true,
+		ChangeListScope: m.ChangeListScope,
+		ChangeListRoots: append([]string(nil), m.ChangeListRoots...),
 		ScanRoot: m.ScanRoot, ScanExcluded: append([]string(nil), m.ScanExcluded...),
 		ScanFailures:    append([]CaptureFailure(nil), m.ScanFailures...),
 		ScanBeforeFiles: m.ScanBeforeFiles, ScanBeforeMillis: m.ScanBeforeMillis,
