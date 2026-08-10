@@ -21,6 +21,9 @@ const (
 	// DefaultRetentionBytes is the default measured-allocation cap for retained snapshots.
 	DefaultRetentionBytes int64 = 5 << 30
 	manifestVersion             = 1
+	RestoreSourceClone          = "clone"
+	RestoreSourceVolume         = "volume-snapshot"
+	RestoreSourceNone           = "none"
 )
 
 // Entry is the metadata used to detect a file change and a later restore conflict.
@@ -42,11 +45,13 @@ type CaptureFailure struct {
 
 // Change is one created, modified, or deleted path.
 type Change struct {
-	Kind               string `json:"kind"`
-	Path               string `json:"path"`
-	Before             *Entry `json:"before,omitempty"`
-	After              *Entry `json:"after,omitempty"`
-	UnrestorableReason string `json:"unrestorable_reason,omitempty"`
+	Kind               string          `json:"kind"`
+	Path               string          `json:"path"`
+	Before             *Entry          `json:"before,omitempty"`
+	After              *Entry          `json:"after,omitempty"`
+	RestoreSource      string          `json:"restore_source,omitempty"`
+	VolumeSnapshot     *VolumeSnapshot `json:"volume_snapshot,omitempty"`
+	UnrestorableReason string          `json:"unrestorable_reason,omitempty"`
 }
 
 // RestoreRecord is a durable account of one requested restore.
@@ -60,20 +65,28 @@ type RestoreRecord struct {
 
 // Summary is stored in the session audit record.
 type Summary struct {
-	Watched       []string         `json:"watched_paths"`
-	Uncaptured    []CaptureFailure `json:"uncaptured_paths"`
-	Changes       []Change         `json:"changes"`
-	Complete      bool             `json:"complete"`
-	Error         string           `json:"error,omitempty"`
-	Storage       string           `json:"storage"`
-	LogicalBytes  int64            `json:"logical_bytes"`
-	StorageBytes  int64            `json:"storage_bytes"`
-	StorageExact  bool             `json:"storage_bytes_exact"`
-	CopiedBytes   int64            `json:"copied_bytes"`
-	RetentionCap  int64            `json:"retention_cap_bytes"`
-	Retained      bool             `json:"retained"`
-	Evicted       []string         `json:"evicted_sessions,omitempty"`
-	RestoreEvents []RestoreRecord  `json:"restores,omitempty"`
+	Watched          []string         `json:"watched_paths"`
+	Uncaptured       []CaptureFailure `json:"uncaptured_paths"`
+	Changes          []Change         `json:"changes"`
+	Complete         bool             `json:"complete"`
+	Error            string           `json:"error,omitempty"`
+	Storage          string           `json:"storage"`
+	LogicalBytes     int64            `json:"logical_bytes"`
+	StorageBytes     int64            `json:"storage_bytes"`
+	StorageExact     bool             `json:"storage_bytes_exact"`
+	CopiedBytes      int64            `json:"copied_bytes"`
+	RetentionCap     int64            `json:"retention_cap_bytes"`
+	Retained         bool             `json:"retained"`
+	Evicted          []string         `json:"evicted_sessions,omitempty"`
+	RestoreEvents    []RestoreRecord  `json:"restores,omitempty"`
+	ScanRoot         string           `json:"change_scan_root,omitempty"`
+	ScanExcluded     []string         `json:"change_scan_excluded,omitempty"`
+	ScanFailures     []CaptureFailure `json:"change_scan_failures,omitempty"`
+	ScanBeforeFiles  int              `json:"change_scan_before_files,omitempty"`
+	ScanAfterFiles   int              `json:"change_scan_after_files,omitempty"`
+	ScanBeforeMillis int64            `json:"change_scan_before_ms,omitempty"`
+	ScanAfterMillis  int64            `json:"change_scan_after_ms,omitempty"`
+	Backstop         Backstop         `json:"backstop"`
 }
 
 type rootManifest struct {
@@ -86,22 +99,31 @@ type rootManifest struct {
 }
 
 type manifest struct {
-	Version      int              `json:"version"`
-	SessionID    string           `json:"session_id"`
-	StartedAt    time.Time        `json:"started_at"`
-	EndedAt      time.Time        `json:"ended_at,omitempty"`
-	Roots        []rootManifest   `json:"roots"`
-	Excluded     []string         `json:"excluded,omitempty"`
-	After        map[string]Entry `json:"after,omitempty"`
-	Changes      []Change         `json:"changes,omitempty"`
-	Complete     bool             `json:"complete"`
-	Error        string           `json:"error,omitempty"`
-	Storage      string           `json:"storage"`
-	LogicalBytes int64            `json:"logical_bytes"`
-	StorageBytes int64            `json:"storage_bytes"`
-	StorageExact bool             `json:"storage_bytes_exact"`
-	CopiedBytes  int64            `json:"copied_bytes"`
-	RetentionCap int64            `json:"retention_cap_bytes"`
+	Version           int              `json:"version"`
+	SessionID         string           `json:"session_id"`
+	StartedAt         time.Time        `json:"started_at"`
+	EndedAt           time.Time        `json:"ended_at,omitempty"`
+	Roots             []rootManifest   `json:"roots"`
+	Excluded          []string         `json:"excluded,omitempty"`
+	After             map[string]Entry `json:"after,omitempty"`
+	Changes           []Change         `json:"changes,omitempty"`
+	Complete          bool             `json:"complete"`
+	Error             string           `json:"error,omitempty"`
+	Storage           string           `json:"storage"`
+	LogicalBytes      int64            `json:"logical_bytes"`
+	StorageBytes      int64            `json:"storage_bytes"`
+	StorageExact      bool             `json:"storage_bytes_exact"`
+	CopiedBytes       int64            `json:"copied_bytes"`
+	RetentionCap      int64            `json:"retention_cap_bytes"`
+	ScanRoot          string           `json:"scan_root,omitempty"`
+	ScanExcluded      []string         `json:"scan_excluded,omitempty"`
+	ScanExcludedNames []string         `json:"scan_excluded_names,omitempty"`
+	ScanFailures      []CaptureFailure `json:"scan_failures,omitempty"`
+	ScanBeforeFiles   int              `json:"scan_before_files,omitempty"`
+	ScanAfterFiles    int              `json:"scan_after_files,omitempty"`
+	ScanBeforeMillis  int64            `json:"scan_before_ms,omitempty"`
+	ScanAfterMillis   int64            `json:"scan_after_ms,omitempty"`
+	Backstop          Backstop         `json:"backstop"`
 }
 
 // Session owns the in-progress snapshot for a wrapped child.
@@ -109,6 +131,10 @@ type Session struct {
 	dir      string
 	manifest manifest
 	summary  Summary
+	platform VolumeSnapshotPlatform
+	// The widened baseline is needed only by this live process. Persisting it
+	// would serialize and fsync hundreds of thousands of entries repeatedly.
+	scanBefore map[string]Entry
 }
 
 // Usage describes retained snapshot storage.
@@ -209,22 +235,35 @@ func RetentionCapForState(stateDir string) (int64, error) {
 // platform's recursive fast path, then falls back to per-entry capture so that
 // one unreadable path does not erase coverage for the rest of a tree.
 func Start(stateDir, sessionID string, watched []string, capBytes int64, now time.Time) (*Session, Summary, error) {
-	return start(stateDir, sessionID, watched, nil, nil, capBytes, now)
+	return start(stateDir, sessionID, watched, nil, nil, "", nil, nil, "", capBytes, now)
 }
 
 // StartWithExclusions captures watched paths while omitting physically resolved
 // config exclusions in addition to unring's own state directory.
 func StartWithExclusions(stateDir, sessionID string, watched, excluded []string, capBytes int64, now time.Time) (*Session, Summary, error) {
-	return start(stateDir, sessionID, watched, excluded, nil, capBytes, now)
+	return start(stateDir, sessionID, watched, excluded, nil, "", nil, nil, "", capBytes, now)
 }
 
 // StartScope captures a previously resolved scope, including any explicit
 // watches that configuration exclusions made uncapturable.
 func StartScope(stateDir, sessionID string, scope Scope, capBytes int64, now time.Time) (*Session, Summary, error) {
-	return start(stateDir, sessionID, scope.Watched, scope.Excluded, scope.Uncaptured, capBytes, now)
+	return start(
+		stateDir, sessionID, scope.Watched, scope.Excluded, scope.Uncaptured,
+		scope.ScanRoot, scope.ScanExcluded, scope.ScanExcludedNames, scope.ScanError,
+		capBytes, now,
+	)
 }
 
-func start(stateDir, sessionID string, watched, excluded []string, preflightFailures []CaptureFailure, capBytes int64, now time.Time) (*Session, Summary, error) {
+func start(
+	stateDir, sessionID string,
+	watched, excluded []string,
+	preflightFailures []CaptureFailure,
+	scanRoot string,
+	scanExcluded, scanExcludedNames []string,
+	scanError string,
+	capBytes int64,
+	now time.Time,
+) (*Session, Summary, error) {
 	if sessionID == "" || strings.ContainsAny(sessionID, `/\\`) {
 		return nil, Summary{}, errors.New("start file snapshot: invalid session id")
 	}
@@ -255,8 +294,16 @@ func start(stateDir, sessionID string, watched, excluded []string, preflightFail
 
 	m := manifest{
 		Version: manifestVersion, SessionID: sessionID, StartedAt: now.UTC(),
-		Complete: false, RetentionCap: capBytes,
+		Complete: false, RetentionCap: capBytes, ScanRoot: scanRoot,
+		ScanExcluded:      append([]string(nil), scanExcluded...),
+		ScanExcludedNames: append([]string(nil), scanExcludedNames...),
 	}
+	platform := currentSnapshotPlatform()
+	backstopPaths := append([]string(nil), roots...)
+	if scanRoot != "" {
+		backstopPaths = append(backstopPaths, scanRoot)
+	}
+	m.Backstop = takeBackstop(backstopPaths, platform)
 	absoluteStateDir, err := filepath.Abs(stateDir)
 	if err != nil {
 		return nil, Summary{}, fmt.Errorf("resolve state directory: %w", err)
@@ -268,6 +315,7 @@ func start(stateDir, sessionID string, watched, excluded []string, preflightFail
 	m.Excluded = append([]string(nil), excluded...)
 	m.Excluded = append(m.Excluded, filepath.Clean(resolvedStateDir))
 	m.Excluded = append(m.Excluded, overlappingRootExclusions(roots)...)
+	m.ScanExcluded = append(m.ScanExcluded, filepath.Clean(resolvedStateDir))
 	availableBefore, storageMeasured, storageMeasureErr := filesystemAvailableBytes(snapshotRoot)
 	if storageMeasureErr != nil {
 		return nil, Summary{}, fmt.Errorf("measure snapshot storage before capture: %w", storageMeasureErr)
@@ -295,6 +343,18 @@ func start(stateDir, sessionID string, watched, excluded []string, preflightFail
 			return nil, Summary{}, fmt.Errorf("record preflight snapshot failure for %s: no watched root contains it", failure.Path)
 		}
 		failures = append(failures, failure)
+	}
+	var scanBefore map[string]Entry
+	if scanError != "" {
+		m.ScanFailures = append(m.ScanFailures, CaptureFailure{Path: scanRoot, Error: scanError})
+	} else if scanRoot != "" {
+		scanStarted := time.Now()
+		scanBefore, m.ScanFailures, err = scanRootWithNames(scanRoot, m.ScanExcluded, m.ScanExcludedNames)
+		m.ScanBeforeMillis = time.Since(scanStarted).Milliseconds()
+		m.ScanBeforeFiles = len(scanBefore)
+		if err != nil {
+			m.ScanFailures = append(m.ScanFailures, CaptureFailure{Path: scanRoot, Error: err.Error()})
+		}
 	}
 	failures = mergeFailures(failures)
 	m.Storage = storageDescription(methods)
@@ -336,8 +396,15 @@ func start(stateDir, sessionID string, watched, excluded []string, preflightFail
 		Storage: m.Storage, LogicalBytes: m.LogicalBytes, StorageBytes: m.StorageBytes,
 		StorageExact: m.StorageExact, CopiedBytes: m.CopiedBytes,
 		RetentionCap: capBytes, Retained: true,
+		ScanRoot: m.ScanRoot, ScanExcluded: append([]string(nil), m.ScanExcluded...),
+		ScanFailures:    append([]CaptureFailure(nil), m.ScanFailures...),
+		ScanBeforeFiles: m.ScanBeforeFiles, ScanBeforeMillis: m.ScanBeforeMillis,
+		Backstop: m.Backstop,
 	}
-	session := &Session{dir: finalDir, manifest: m, summary: summary}
+	session := &Session{
+		dir: finalDir, manifest: m, summary: summary, platform: platform,
+		scanBefore: scanBefore,
+	}
 	evicted, _, err := EnforceRetention(stateDir, capBytes, sessionID)
 	if err != nil {
 		_ = removeSnapshotTree(finalDir)
@@ -427,8 +494,54 @@ func (s *Session) Seal(now time.Time) Summary {
 		changes[index].UnrestorableReason = overlappingFailure(
 			changes[index].Path, coveragePrefixes, coverageMessages,
 		)
+		if changes[index].UnrestorableReason == "" {
+			changes[index].RestoreSource = RestoreSourceClone
+		} else {
+			changes[index].RestoreSource = RestoreSourceNone
+		}
 	}
-	allFailures := mergeFailures(scanFailures, coverageGaps)
+
+	wideAfter := make(map[string]Entry)
+	wideFailures := append([]CaptureFailure(nil), s.manifest.ScanFailures...)
+	if s.manifest.ScanRoot != "" {
+		scanStarted := time.Now()
+		entries, failures, err := scanRootWithNames(
+			s.manifest.ScanRoot, s.manifest.ScanExcluded, s.manifest.ScanExcludedNames,
+		)
+		s.manifest.ScanAfterMillis = time.Since(scanStarted).Milliseconds()
+		s.manifest.ScanAfterFiles = len(entries)
+		if err != nil {
+			wideFailures = append(wideFailures, CaptureFailure{Path: s.manifest.ScanRoot, Error: err.Error()})
+		} else {
+			wideAfter = entries
+			wideFailures = append(wideFailures, failures...)
+		}
+	}
+	wideExcluded := make(map[string]bool)
+	for _, failure := range wideFailures {
+		if failure.Path != "" {
+			wideExcluded[failure.Path] = true
+		}
+	}
+	wideChanges := diff(s.scanBefore, wideAfter, wideExcluded, nil)
+	changeIndexes := make(map[string]int, len(changes))
+	for index := range changes {
+		changeIndexes[changes[index].Path] = index
+	}
+	for _, change := range wideChanges {
+		if pathInsideCapturedRoot(change.Path, s.manifest.Roots) {
+			continue
+		}
+		if _, exists := changeIndexes[change.Path]; exists {
+			continue
+		}
+		classifyWideChange(&change, s.platform, &s.manifest.Backstop)
+		changeIndexes[change.Path] = len(changes)
+		changes = append(changes, change)
+	}
+	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
+	s.manifest.ScanFailures = mergeFailures(wideFailures)
+	allFailures := mergeFailures(scanFailures, coverageGaps, s.manifest.ScanFailures)
 	s.manifest.EndedAt = now.UTC()
 	s.manifest.After = after
 	s.manifest.Changes = changes
@@ -476,7 +589,62 @@ func (s *Session) Seal(now time.Time) Summary {
 	s.summary.Error = s.manifest.Error
 	s.summary.StorageBytes = s.manifest.StorageBytes
 	s.summary.StorageExact = s.manifest.StorageExact
+	s.summary.ScanFailures = append([]CaptureFailure(nil), s.manifest.ScanFailures...)
+	s.summary.ScanAfterFiles = s.manifest.ScanAfterFiles
+	s.summary.ScanAfterMillis = s.manifest.ScanAfterMillis
+	s.summary.Backstop = s.manifest.Backstop
 	return s.summary
+}
+
+func pathInsideCapturedRoot(path string, roots []rootManifest) bool {
+	for _, root := range roots {
+		for _, candidate := range []string{root.Path, root.Source} {
+			if candidate != "" && (path == candidate || strings.HasPrefix(path, candidate+string(os.PathSeparator))) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func classifyWideChange(change *Change, platform VolumeSnapshotPlatform, backstop *Backstop) {
+	change.RestoreSource = RestoreSourceNone
+	entry := change.Before
+	if entry == nil {
+		entry = change.After
+	}
+	if entry != nil {
+		switch {
+		case entry.Type == "other":
+			change.UnrestorableReason = "unsupported file type cannot be restored per path"
+			return
+		case entry.Type == "file" && entry.Links > 1:
+			change.UnrestorableReason = "hard-linked file cannot be restored per path without breaking its link group"
+			return
+		}
+	}
+	if !backstop.Available {
+		change.UnrestorableReason = "no whole-volume snapshot was taken for this session"
+		return
+	}
+	excluded, err := platform.IsExcluded(change.Path)
+	if err != nil {
+		change.UnrestorableReason = "could not verify that the path was included in the Time Machine backstop: " + err.Error()
+		return
+	}
+	if excluded {
+		failure := CaptureFailure{Path: change.Path, Error: "excluded from the Time Machine backup"}
+		backstop.Excluded = mergeFailures(backstop.Excluded, []CaptureFailure{failure})
+		change.UnrestorableReason = "path was excluded from the Time Machine backup"
+		return
+	}
+	snapshot, covered := snapshotForPath(platform, *backstop, change.Path)
+	if !covered {
+		change.UnrestorableReason = "the path's volume has no recorded local snapshot for this session"
+		return
+	}
+	change.RestoreSource = RestoreSourceVolume
+	change.VolumeSnapshot = &snapshot
 }
 
 func coverageFailures(entries map[string]Entry, alreadyUncaptured map[string]string) []CaptureFailure {
@@ -871,7 +1039,15 @@ func captureOne(source, destination string, info fs.FileInfo) (string, bool, err
 }
 
 func scanRoot(root string, excluded []string) (map[string]Entry, []CaptureFailure, error) {
+	return scanRootWithNames(root, excluded, nil)
+}
+
+func scanRootWithNames(root string, excluded, excludedNames []string) (map[string]Entry, []CaptureFailure, error) {
 	entries := make(map[string]Entry)
+	excludedNameSet := make(map[string]bool, len(excludedNames))
+	for _, name := range excludedNames {
+		excludedNameSet[name] = true
+	}
 	info, err := os.Lstat(root)
 	if errors.Is(err, os.ErrNotExist) {
 		return entries, nil, nil
@@ -901,6 +1077,9 @@ func scanRoot(root string, excluded []string) (map[string]Entry, []CaptureFailur
 				return filepath.SkipDir
 			}
 			return nil
+		}
+		if path != root && directoryEntry.IsDir() && excludedNameSet[directoryEntry.Name()] {
+			return filepath.SkipDir
 		}
 		info, infoErr := directoryEntry.Info()
 		if infoErr != nil {

@@ -227,6 +227,13 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		return internalErrorExitCode
 	}
 	auditRecord := auditSession.Snapshot()
+	if scope.ScanRoot != "" && os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") == "" {
+		fmt.Fprintf(stderr,
+			"unring: scanning %s for the widened change list; this metadata scan may take several seconds and excludes Library, node_modules, .git, .cache, and go/pkg.\n",
+			scope.ScanRoot)
+	} else if scope.ScanError != "" {
+		fmt.Fprintf(stderr, "unring: WIDENED CHANGE LIST UNAVAILABLE: %s\n", scope.ScanError)
+	}
 	fileSession, fileSummary, err := localrollback.StartScope(
 		auditStore.StateDir(), auditRecord.ID, scope, capBytes, auditRecord.StartedAt,
 	)
@@ -555,6 +562,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		auditError = joinErrorText(auditError, result.Err)
 	}
 	fileSummary = fileSession.Seal(time.Now())
+	printScanFinished(stderr, fileSummary)
 	if evicted, usage, retentionErr := localrollback.EnforceRetention(
 		auditStore.StateDir(), capBytes, auditRecord.ID,
 	); retentionErr != nil {
@@ -836,6 +844,26 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 }
 
 func printSnapshotStarted(output io.Writer, summary localrollback.Summary) {
+	if summary.ScanRoot != "" && os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") == "" {
+		fmt.Fprintf(output,
+			"unring: widened change-list baseline scanned %d entries in %d ms; the same pruned scope will be scanned again after the child exits.\n",
+			summary.ScanBeforeFiles, summary.ScanBeforeMillis)
+	}
+	if summary.Backstop.Checked && !summary.Backstop.Available {
+		fmt.Fprintln(output, "unring: ============================================================")
+		fmt.Fprintln(output, "unring: NO WHOLE-VOLUME BACKSTOP")
+		fmt.Fprintf(output, "unring: %s.\n", strings.TrimSuffix(summary.Backstop.Reason, "."))
+		fmt.Fprintln(output, "unring: Changes outside the clone scope can be reported, but their prior contents cannot be restored.")
+		fmt.Fprintln(output, "unring: The child will still run with clone-based protection for watched paths.")
+		fmt.Fprintln(output, "unring: ============================================================")
+	} else if summary.Backstop.Available {
+		for _, snapshot := range summary.Backstop.Snapshots {
+			fmt.Fprintf(output, "unring: whole-volume backstop recorded %s on %s.\n", snapshot.Name, snapshot.MountPoint)
+		}
+	}
+	for _, failure := range summary.Backstop.Excluded {
+		fmt.Fprintf(output, "unring: PATH OUTSIDE WHOLE-VOLUME BACKSTOP: %s: %s\n", failure.Path, failure.Error)
+	}
 	if strings.Contains(summary.Storage, "full-copy") {
 		fmt.Fprintf(output,
 			"unring: snapshot cloning was unavailable for %d bytes; those bytes were copied in full before the child started.\n",
@@ -843,6 +871,9 @@ func printSnapshotStarted(output io.Writer, summary localrollback.Summary) {
 	}
 	for _, failure := range summary.Uncaptured {
 		fmt.Fprintf(output, "unring: FILE NOT SNAPSHOTTED: %s: %s\n", failure.Path, failure.Error)
+	}
+	for _, failure := range summary.ScanFailures {
+		fmt.Fprintf(output, "unring: CHANGE-LIST SCAN INCOMPLETE: %s: %s\n", failure.Path, failure.Error)
 	}
 	for _, evicted := range summary.Evicted {
 		fmt.Fprintf(output, "unring: retention evicted oldest snapshot %s.\n", evicted)
@@ -856,6 +887,14 @@ func printSnapshotStarted(output io.Writer, summary localrollback.Summary) {
 			"unring: snapshot storage is an upper-bound estimate of %d bytes; retention will not evict snapshots based on that estimate.\n",
 			summary.StorageBytes)
 	}
+}
+
+func printScanFinished(output io.Writer, summary localrollback.Summary) {
+	if summary.ScanRoot == "" || os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") != "" {
+		return
+	}
+	fmt.Fprintf(output, "unring: widened change-list final scan inspected %d entries in %d ms.\n",
+		summary.ScanAfterFiles, summary.ScanAfterMillis)
 }
 
 func printFileChanges(output io.Writer, sessionID string, summary localrollback.Summary) {
@@ -878,7 +917,9 @@ func printFileChanges(output io.Writer, sessionID string, summary localrollback.
 		created, modified, deleted)
 	for _, change := range summary.Changes {
 		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
-		if change.UnrestorableReason != "" {
+		if change.RestoreSource == localrollback.RestoreSourceVolume {
+			fmt.Fprintln(output, "             SNAPSHOT ONLY: restoring this path requires sudo to mount the APFS snapshot.")
+		} else if change.UnrestorableReason != "" {
 			fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
 		}
 	}
@@ -905,9 +946,29 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 	for _, failure := range summary.Uncaptured {
 		fmt.Fprintf(output, "  NOT SNAPSHOTTED: %s: %s\n", failure.Path, failure.Error)
 	}
+	if summary.Backstop.Available {
+		for _, snapshot := range summary.Backstop.Snapshots {
+			fmt.Fprintf(output, "  Volume backstop: %s on %s\n", snapshot.Name, snapshot.MountPoint)
+		}
+	} else {
+		fmt.Fprintf(output, "  NO WHOLE-VOLUME BACKSTOP: %s\n", summary.Backstop.Reason)
+	}
+	for _, failure := range summary.Backstop.Excluded {
+		fmt.Fprintf(output, "  OUTSIDE VOLUME BACKSTOP: %s: %s\n", failure.Path, failure.Error)
+	}
+	for _, failure := range summary.ScanFailures {
+		fmt.Fprintf(output, "  CHANGE-LIST SCAN INCOMPLETE: %s: %s\n", failure.Path, failure.Error)
+	}
+	if summary.ScanRoot != "" {
+		fmt.Fprintf(output, "  Change-list scan: %d entries/%d ms before; %d entries/%d ms after\n",
+			summary.ScanBeforeFiles, summary.ScanBeforeMillis,
+			summary.ScanAfterFiles, summary.ScanAfterMillis)
+	}
 	for _, change := range summary.Changes {
 		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
-		if change.UnrestorableReason != "" {
+		if change.RestoreSource == localrollback.RestoreSourceVolume {
+			fmt.Fprintln(output, "             SNAPSHOT ONLY: requires sudo to mount the APFS snapshot")
+		} else if change.UnrestorableReason != "" {
 			fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
 		}
 	}
@@ -1282,7 +1343,24 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 			selections = append(selections, change.Path)
 		}
 	}
-	results, err := localrollback.Restore(store.StateDir(), record.ID, selections, force)
+	selectedChanges, err := localrollback.ChangesForRestore(record.Files.Changes, selections)
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: restore %s: %v\n", record.ID, err)
+		return internalErrorExitCode
+	}
+	rootWarningPrinted := false
+	for _, change := range selectedChanges {
+		if change.RestoreSource != localrollback.RestoreSourceVolume {
+			continue
+		}
+		if !rootWarningPrinted {
+			fmt.Fprintln(stderr, "unring: ROOT PRIVILEGES REQUIRED FOR SNAPSHOT-ONLY RESTORE")
+			fmt.Fprintln(stderr, "unring: This path was outside the clone scope. macOS permits only root to mount the recorded read-only APFS snapshot, so sudo will ask for authorization before unring accesses its prior contents.")
+			rootWarningPrinted = true
+		}
+		fmt.Fprintf(stderr, "unring: snapshot-only path: %s\n", change.Path)
+	}
+	results, err := localrollback.RestoreRecorded(store.StateDir(), record.ID, record.Files, selections, force)
 	if err != nil {
 		fmt.Fprintf(stderr, "unring: restore %s: %v\n", record.ID, err)
 		return internalErrorExitCode
@@ -1365,6 +1443,32 @@ func snapshotsCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "Snapshot storage: upper-bound estimate %d bytes of %d bytes; %d sessions retained.\n",
 			usage.Bytes, usage.CapBytes, usage.Sessions)
 	}
+	records, listErr := store.List()
+	if listErr != nil {
+		fmt.Fprintf(stderr, "unring: inspect session backstops: %v\n", listErr)
+	}
+	for _, record := range records {
+		backstop := record.Files.Backstop
+		if !backstop.Available {
+			reason := backstop.Reason
+			if reason == "" {
+				reason = "no backstop was recorded"
+			}
+			fmt.Fprintf(stdout, "%s  NO WHOLE-VOLUME BACKSTOP — %s\n", record.ID, reason)
+			continue
+		}
+		presences := localrollback.InspectBackstop(backstop)
+		for _, presence := range presences {
+			status := "present"
+			if presence.Error != "" {
+				status = "presence unknown: " + presence.Error
+			} else if !presence.Present {
+				status = "PURGED OR DELETED"
+			}
+			fmt.Fprintf(stdout, "%s  %s on %s — %s\n",
+				record.ID, presence.Snapshot.Name, presence.Snapshot.MountPoint, status)
+		}
+	}
 	return 0
 }
 
@@ -1372,12 +1476,19 @@ func printRestoreListing(output io.Writer, record audit.Record) {
 	fmt.Fprintf(output, "UNRING FILE CHANGES %s\n", record.ID)
 	for _, change := range record.Files.Changes {
 		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
-		if change.UnrestorableReason != "" {
+		if change.RestoreSource == localrollback.RestoreSourceVolume {
+			fmt.Fprintln(output, "             SNAPSHOT ONLY: restore requires sudo because APFS snapshot mounting is root-only")
+		} else if change.UnrestorableReason != "" {
 			fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
 		}
 	}
 	if !record.Files.Retained {
-		fmt.Fprintln(output, "Snapshot data has been evicted; these changes are no longer restorable.")
+		if hasVolumeRestorableFileChange(record.Files.Changes) {
+			fmt.Fprintln(output, "Clone snapshot data has been evicted; SNAPSHOT ONLY paths remain restorable while their APFS snapshot is present.")
+			fmt.Fprintf(output, "Restore selected snapshot-only paths with: unring restore %s <path> [...]\n", record.ID)
+			return
+		}
+		fmt.Fprintln(output, "Clone snapshot data has been evicted; these changes are no longer restorable.")
 		return
 	}
 	if hasRestorableFileChange(record.Files.Changes) {
@@ -1391,6 +1502,15 @@ func printRestoreListing(output io.Writer, record audit.Record) {
 func hasRestorableFileChange(changes []localrollback.Change) bool {
 	for _, change := range changes {
 		if change.UnrestorableReason == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasVolumeRestorableFileChange(changes []localrollback.Change) bool {
+	for _, change := range changes {
+		if change.UnrestorableReason == "" && change.RestoreSource == localrollback.RestoreSourceVolume {
 			return true
 		}
 	}

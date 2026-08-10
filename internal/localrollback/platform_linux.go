@@ -10,6 +10,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func newVolumeSnapshotPlatform() VolumeSnapshotPlatform {
+	return unavailableSnapshotPlatform{reason: "whole-volume APFS snapshots are unavailable on Linux"}
+}
+
 func cloneDirectory(source, destination string) (string, error) {
 	return "", syscall.ENOTSUP
 }

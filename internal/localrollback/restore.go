@@ -66,6 +66,7 @@ func Restore(stateDir, sessionID string, selections []string, force bool) ([]Res
 	selected = orderRestoreChanges(selected)
 	rootDirectory := filepath.Join(stateDir, "snapshots", value.SessionID)
 	results := make([]RestoreResult, 0, len(selected))
+	platform := currentSnapshotPlatform()
 	for _, change := range selected {
 		if change.UnrestorableReason != "" {
 			results = append(results, RestoreResult{
@@ -74,10 +75,254 @@ func Restore(stateDir, sessionID string, selections []string, force bool) ([]Res
 			})
 			continue
 		}
-		result := restoreOne(rootDirectory, value, change, force)
+		var result RestoreResult
+		switch change.RestoreSource {
+		case RestoreSourceVolume:
+			result = restoreVolumeOne(platform, value, change, force)
+		case RestoreSourceNone:
+			result = RestoreResult{
+				Path: change.Path, Status: "unavailable",
+				Err: errors.New("no volume snapshot was taken for this path in this session"),
+			}
+		default:
+			// Manifests written before restore-source tagging are clone-backed.
+			result = restoreOne(rootDirectory, value, change, force)
+		}
 		results = append(results, result)
 	}
 	return results, nil
+}
+
+// RestoreRecorded restores from an audit summary when available. It preserves
+// clone restore behavior while allowing a still-present APFS backstop to be
+// used after clone retention has evicted the session directory.
+func RestoreRecorded(stateDir, sessionID string, summary Summary, selections []string, force bool) ([]RestoreResult, error) {
+	if sessionID == "" || strings.ContainsAny(sessionID, `/\\`) {
+		return nil, errors.New("restore recorded snapshot: invalid session id")
+	}
+	manifestPath := filepath.Join(stateDir, "snapshots", sessionID, "manifest.json")
+	if _, err := os.Stat(manifestPath); err == nil {
+		return Restore(stateDir, sessionID, selections, force)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	selected, err := selectChanges(summary.Changes, selections)
+	if err != nil {
+		return nil, err
+	}
+	unlock, err := acquireSnapshotLock(stateDir, sessionID, unix.LOCK_SH)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	platform := currentSnapshotPlatform()
+	value := manifest{SessionID: sessionID, Changes: summary.Changes, Backstop: summary.Backstop}
+	results := make([]RestoreResult, 0, len(selected))
+	for _, change := range selected {
+		switch {
+		case change.UnrestorableReason != "":
+			results = append(results, RestoreResult{
+				Path: change.Path, Status: "unavailable",
+				Err: fmt.Errorf("path was outside snapshot coverage: %s", change.UnrestorableReason),
+			})
+		case change.RestoreSource == RestoreSourceVolume:
+			results = append(results, restoreVolumeOne(platform, value, change, force))
+		case change.RestoreSource == RestoreSourceNone:
+			results = append(results, RestoreResult{
+				Path: change.Path, Status: "unavailable",
+				Err: errors.New("no volume snapshot was taken for this path in this session"),
+			})
+		default:
+			results = append(results, RestoreResult{
+				Path: change.Path, Status: "unavailable",
+				Err: errors.New("clone snapshot data was evicted; this path was not stored in the volume-snapshot restore layer"),
+			})
+		}
+	}
+	return results, nil
+}
+
+func restoreVolumeOne(platform VolumeSnapshotPlatform, value manifest, change Change, force bool) RestoreResult {
+	result := RestoreResult{Path: change.Path}
+	if change.VolumeSnapshot == nil {
+		result.Status = "unavailable"
+		result.Err = errors.New("the session did not record which volume snapshot contains this path")
+		return result
+	}
+	current, exists, err := currentEntry(change.Path)
+	if err != nil {
+		result.Status, result.Err = "error", err
+		return result
+	}
+	if change.Before == nil && !exists {
+		result.Status = "already-restored"
+		return result
+	}
+	conflict := !matchesExpected(current, exists, change.After)
+	possibleRestored := matchesRestoredMetadata(current, exists, change.Before)
+	if conflict && !possibleRestored && !force {
+		result.Status = "refused"
+		result.Err = errors.New("path changed after the session ended; snapshot-only restores cannot write a conflict sidecar without mounting the APFS snapshot")
+		return result
+	}
+	volume := Volume{
+		ID: change.VolumeSnapshot.VolumeID, MountPoint: change.VolumeSnapshot.MountPoint,
+		Filesystem: "apfs",
+	}
+	names, err := platform.ListSnapshots(volume)
+	if err != nil {
+		result.Status = "unavailable"
+		result.Err = fmt.Errorf("could not verify volume snapshot %s before restore: %w", change.VolumeSnapshot.Name, err)
+		return result
+	}
+	present := false
+	for _, name := range names {
+		if name == change.VolumeSnapshot.Name {
+			present = true
+			break
+		}
+	}
+	if !present {
+		result.Status = "unavailable"
+		result.Err = fmt.Errorf("volume snapshot %s is no longer present; it was purged or deleted", change.VolumeSnapshot.Name)
+		return result
+	}
+
+	if change.Kind == "created" {
+		if exists {
+			if err := os.Remove(change.Path); err != nil {
+				result.Status, result.Err = "error", err
+				return result
+			}
+		}
+		result.Status = "restored"
+		return result
+	}
+
+	mountPoint, err := os.MkdirTemp("", "unring-volume-snapshot-*")
+	if err != nil {
+		result.Status, result.Err = "error", err
+		return result
+	}
+	defer os.Remove(mountPoint)
+	if err := platform.MountSnapshot(*change.VolumeSnapshot, mountPoint); err != nil {
+		result.Status = "error"
+		result.Err = fmt.Errorf("mount volume snapshot %s with root privileges: %w", change.VolumeSnapshot.Name, err)
+		return result
+	}
+	snapshotPath, err := mountedSnapshotPath(mountPoint, change.VolumeSnapshot.MountPoint, change.Path)
+	refusedAfterMount := false
+	if err == nil && possibleRestored {
+		var matches bool
+		matches, err = pathMatchesMountedBefore(snapshotPath, change.Path, change.Before)
+		if err == nil && matches {
+			unmountErr := platform.UnmountSnapshot(mountPoint)
+			if unmountErr != nil {
+				result.Status = "error"
+				result.Err = wrapUnmountError(unmountErr)
+				return result
+			}
+			result.Status = "already-restored"
+			return result
+		}
+		if err == nil && conflict && !force {
+			err = errors.New("path changed after the session ended; not overwritten")
+			refusedAfterMount = true
+		}
+	}
+	if err == nil {
+		err = restoreMountedSnapshotObject(snapshotPath, change.Path, change.Before)
+	}
+	unmountErr := platform.UnmountSnapshot(mountPoint)
+	if err != nil || unmountErr != nil {
+		result.Status = "error"
+		if refusedAfterMount && unmountErr == nil {
+			result.Status = "refused"
+		}
+		result.Err = errors.Join(err, wrapUnmountError(unmountErr))
+		return result
+	}
+	result.Status = "restored"
+	return result
+}
+
+func matchesRestoredMetadata(current Entry, exists bool, before *Entry) bool {
+	if before == nil {
+		return !exists
+	}
+	if !exists || current.Type != before.Type || current.Mode != before.Mode {
+		return false
+	}
+	switch before.Type {
+	case "directory":
+		return true
+	case "symlink":
+		return current.LinkTarget == before.LinkTarget
+	case "file":
+		return current.Size == before.Size && current.MTime == before.MTime
+	default:
+		return false
+	}
+}
+
+func pathMatchesMountedBefore(snapshotPath, currentPath string, before *Entry) (bool, error) {
+	if before == nil {
+		return false, nil
+	}
+	switch before.Type {
+	case "directory", "symlink":
+		return true, nil
+	case "file":
+		return filesEqual(snapshotPath, currentPath)
+	default:
+		return false, nil
+	}
+}
+
+func restoreMountedSnapshotObject(snapshotPath, destination string, metadata *Entry) error {
+	if metadata == nil {
+		return errors.New("snapshot metadata is absent")
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return err
+	}
+	if metadata.Type == "directory" {
+		if err := os.Mkdir(destination, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		return applyMetadata(destination, *metadata)
+	}
+	return restoreSnapshotAtomically(snapshotPath, destination, metadata)
+}
+
+func mountedSnapshotPath(mountedRoot, volumeMountPoint, original string) (string, error) {
+	original = filepath.Clean(original)
+	volumeMountPoint = filepath.Clean(volumeMountPoint)
+	var relative string
+	if original == volumeMountPoint || strings.HasPrefix(original, volumeMountPoint+string(os.PathSeparator)) {
+		var err error
+		relative, err = filepath.Rel(volumeMountPoint, original)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		// The macOS Data volume is mounted at /System/Volumes/Data but its
+		// firmlinked paths (including /Users) appear from the volume root.
+		relative = strings.TrimPrefix(original, string(os.PathSeparator))
+	}
+	path := filepath.Clean(filepath.Join(mountedRoot, relative))
+	root := filepath.Clean(mountedRoot)
+	if path != root && !strings.HasPrefix(path, root+string(os.PathSeparator)) {
+		return "", errors.New("mounted snapshot path escaped its root")
+	}
+	return path, nil
+}
+
+func wrapUnmountError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("unmount volume snapshot: %w", err)
 }
 
 func orderRestoreChanges(changes []Change) []Change {
@@ -152,6 +397,11 @@ func summaryFromManifest(value manifest, retained bool) Summary {
 		LogicalBytes: value.LogicalBytes, StorageBytes: value.StorageBytes,
 		StorageExact: value.StorageExact, CopiedBytes: value.CopiedBytes,
 		RetentionCap: value.RetentionCap, Retained: retained,
+		ScanRoot: value.ScanRoot, ScanExcluded: append([]string(nil), value.ScanExcluded...),
+		ScanFailures:    append([]CaptureFailure(nil), value.ScanFailures...),
+		ScanBeforeFiles: value.ScanBeforeFiles, ScanAfterFiles: value.ScanAfterFiles,
+		ScanBeforeMillis: value.ScanBeforeMillis, ScanAfterMillis: value.ScanAfterMillis,
+		Backstop: value.Backstop,
 	}
 }
 
@@ -196,6 +446,12 @@ func selectChanges(changes []Change, selections []string) ([]Change, error) {
 		}
 	}
 	return selected, nil
+}
+
+// ChangesForRestore resolves user selections exactly as Restore will, without
+// changing files or crossing the root privilege boundary.
+func ChangesForRestore(changes []Change, selections []string) ([]Change, error) {
+	return selectChanges(changes, selections)
 }
 
 func restoreOne(snapshotRoot string, value manifest, change Change, force bool) RestoreResult {

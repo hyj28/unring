@@ -27,9 +27,13 @@ type ScopeOptions struct {
 // Scope is the resolved set of watched roots, physically resolved exclusions,
 // and explicit watches that those exclusions prevent from being captured.
 type Scope struct {
-	Watched    []string
-	Excluded   []string
-	Uncaptured []CaptureFailure
+	Watched           []string
+	Excluded          []string
+	Uncaptured        []CaptureFailure
+	ScanRoot          string
+	ScanExcluded      []string
+	ScanExcludedNames []string
+	ScanError         string
 }
 
 type scopeConfigError struct {
@@ -79,18 +83,33 @@ func ResolveScope(options ScopeOptions) (Scope, error) {
 		return Scope{}, err
 	}
 
+	homeDirectory := options.HomeDirectory
+	var scanRoot string
+	var scanError string
+	if len(options.WatchOnly) == 0 {
+		if homeDirectory == "" {
+			homeDirectory, err = os.UserHomeDir()
+		}
+		if err != nil {
+			scanError = "find home directory for widened change-list scan: " + err.Error()
+			err = nil
+		} else {
+			scanRoot, err = resolveExistingPath(homeDirectory)
+			if err != nil {
+				scanError = "resolve home directory for widened change-list scan: " + err.Error()
+				err = nil
+			}
+		}
+	}
+
 	var watched []string
 	var explicit []string
 	if len(options.WatchOnly) > 0 {
 		explicit = append(explicit, options.WatchOnly...)
 		watched = append(watched, explicit...)
 	} else {
-		homeDirectory := options.HomeDirectory
 		if homeDirectory == "" {
-			homeDirectory, err = os.UserHomeDir()
-			if err != nil {
-				return Scope{}, fmt.Errorf("find home directory for default snapshot scope: %w", err)
-			}
+			return Scope{}, fmt.Errorf("find home directory for default snapshot scope: %s", scanError)
 		}
 		defaults, err := DefaultWatchPaths(options.WorkingDirectory, homeDirectory)
 		if err != nil {
@@ -145,7 +164,26 @@ func ResolveScope(options ScopeOptions) (Scope, error) {
 		}
 		filtered = append(filtered, root)
 	}
-	return Scope{Watched: filtered, Excluded: excluded, Uncaptured: uncaptured}, nil
+	var scanExcluded []string
+	var scanExcludedNames []string
+	if scanRoot != "" {
+		scanExcluded = append(scanExcluded, excluded...)
+		scanExcluded = append(scanExcluded,
+			filepath.Join(scanRoot, "Library"),
+			filepath.Join(scanRoot, "go", "pkg"),
+		)
+		scanExcluded, err = normalizeExclusions(scanExcluded)
+		if err != nil {
+			return Scope{}, fmt.Errorf("resolve widened scan exclusions: %w", err)
+		}
+		scanExcludedNames = []string{"node_modules", ".git", ".cache"}
+	}
+	return Scope{
+		Watched: filtered, Excluded: excluded, Uncaptured: uncaptured,
+		ScanRoot: scanRoot, ScanExcluded: scanExcluded,
+		ScanExcludedNames: scanExcludedNames,
+		ScanError:         scanError,
+	}, nil
 }
 
 func loadScopeConfig(stateDir, homeDirectory string, includeWatch bool) (scopeConfig, error) {

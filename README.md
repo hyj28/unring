@@ -52,10 +52,11 @@ unring run -- claude -p 'Implement the requested validation change, run its test
 unring run -- your-one-shot-agent-command
 ```
 
-Before the child starts, unring snapshots the project tree plus `~/Documents`,
-`~/Desktop`, `~/.config`, `~/.ssh`, and `~/.aws`. A repeatable `--watch` flag adds paths
-to that default scope; use repeatable `--watch-only` when the named paths should replace
-it. On APFS the fast path uses copy-on-write clones. If cloning is unavailable, unring
+Before the child starts, unring creates two independent layers of file protection. It asks
+Time Machine for a whole-volume local APFS snapshot, then clones the project tree plus
+`~/Documents`, `~/Desktop`, `~/.config`, `~/.ssh`, and `~/.aws`. A repeatable `--watch`
+flag adds paths to that clone scope; use repeatable `--watch-only` when the named paths
+should replace it. On APFS the clone fast path uses copy-on-write clones. If cloning is unavailable, unring
 copies bytes for real and reports that cost. If one unreadable
 path breaks the recursive clone, unring falls back to per-entry capture and names every
 path it could not protect; an omitted path is never silently presented as snapshotted.
@@ -65,10 +66,15 @@ symlinked directory targets are not followed and are named as not snapshotted. H
 files are likewise named as outside coverage because per-path restore cannot preserve a
 link group honestly.
 
-**Anything outside the watched scope is neither captured nor reported.** If the agent
-deletes a directory that was not watched, unring holds no copy of it and the change list
-will not mention it — the session simply looks clean. Widen the scope with `--watch` when
-a run might touch something outside it.
+The change list is wider than the clone scope: unring scans the home directory before and
+after the child runs, excluding `~/Library`, `node_modules`, `.git`, `.cache`, and `~/go/pkg`.
+The scan is metadata-only and its progress is announced because it can take several seconds.
+A replacement `--watch-only` scope also replaces this wider scan; the clone diff already
+covers exactly those explicitly selected roots. Additive `--watch` leaves the home-wide scan
+enabled. Scan entry counts and elapsed times are retained in the session audit record.
+A change inside the clone scope remains restorable without privileges. A reported change
+outside it is marked **snapshot only** and requires `sudo` to mount the read-only APFS
+snapshot before restoring prior contents.
 
 The optional `<state-root>/config.yaml` records additive watches and subtractive
 exclusions. Config paths must be absolute or begin with `~/`; relative paths are rejected.
@@ -87,16 +93,19 @@ Missing default directories are ignored because the user did not choose them. A 
 path named by `--watch`, `--watch-only`, or `config.yaml` is reported before the child
 starts without preventing the session from running.
 
-Two limits are worth knowing before relying on the scope. Data protected by macOS privacy
+Two limits are worth knowing before relying on the scan. Data protected by macOS privacy
 controls — the Photos library, for instance — cannot be read by unring at all, so adding
 it to the scope captures nothing; the same restriction applies to the agent unring runs,
 which cannot delete what it cannot read either. And on Linux, where `clonefile` is
 unavailable, capture copies bytes for real, so a wide scope costs real time and real
 writes.
 
-A whole-volume snapshot backstop that removes the scope question entirely is designed but
-not built: see [docs/LOCAL-ROLLBACK-DESIGN.md §8](docs/LOCAL-ROLLBACK-DESIGN.md) and M10 in
-[ROADMAP.md](ROADMAP.md). Until it ships, the scope is the coverage.
+The whole-volume backstop is macOS-only and depends on Time Machine: `tmutil localsnapshot`
+snapshots APFS volumes included in the Time Machine backup. If Time Machine is not
+configured, a watched path is excluded from it, the filesystem is not APFS, or the platform
+is not macOS, unring prints a prominent coverage warning and still runs. The clone layer and
+change list continue to work. Local snapshots are purgeable under disk pressure; `unring
+snapshots` reports whether each recorded backstop still exists.
 
 After the child exits, inspect and restore file changes at any later time:
 
@@ -105,11 +114,13 @@ unring restore <session-id>                  # list created, modified, deleted p
 unring restore <session-id> path/to/file     # restore selected paths
 unring restore --all <session-id>            # restore all covered paths; report unavailable ones
 unring restore --force <session-id> path     # explicitly overwrite a conflict
-unring snapshots                             # inspect retained usage and the space cap
+unring snapshots                             # inspect clone usage and APFS backstop presence
 ```
 
-A path changed after the session is refused by default. Its pre-session snapshot is
-written alongside the current file, and only `--force` permits replacement. Coverage
+A clone-covered path changed after the session is refused by default. Its pre-session
+snapshot is written alongside the current file, and only `--force` permits replacement.
+Snapshot-only restore announces why root is required before invoking `sudo`; it fails
+clearly if Time Machine has already purged the recorded APFS snapshot. Coverage
 gaps created during a session are named in the change list and audit record; they do not
 prevent restoring independently covered paths. Snapshot retention defaults to 5 GiB of
 measured snapshot allocation and evicts oldest sessions.
@@ -284,8 +295,10 @@ otherwise the platform user-config directory plus `unring` (on macOS,
 `~/Library/Application Support/unring`). `UNRING_STATE_DIR` is an explicit override
 for isolated installations and tests.
 
-File snapshots are stored beneath `<state-root>/snapshots/<session-id>`; unring excludes
-its own state root if it is inside a watched project tree.
+Clone snapshots and metadata baselines are stored beneath
+`<state-root>/snapshots/<session-id>`; unring excludes its own state root if it is inside a
+watched project tree. Whole-volume snapshots remain APFS-managed and are named in the
+session audit record rather than copied into unring's state directory.
 
 The CA certificate is stored at `<state-root>/ca/ca.pem`; its private key is
 `<state-root>/ca/ca-key.pem`, inside a mode-`0700` directory with mode-`0600`
