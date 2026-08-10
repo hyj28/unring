@@ -487,26 +487,24 @@ func filesEqual(leftPath, rightPath string) (bool, error) {
 }
 
 func snapshotPathFor(value manifest, snapshotRoot, original string) (string, error) {
-	for _, root := range value.Roots {
-		if original != root.Path && !strings.HasPrefix(original, root.Path+string(os.PathSeparator)) {
-			continue
-		}
-		relative, err := filepath.Rel(root.Path, original)
-		if err != nil {
-			return "", err
-		}
-		path := filepath.Join(snapshotRoot, root.Snapshot)
-		if relative != "." {
-			path = filepath.Join(path, relative)
-		}
-		cleanRoot := filepath.Clean(filepath.Join(snapshotRoot, root.Snapshot))
-		cleanPath := filepath.Clean(path)
-		if cleanPath != cleanRoot && !strings.HasPrefix(cleanPath, cleanRoot+string(os.PathSeparator)) {
-			return "", errors.New("snapshot path escaped its root")
-		}
-		return cleanPath, nil
+	root, found := manifestRootFor(value, original)
+	if !found {
+		return "", fmt.Errorf("snapshot has no root for %s", original)
 	}
-	return "", fmt.Errorf("snapshot has no root for %s", original)
+	relative, err := filepath.Rel(root.Path, original)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(snapshotRoot, root.Snapshot)
+	if relative != "." {
+		path = filepath.Join(path, relative)
+	}
+	cleanRoot := filepath.Clean(filepath.Join(snapshotRoot, root.Snapshot))
+	cleanPath := filepath.Clean(path)
+	if cleanPath != cleanRoot && !strings.HasPrefix(cleanPath, cleanRoot+string(os.PathSeparator)) {
+		return "", errors.New("snapshot path escaped its root")
+	}
+	return cleanPath, nil
 }
 
 func restoreSnapshotPath(snapshotPath, destination string, metadata *Entry) error {

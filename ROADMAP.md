@@ -122,11 +122,11 @@ APFS snapshot costs 180 ms and covers the disk.
       made unreadable rather than reporting them as unchanged
 - [ ] M10.3 Restore a path from the volume snapshot, stating that it needs `sudo` before
       asking for it, and failing clearly when the snapshot has been purged
-- [ ] M10.4 Config file at the state directory with `watch` and `exclude` lists; `--watch`
+- [x] M10.4 Config file at the state directory with `watch` and `exclude` lists; `--watch`
       becomes additive and `--watch-only` takes over the replacing behaviour
 - [ ] M10.5 Report backstop coverage honestly: no Time Machine, a path excluded from it
       (`tmutil isexcluded`), or Linux — say so prominently and keep running
-- [ ] M10.6 Skip a nonexistent *default* path silently; report a nonexistent path the user
+- [x] M10.6 Skip a nonexistent *default* path silently; report a nonexistent path the user
       named explicitly
 
 ---

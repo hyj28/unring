@@ -209,6 +209,22 @@ func RetentionCapForState(stateDir string) (int64, error) {
 // platform's recursive fast path, then falls back to per-entry capture so that
 // one unreadable path does not erase coverage for the rest of a tree.
 func Start(stateDir, sessionID string, watched []string, capBytes int64, now time.Time) (*Session, Summary, error) {
+	return start(stateDir, sessionID, watched, nil, nil, capBytes, now)
+}
+
+// StartWithExclusions captures watched paths while omitting physically resolved
+// config exclusions in addition to unring's own state directory.
+func StartWithExclusions(stateDir, sessionID string, watched, excluded []string, capBytes int64, now time.Time) (*Session, Summary, error) {
+	return start(stateDir, sessionID, watched, excluded, nil, capBytes, now)
+}
+
+// StartScope captures a previously resolved scope, including any explicit
+// watches that configuration exclusions made uncapturable.
+func StartScope(stateDir, sessionID string, scope Scope, capBytes int64, now time.Time) (*Session, Summary, error) {
+	return start(stateDir, sessionID, scope.Watched, scope.Excluded, scope.Uncaptured, capBytes, now)
+}
+
+func start(stateDir, sessionID string, watched, excluded []string, preflightFailures []CaptureFailure, capBytes int64, now time.Time) (*Session, Summary, error) {
 	if sessionID == "" || strings.ContainsAny(sessionID, `/\\`) {
 		return nil, Summary{}, errors.New("start file snapshot: invalid session id")
 	}
@@ -249,7 +265,9 @@ func Start(stateDir, sessionID string, watched []string, capBytes int64, now tim
 	if err != nil {
 		return nil, Summary{}, fmt.Errorf("resolve state directory symlinks: %w", err)
 	}
-	m.Excluded = []string{filepath.Clean(resolvedStateDir)}
+	m.Excluded = append([]string(nil), excluded...)
+	m.Excluded = append(m.Excluded, filepath.Clean(resolvedStateDir))
+	m.Excluded = append(m.Excluded, overlappingRootExclusions(roots)...)
 	availableBefore, storageMeasured, storageMeasureErr := filesystemAvailableBytes(snapshotRoot)
 	if storageMeasureErr != nil {
 		return nil, Summary{}, fmt.Errorf("measure snapshot storage before capture: %w", storageMeasureErr)
@@ -272,6 +290,13 @@ func Start(stateDir, sessionID string, watched []string, capBytes int64, now tim
 			return nil, Summary{}, fmt.Errorf("snapshot %s: %w", root, captureErr)
 		}
 	}
+	for _, failure := range preflightFailures {
+		if !attachManifestFailure(&m, failure) {
+			return nil, Summary{}, fmt.Errorf("record preflight snapshot failure for %s: no watched root contains it", failure.Path)
+		}
+		failures = append(failures, failure)
+	}
+	failures = mergeFailures(failures)
 	m.Storage = storageDescription(methods)
 	if err := writeManifest(temporary, m); err != nil {
 		return nil, Summary{}, err
@@ -321,6 +346,24 @@ func Start(stateDir, sessionID string, watched []string, capBytes int64, now tim
 	summary.Evicted = evicted
 	session.summary = summary
 	return session, summary, nil
+}
+
+func attachManifestFailure(value *manifest, failure CaptureFailure) bool {
+	matched := -1
+	for index := range value.Roots {
+		root := &value.Roots[index]
+		if failure.Path != root.Path && !strings.HasPrefix(failure.Path, root.Path+string(os.PathSeparator)) {
+			continue
+		}
+		if matched < 0 || len(root.Path) > len(value.Roots[matched].Path) {
+			matched = index
+		}
+	}
+	if matched >= 0 {
+		value.Roots[matched].Uncaptured[failure.Path] = failure.Error
+		return true
+	}
+	return false
 }
 
 // Seal scans the watched paths after the child exits and records the diff.
@@ -377,7 +420,7 @@ func (s *Session) Seal(now time.Time) Summary {
 			root.Uncaptured[failure.Path] = failure.Error
 		}
 	}
-	changes := diff(before, after, diffExcluded)
+	changes := diff(before, after, diffExcluded, s.manifest.Roots)
 	coveragePrefixes := failurePrefixes(coverageGaps)
 	coverageMessages := failureMessages(coverageGaps)
 	for index := range changes {
@@ -508,7 +551,7 @@ func captureRoot(root, destination string, excluded []string) (rootManifest, []C
 
 	var captureFailures []CaptureFailure
 	var copiedBytes int64
-	if info.IsDir() && !containsExcludedPath(source, excluded) {
+	if info.IsDir() && !isExcluded(source, excluded) && !containsExcludedPath(source, excluded) {
 		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 			return state, beforeFailures, methods, 0, 0, err
 		}
@@ -917,10 +960,10 @@ func entryFromInfo(path string, info fs.FileInfo) (Entry, error) {
 	return entry, nil
 }
 
-func diff(before, after map[string]Entry, uncaptured map[string]bool) []Change {
+func diff(before, after map[string]Entry, uncaptured map[string]bool, roots []rootManifest) []Change {
 	changes := make([]Change, 0)
 	for path, oldEntry := range before {
-		if coveredBy(path, uncaptured) {
+		if excludedFromDiff(path, uncaptured, roots) {
 			continue
 		}
 		newEntry, exists := after[path]
@@ -935,7 +978,7 @@ func diff(before, after map[string]Entry, uncaptured map[string]bool) []Change {
 		}
 	}
 	for path, newEntry := range after {
-		if _, existed := before[path]; existed || coveredBy(path, uncaptured) {
+		if _, existed := before[path]; existed || excludedFromDiff(path, uncaptured, roots) {
 			continue
 		}
 		afterCopy := newEntry
@@ -943,6 +986,28 @@ func diff(before, after map[string]Entry, uncaptured map[string]bool) []Change {
 	}
 	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
 	return changes
+}
+
+func excludedFromDiff(path string, uncaptured map[string]bool, roots []rootManifest) bool {
+	if !coveredBy(path, uncaptured) {
+		return false
+	}
+	for _, root := range roots {
+		if !root.Existed || (path != root.Path && !strings.HasPrefix(path, root.Path+string(os.PathSeparator))) {
+			continue
+		}
+		coveredByRootFailure := false
+		for failure := range root.Uncaptured {
+			if path == failure || strings.HasPrefix(path, failure+string(os.PathSeparator)) {
+				coveredByRootFailure = true
+				break
+			}
+		}
+		if !coveredByRootFailure {
+			return false
+		}
+	}
+	return true
 }
 
 func entriesDiffer(before, after Entry) bool {
@@ -984,7 +1049,17 @@ func normalizeRoots(paths []string) ([]string, error) {
 	for _, candidate := range roots {
 		covered := false
 		for _, parent := range filtered {
-			if candidate == parent || strings.HasPrefix(candidate, parent+string(os.PathSeparator)) {
+			if candidate == parent {
+				covered = true
+				break
+			}
+			if !strings.HasPrefix(candidate, parent+string(os.PathSeparator)) {
+				continue
+			}
+			resolvedParent, parentErr := resolveExistingPath(parent)
+			resolvedCandidate, candidateErr := resolveExistingPath(candidate)
+			if parentErr == nil && candidateErr == nil &&
+				(resolvedCandidate == resolvedParent || strings.HasPrefix(resolvedCandidate, resolvedParent+string(os.PathSeparator))) {
 				covered = true
 				break
 			}
@@ -994,6 +1069,48 @@ func normalizeRoots(paths []string) ([]string, error) {
 		}
 	}
 	return filtered, nil
+}
+
+func overlappingRootExclusions(roots []string) []string {
+	unique := make(map[string]bool)
+	var exclusions []string
+	for _, candidate := range roots {
+		for _, parent := range roots {
+			if candidate == parent || !strings.HasPrefix(candidate, parent+string(os.PathSeparator)) {
+				continue
+			}
+			resolvedParent, parentErr := resolveExistingPath(parent)
+			resolvedCandidate, candidateErr := resolveExistingPath(candidate)
+			if parentErr != nil || candidateErr != nil || resolvedCandidate == resolvedParent ||
+				strings.HasPrefix(resolvedCandidate, resolvedParent+string(os.PathSeparator)) {
+				continue
+			}
+			relative, err := filepath.Rel(parent, candidate)
+			if err != nil {
+				continue
+			}
+			logical := parent
+			physical := resolvedParent
+			for _, component := range strings.Split(relative, string(os.PathSeparator)) {
+				logical = filepath.Join(logical, component)
+				physical = filepath.Join(physical, component)
+				info, err := os.Lstat(logical)
+				if err == nil && info.Mode()&os.ModeSymlink != 0 {
+					resolvedBoundary, err := resolveExistingPath(logical)
+					if err != nil || resolvedBoundary != resolvedCandidate {
+						break
+					}
+					if !unique[physical] {
+						unique[physical] = true
+						exclusions = append(exclusions, physical)
+					}
+					break
+				}
+			}
+		}
+	}
+	sort.Strings(exclusions)
+	return exclusions
 }
 
 func projectRoot(directory string) (string, error) {

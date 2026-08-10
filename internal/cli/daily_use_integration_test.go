@@ -41,7 +41,7 @@ func TestFileChangesAreRecordedListedAndRestoredIndividually(t *testing.T) {
 	}
 
 	binary := buildTestBinary(t)
-	command := exec.Command(binary, "run", "--watch", watched, "--", "/bin/sh", "-c", `
+	command := exec.Command(binary, "run", "--watch-only", watched, "--", "/bin/sh", "-c", `
 printf 'SAFE--AFTER' > modified-safe.txt
 touch -r mtime-reference modified-safe.txt
 printf 'conflict--after' > modified-conflict.txt
@@ -163,7 +163,7 @@ func TestRestoreAllRestoresEveryChangedPathIncludingDirectories(t *testing.T) {
 	writeTestFile(t, deleted, "before-deleted")
 
 	binary := buildTestBinary(t)
-	command := exec.Command(binary, "run", "--watch", root, "--", "/bin/sh", "-c",
+	command := exec.Command(binary, "run", "--watch-only", root, "--", "/bin/sh", "-c",
 		"printf 'after-modified' > modified.txt; rm deleted.txt; mkdir empty-created; printf 'created' > created.txt")
 	command.Dir = root
 	command.Env = os.Environ()
@@ -202,7 +202,7 @@ func TestUnrestorableCreatedPathIsListedWithoutBlockingProtectedRestore(t *testi
 	t.Setenv("UNRING_STATE_DIR", stateDir)
 
 	binary := buildTestBinary(t)
-	command := exec.Command(binary, "run", "--watch", root, "--", "/bin/sh", "-c",
+	command := exec.Command(binary, "run", "--watch-only", root, "--", "/bin/sh", "-c",
 		"rm protected.txt; ln -s \"$1\" linked-build-output", "unring-test", target)
 	command.Dir = root
 	command.Env = os.Environ()
@@ -275,7 +275,7 @@ func TestSymlinkedWatchRootIsProtectedAndNestedSymlinkIsDisclosed(t *testing.T) 
 	t.Setenv("DATABASE_URL", "")
 	t.Setenv("UNRING_STATE_DIR", stateDir)
 	binary := buildTestBinary(t)
-	command := exec.Command(binary, "run", "--watch", link, "--", "/bin/rm", filepath.Join(link, "taxes.pdf"))
+	command := exec.Command(binary, "run", "--watch-only", link, "--", "/bin/rm", filepath.Join(link, "taxes.pdf"))
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -311,7 +311,7 @@ func TestRestoreRefusesAWatchRootRetargetEvenWithForce(t *testing.T) {
 	t.Setenv("UNRING_STATE_DIR", stateDir)
 	binary := buildTestBinary(t)
 
-	run := exec.Command(binary, "run", "--watch", root, "--", "/bin/rm", logical)
+	run := exec.Command(binary, "run", "--watch-only", root, "--", "/bin/rm", logical)
 	run.Env = os.Environ()
 	if output, err := run.CombinedOutput(); err != nil {
 		t.Fatalf("delete through original watched root: %v\n%s", err, output)
@@ -349,7 +349,7 @@ func TestMissingWatchedRootIsReportedAtStartAndInAudit(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
 	t.Setenv("UNRING_STATE_DIR", stateDir)
 	binary := buildTestBinary(t)
-	command := exec.Command(binary, "run", "--watch", missing, "--", "/usr/bin/true")
+	command := exec.Command(binary, "run", "--watch-only", missing, "--", "/usr/bin/true")
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -373,6 +373,434 @@ func TestMissingWatchedRootIsReportedAtStartAndInAudit(t *testing.T) {
 	}
 }
 
+func TestConfigurableSnapshotScopeThroughCLI(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	binary := buildTestBinary(t)
+	home := os.Getenv("HOME")
+
+	run := func(t *testing.T, directory string, args ...string) (string, string, error) {
+		t.Helper()
+		command := exec.Command(binary, args...)
+		command.Dir = directory
+		command.Env = os.Environ()
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		command.Stdout = &stdout
+		command.Stderr = &stderr
+		err := command.Run()
+		return stdout.String(), stderr.String(), err
+	}
+	makeProject := func(t *testing.T) string {
+		t.Helper()
+		project := t.TempDir()
+		if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return project
+	}
+
+	t.Run("default config and flag watches are additive and exclusions subtract", func(t *testing.T) {
+		stateDir := t.TempDir()
+		t.Setenv("UNRING_STATE_DIR", stateDir)
+		project := makeProject(t)
+		configWatch := filepath.Join(home, "config-watch-additive")
+		flagWatch := t.TempDir()
+		for _, directory := range []string{
+			configWatch,
+			filepath.Join(project, "private"),
+			filepath.Join(configWatch, "private"),
+		} {
+			if err := os.MkdirAll(directory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		defaultFile := filepath.Join(project, "default.txt")
+		defaultExcluded := filepath.Join(project, "private", "excluded.txt")
+		configFile := filepath.Join(configWatch, "configured.txt")
+		configExcluded := filepath.Join(configWatch, "private", "excluded.txt")
+		flagFile := filepath.Join(flagWatch, "flag.txt")
+		for path, content := range map[string]string{
+			defaultFile: "default", defaultExcluded: "default-excluded",
+			configFile: "configured", configExcluded: "config-excluded", flagFile: "flag",
+		} {
+			writeTestFile(t, path, content)
+		}
+		config := "watch:\n  - ~/config-watch-additive\nexclude:\n  - " +
+			filepath.Join(project, "private") + "\n  - ~/config-watch-additive/private\n"
+		if err := os.WriteFile(filepath.Join(stateDir, "config.yaml"), []byte(config), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		stdout, stderr, err := run(t, project,
+			"run", "--watch", flagWatch, "--", "/bin/rm",
+			defaultFile, defaultExcluded, configFile, configExcluded, flagFile,
+		)
+		if err != nil {
+			t.Fatalf("additive run: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		for _, path := range []string{defaultFile, configFile, flagFile} {
+			if !strings.Contains(stdout, path) {
+				t.Fatalf("additive change report omitted %s:\n%s", path, stdout)
+			}
+		}
+		for _, path := range []string{defaultExcluded, configExcluded} {
+			if strings.Contains(stdout, path) {
+				t.Fatalf("change report included excluded path %s:\n%s", path, stdout)
+			}
+		}
+
+		sessionID := newestSessionID(t, binary)
+		restoreStdout, restoreStderr, err := run(t, project, "restore", "--all", sessionID)
+		if err != nil {
+			t.Fatalf("restore additive scope: %v\nstdout: %s\nstderr: %s", err, restoreStdout, restoreStderr)
+		}
+		assertTestFile(t, defaultFile, "default")
+		assertTestFile(t, configFile, "configured")
+		assertTestFile(t, flagFile, "flag")
+		for _, path := range []string{defaultExcluded, configExcluded} {
+			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("excluded path %s was restored: %v", path, err)
+			}
+		}
+	})
+
+	t.Run("watch only replaces defaults and config watch but keeps exclusions", func(t *testing.T) {
+		stateDir := t.TempDir()
+		t.Setenv("UNRING_STATE_DIR", stateDir)
+		project := makeProject(t)
+		configured := t.TempDir()
+		only := t.TempDir()
+		if err := os.Mkdir(filepath.Join(only, "private"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		defaultFile := filepath.Join(project, "default-only-test.txt")
+		configuredFile := filepath.Join(configured, "configured-only-test.txt")
+		onlyFile := filepath.Join(only, "only.txt")
+		excludedFile := filepath.Join(only, "private", "excluded-only-test.txt")
+		for path, content := range map[string]string{
+			defaultFile: "default", configuredFile: "configured", onlyFile: "only", excludedFile: "excluded",
+		} {
+			writeTestFile(t, path, content)
+		}
+		config := "watch:\n  - " + configured + "\nexclude:\n  - " + filepath.Join(only, "private") + "\n"
+		if err := os.WriteFile(filepath.Join(stateDir, "config.yaml"), []byte(config), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		stdout, stderr, err := run(t, project,
+			"run", "--watch-only", only, "--", "/bin/rm",
+			defaultFile, configuredFile, onlyFile, excludedFile,
+		)
+		if err != nil {
+			t.Fatalf("watch-only run: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		if !strings.Contains(stdout, onlyFile) {
+			t.Fatalf("watch-only report omitted %s:\n%s", onlyFile, stdout)
+		}
+		for _, path := range []string{defaultFile, configuredFile, excludedFile} {
+			if strings.Contains(stdout, path) {
+				t.Fatalf("watch-only report included out-of-scope path %s:\n%s", path, stdout)
+			}
+		}
+
+		sessionID := newestSessionID(t, binary)
+		if stdout, stderr, err := run(t, project, "restore", "--all", sessionID); err != nil {
+			t.Fatalf("restore watch-only scope: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		assertTestFile(t, onlyFile, "only")
+		for _, path := range []string{defaultFile, configuredFile, excludedFile} {
+			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("out-of-scope path %s was restored: %v", path, err)
+			}
+		}
+	})
+
+	t.Run("watch and watch only are a usage error", func(t *testing.T) {
+		marker := filepath.Join(t.TempDir(), "child-ran")
+		stdout, stderr, err := run(t, t.TempDir(),
+			"run", "--watch", t.TempDir(), "--watch-only", t.TempDir(), "--",
+			"/bin/sh", "-c", "touch \"$1\"", "unring-test", marker,
+		)
+		var exitError *exec.ExitError
+		if !errors.As(err, &exitError) || exitError.ExitCode() != usageExitCode {
+			t.Fatalf("mutually exclusive watch exit = %v, want %d\nstdout: %s\nstderr: %s", err, usageExitCode, stdout, stderr)
+		}
+		if !strings.Contains(stderr, "--watch and --watch-only are mutually exclusive") {
+			t.Fatalf("mutual-exclusion error was not actionable: %s", stderr)
+		}
+		if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("usage error launched child: %v", err)
+		}
+	})
+
+	t.Run("missing defaults are silent and missing explicit paths are reported on stderr", func(t *testing.T) {
+		project := makeProject(t)
+		stateDir := t.TempDir()
+		t.Setenv("UNRING_STATE_DIR", stateDir)
+		stdout, stderr, err := run(t, project, "run", "--", "/usr/bin/true")
+		if err != nil {
+			t.Fatalf("default-scope run: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		if strings.Contains(stderr, "does not exist") || strings.Contains(stderr, "scope config") {
+			t.Fatalf("missing default or missing config produced output: %s", stderr)
+		}
+
+		for _, test := range []struct {
+			name string
+			args func(string) []string
+		}{
+			{name: "watch", args: func(path string) []string {
+				return []string{"run", "--watch", path, "--", "/usr/bin/true"}
+			}},
+			{name: "watch-only", args: func(path string) []string {
+				return []string{"run", "--watch-only", path, "--", "/usr/bin/true"}
+			}},
+			{name: "config", args: func(path string) []string {
+				if err := os.WriteFile(filepath.Join(stateDir, "config.yaml"), []byte("watch:\n  - "+path+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return []string{"run", "--", "/usr/bin/true"}
+			}},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				if err := os.Remove(filepath.Join(stateDir, "config.yaml")); err != nil && !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+				missing := filepath.Join(t.TempDir(), "missing-explicit")
+				stdout, stderr, err := run(t, project, test.args(missing)...)
+				if err != nil {
+					t.Fatalf("missing explicit path was fatal: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+				}
+				for _, want := range []string{"FILE NOT SNAPSHOTTED", missing, "does not exist"} {
+					if !strings.Contains(stderr, want) {
+						t.Fatalf("missing explicit warning omitted %q: %s", want, stderr)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("invalid config names the file and prevents child startup", func(t *testing.T) {
+		project := makeProject(t)
+		for _, test := range []struct {
+			name       string
+			contents   string
+			wantDetail string
+		}{
+			{name: "malformed YAML", contents: "watch: [\n", wantDetail: "decode YAML"},
+			{name: "relative path", contents: "watch:\n  - relative/path\n", wantDetail: "must be absolute"},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				stateDir := t.TempDir()
+				t.Setenv("UNRING_STATE_DIR", stateDir)
+				filename := filepath.Join(stateDir, "config.yaml")
+				if err := os.WriteFile(filename, []byte(test.contents), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				marker := filepath.Join(t.TempDir(), "child-ran")
+				stdout, stderr, err := run(t, project,
+					"run", "--", "/bin/sh", "-c", "touch \"$1\"", "unring-test", marker,
+				)
+				var exitError *exec.ExitError
+				if !errors.As(err, &exitError) || exitError.ExitCode() != usageExitCode {
+					t.Fatalf("invalid config exit = %v, want %d\nstdout: %s\nstderr: %s", err, usageExitCode, stdout, stderr)
+				}
+				for _, want := range []string{filename, test.wantDetail} {
+					if !strings.Contains(stderr, want) {
+						t.Fatalf("config error omitted %q: %s", want, stderr)
+					}
+				}
+				if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("invalid config launched child: %v", err)
+				}
+			})
+		}
+	})
+}
+
+func TestExplicitWatchExcludedByConfigIsReportedThroughCLI(t *testing.T) {
+	stateDir := t.TempDir()
+	project := t.TempDir()
+	private := filepath.Join(project, "private")
+	keep := filepath.Join(private, "keep")
+	if err := os.MkdirAll(keep, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	important := filepath.Join(keep, "important.txt")
+	secret := "PRIVATEKEY-CONTENTS-ROUND2"
+	writeTestFile(t, important, secret)
+	configFile := filepath.Join(stateDir, "config.yaml")
+	if err := os.WriteFile(configFile, []byte("exclude:\n  - "+private+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	binary := buildTestBinary(t)
+
+	command := exec.Command(binary, "run", "--watch-only", keep, "--", "/bin/rm", important)
+	command.Dir = project
+	command.Env = os.Environ()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		t.Fatalf("excluded explicit watch run: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+	}
+	for _, want := range []string{"FILE NOT SNAPSHOTTED", keep, "excluded"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("excluded explicit watch warning omitted %q:\n%s", want, stderr.String())
+		}
+	}
+
+	sessionID := newestSessionID(t, binary)
+	logCommand := exec.Command(binary, "log", "--json", sessionID)
+	logCommand.Env = os.Environ()
+	logOutput, err := logCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("read excluded-watch audit: %v\n%s", err, logOutput)
+	}
+	for _, want := range []string{`"path": "` + keep + `"`, "excluded"} {
+		if !strings.Contains(string(logOutput), want) {
+			t.Fatalf("excluded explicit watch audit omitted %q:\n%s", want, logOutput)
+		}
+	}
+	if err := filepath.WalkDir(filepath.Join(stateDir, "snapshots"), func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(data, []byte(secret)) {
+			t.Errorf("config-excluded contents were copied into snapshot store at %s", path)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("inspect snapshot store for excluded contents: %v", err)
+	}
+}
+
+func TestWatchOnlyDoesNotRequireHomeAndScopeFailuresKeepInternalExitCode(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	binary := buildTestBinary(t)
+	withoutHome := func() []string {
+		var environment []string
+		for _, entry := range os.Environ() {
+			if !strings.HasPrefix(entry, "HOME=") {
+				environment = append(environment, entry)
+			}
+		}
+		return environment
+	}
+
+	watchOnlyState := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", watchOnlyState)
+	if err := os.WriteFile(
+		filepath.Join(watchOnlyState, "config.yaml"),
+		[]byte("watch:\n  - ~/discarded-by-watch-only\n"), 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	watchOnly := exec.Command(binary, "run", "--watch-only", t.TempDir(), "--", "/usr/bin/true")
+	watchOnly.Env = withoutHome()
+	if output, err := watchOnly.CombinedOutput(); err != nil {
+		t.Fatalf("watch-only with HOME unset: %v\n%s", err, output)
+	}
+
+	defaultState := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", defaultState)
+	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defaultRun := exec.Command(binary, "run", "--", "/usr/bin/true")
+	defaultRun.Dir = project
+	defaultRun.Env = withoutHome()
+	output, err := defaultRun.CombinedOutput()
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() != internalErrorExitCode {
+		t.Fatalf("default scope without HOME exit = %v, want %d\n%s", err, internalErrorExitCode, output)
+	}
+	if !strings.Contains(string(output), "find home directory for default snapshot scope") {
+		t.Fatalf("internal scope error omitted cause:\n%s", output)
+	}
+
+	homeExcludeState := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", homeExcludeState)
+	if err := os.WriteFile(
+		filepath.Join(homeExcludeState, "config.yaml"),
+		[]byte("exclude:\n  - ~/Pictures\n"), 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	homeExclude := exec.Command(binary, "run", "--watch-only", t.TempDir(), "--", "/usr/bin/true")
+	homeExclude.Env = withoutHome()
+	output, err = homeExclude.CombinedOutput()
+	if !errors.As(err, &exitError) || exitError.ExitCode() != internalErrorExitCode {
+		t.Fatalf("config exclusion without HOME exit = %v, want %d\n%s", err, internalErrorExitCode, output)
+	}
+	if !strings.Contains(string(output), "$HOME is not defined") {
+		t.Fatalf("config exclusion HOME error omitted cause:\n%s", output)
+	}
+
+	readErrorState := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", readErrorState)
+	if err := os.Mkdir(filepath.Join(readErrorState, "config.yaml"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	readError := exec.Command(binary, "run", "--watch-only", t.TempDir(), "--", "/usr/bin/true")
+	readError.Env = os.Environ()
+	output, err = readError.CombinedOutput()
+	if !errors.As(err, &exitError) || exitError.ExitCode() != internalErrorExitCode {
+		t.Fatalf("config read error exit = %v, want %d\n%s", err, internalErrorExitCode, output)
+	}
+	for _, want := range []string{"read snapshot scope config", "config.yaml"} {
+		if !strings.Contains(string(output), want) {
+			t.Fatalf("config read error omitted %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestDanglingDefaultSymlinkIsDisclosedThroughCLI(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	binary := buildTestBinary(t)
+	home := os.Getenv("HOME")
+	documents := filepath.Join(home, "Documents")
+	if err := os.Symlink(filepath.Join(t.TempDir(), "offline-documents"), documents); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command(binary, "run", "--", "/usr/bin/true")
+	command.Dir = project
+	command.Env = os.Environ()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		t.Fatalf("dangling default run: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+	}
+	for _, want := range []string{"FILE NOT SNAPSHOTTED", documents, "does not exist"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("dangling default disclosure omitted %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
 func TestCurrentSnapshotOverCapRemainsRestorable(t *testing.T) {
 	stateDir := t.TempDir()
 	root := t.TempDir()
@@ -381,7 +809,7 @@ func TestCurrentSnapshotOverCapRemainsRestorable(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
 	t.Setenv("UNRING_STATE_DIR", stateDir)
 	binary := buildTestBinary(t)
-	command := exec.Command(binary, "run", "--snapshot-cap-bytes", "1", "--watch", root, "--", "/bin/sh", "-c", "printf after! > file")
+	command := exec.Command(binary, "run", "--snapshot-cap-bytes", "1", "--watch-only", root, "--", "/bin/sh", "-c", "printf after! > file")
 	command.Dir = root
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
@@ -416,7 +844,7 @@ func TestUnsnapshottedPathIsReportedAtStartAndInSessionRecord(t *testing.T) {
 	t.Setenv("UNRING_STATE_DIR", stateDir)
 
 	binary := buildTestBinary(t)
-	command := exec.Command(binary, "run", "--watch", watched, "--", "/usr/bin/true")
+	command := exec.Command(binary, "run", "--watch-only", watched, "--", "/usr/bin/true")
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -452,7 +880,7 @@ func TestSnapshotRetentionEvictsOldestAndReportsUsage(t *testing.T) {
 	for index := 0; index < 128; index++ {
 		writeTestFile(t, filepath.Join(firstWatch, fmt.Sprintf("first-retained-file-%03d", index)), "12345678")
 	}
-	first := exec.Command(binary, "run", "--snapshot-cap-bytes", "12000", "--watch", firstWatch, "--", "/usr/bin/true")
+	first := exec.Command(binary, "run", "--snapshot-cap-bytes", "12000", "--watch-only", firstWatch, "--", "/usr/bin/true")
 	first.Env = os.Environ()
 	if output, err := first.CombinedOutput(); err != nil {
 		t.Fatalf("first retained session: %v\n%s", err, output)
@@ -464,7 +892,7 @@ func TestSnapshotRetentionEvictsOldestAndReportsUsage(t *testing.T) {
 	for index := 0; index < 128; index++ {
 		writeTestFile(t, filepath.Join(secondWatch, fmt.Sprintf("second-retained-file-%03d", index)), "abcdefgh")
 	}
-	second := exec.Command(binary, "run", "--snapshot-cap-bytes", "12000", "--watch", secondWatch, "--", "/usr/bin/true")
+	second := exec.Command(binary, "run", "--snapshot-cap-bytes", "12000", "--watch-only", secondWatch, "--", "/usr/bin/true")
 	second.Env = os.Environ()
 	secondOutput, err := second.CombinedOutput()
 	if err != nil {
@@ -502,7 +930,7 @@ func TestSnapshotsReportsTheCapAnExplicitRunEnforced(t *testing.T) {
 	t.Setenv("UNRING_SNAPSHOT_CAP_BYTES", "1000")
 	binary := buildTestBinary(t)
 
-	run := exec.Command(binary, "run", "--snapshot-cap-bytes", "5000", "--watch", t.TempDir(), "--", "/usr/bin/true")
+	run := exec.Command(binary, "run", "--snapshot-cap-bytes", "5000", "--watch-only", t.TempDir(), "--", "/usr/bin/true")
 	run.Env = os.Environ()
 	if output, err := run.CombinedOutput(); err != nil {
 		t.Fatalf("run with explicit cap: %v\n%s", err, output)
@@ -535,7 +963,7 @@ func TestOutboundInterceptionIsOffByDefault(t *testing.T) {
 	t.Setenv("HTTPS_PROXY", "http://inherited-proxy.invalid:4321")
 
 	binary := buildTestBinary(t)
-	command := exec.Command(binary, "run", "--watch", watched, "--", "/bin/sh", "-c",
+	command := exec.Command(binary, "run", "--watch-only", watched, "--", "/bin/sh", "-c",
 		`printf 'proxy=<%s> shim=<%s>\n' "$HTTPS_PROXY" "$UNRING_GH_SHIM"; gh issue create`)
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
@@ -616,7 +1044,7 @@ func TestRunWithoutDatabaseRunsChildPropagatesExitAndRecordsCoverage(t *testing.
 	command := exec.Command(
 		binary,
 		"run",
-		"--watch", t.TempDir(),
+		"--watch-only", t.TempDir(),
 		"--",
 		"/bin/sh",
 		"-c",
@@ -747,7 +1175,7 @@ func TestRunWithoutDatabaseStillInterceptsHTTPS(t *testing.T) {
 		"run",
 		"--discard",
 		"--outbound",
-		"--watch", t.TempDir(),
+		"--watch-only", t.TempDir(),
 		"--",
 		curl,
 		"--silent",
@@ -848,7 +1276,7 @@ func TestControlPlaneOnlyCLIReviewIsVisible(t *testing.T) {
 				t.Setenv("DATABASE_URL", "")
 			}
 
-			command := exec.Command(binary, "run", "--outbound", "--watch", t.TempDir(), "--", fakeClaude)
+			command := exec.Command(binary, "run", "--outbound", "--watch-only", t.TempDir(), "--", fakeClaude)
 			command.Env = os.Environ()
 			output, err := command.CombinedOutput()
 			if err != nil {
@@ -954,7 +1382,7 @@ func TestGitPushOnlyRunGetsStructuralBlindSpotDisclosure(t *testing.T) {
 	}
 	t.Setenv("PATH", fakeDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	command := exec.Command(binary, "run", "--watch", t.TempDir(), "--", "git", "push")
+	command := exec.Command(binary, "run", "--watch-only", t.TempDir(), "--", "git", "push")
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -984,7 +1412,7 @@ func TestConfiguredQuietSessionPrintsOnlyDisclosure(t *testing.T) {
 		t.Fatalf("write fake git: %v", err)
 	}
 	t.Setenv("PATH", fakeDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
-	command := exec.Command(binary, "run", "--discard", "--watch", t.TempDir(), "--", "git", "push")
+	command := exec.Command(binary, "run", "--discard", "--watch-only", t.TempDir(), "--", "git", "push")
 	command.Env = os.Environ()
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -1017,7 +1445,7 @@ func TestDatabaseFreeStartupFailureRemainsNotStartedInAudit(t *testing.T) {
 	t.Setenv("UNRING_ADAPTERS", filepath.Join(t.TempDir(), "does-not-exist.yaml"))
 
 	binary := buildTestBinary(t)
-	command := exec.Command(binary, "run", "--outbound", "--watch", t.TempDir(), "--", "/bin/echo", "must-not-run")
+	command := exec.Command(binary, "run", "--outbound", "--watch-only", t.TempDir(), "--", "/bin/echo", "must-not-run")
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
 	var exitError *exec.ExitError
