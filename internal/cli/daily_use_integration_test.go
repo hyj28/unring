@@ -630,7 +630,8 @@ func TestExplicitWatchExcludedByConfigIsReportedThroughCLI(t *testing.T) {
 		t.Fatal(err)
 	}
 	important := filepath.Join(keep, "important.txt")
-	writeTestFile(t, important, "important")
+	secret := "PRIVATEKEY-CONTENTS-ROUND2"
+	writeTestFile(t, important, secret)
 	configFile := filepath.Join(stateDir, "config.yaml")
 	if err := os.WriteFile(configFile, []byte("exclude:\n  - "+private+"\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -666,6 +667,24 @@ func TestExplicitWatchExcludedByConfigIsReportedThroughCLI(t *testing.T) {
 		if !strings.Contains(string(logOutput), want) {
 			t.Fatalf("excluded explicit watch audit omitted %q:\n%s", want, logOutput)
 		}
+	}
+	if err := filepath.WalkDir(filepath.Join(stateDir, "snapshots"), func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(data, []byte(secret)) {
+			t.Errorf("config-excluded contents were copied into snapshot store at %s", path)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("inspect snapshot store for excluded contents: %v", err)
 	}
 }
 
@@ -712,6 +731,73 @@ func TestWatchOnlyDoesNotRequireHomeAndScopeFailuresKeepInternalExitCode(t *test
 	}
 	if !strings.Contains(string(output), "find home directory for default snapshot scope") {
 		t.Fatalf("internal scope error omitted cause:\n%s", output)
+	}
+
+	homeExcludeState := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", homeExcludeState)
+	if err := os.WriteFile(
+		filepath.Join(homeExcludeState, "config.yaml"),
+		[]byte("exclude:\n  - ~/Pictures\n"), 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	homeExclude := exec.Command(binary, "run", "--watch-only", t.TempDir(), "--", "/usr/bin/true")
+	homeExclude.Env = withoutHome()
+	output, err = homeExclude.CombinedOutput()
+	if !errors.As(err, &exitError) || exitError.ExitCode() != internalErrorExitCode {
+		t.Fatalf("config exclusion without HOME exit = %v, want %d\n%s", err, internalErrorExitCode, output)
+	}
+	if !strings.Contains(string(output), "$HOME is not defined") {
+		t.Fatalf("config exclusion HOME error omitted cause:\n%s", output)
+	}
+
+	readErrorState := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", readErrorState)
+	if err := os.Mkdir(filepath.Join(readErrorState, "config.yaml"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	readError := exec.Command(binary, "run", "--watch-only", t.TempDir(), "--", "/usr/bin/true")
+	readError.Env = os.Environ()
+	output, err = readError.CombinedOutput()
+	if !errors.As(err, &exitError) || exitError.ExitCode() != internalErrorExitCode {
+		t.Fatalf("config read error exit = %v, want %d\n%s", err, internalErrorExitCode, output)
+	}
+	for _, want := range []string{"read snapshot scope config", "config.yaml"} {
+		if !strings.Contains(string(output), want) {
+			t.Fatalf("config read error omitted %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestDanglingDefaultSymlinkIsDisclosedThroughCLI(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	binary := buildTestBinary(t)
+	home := os.Getenv("HOME")
+	documents := filepath.Join(home, "Documents")
+	if err := os.Symlink(filepath.Join(t.TempDir(), "offline-documents"), documents); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command(binary, "run", "--", "/usr/bin/true")
+	command.Dir = project
+	command.Env = os.Environ()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		t.Fatalf("dangling default run: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+	}
+	for _, want := range []string{"FILE NOT SNAPSHOTTED", documents, "does not exist"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("dangling default disclosure omitted %q:\n%s", want, stderr.String())
+		}
 	}
 }
 

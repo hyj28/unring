@@ -420,7 +420,7 @@ func (s *Session) Seal(now time.Time) Summary {
 			root.Uncaptured[failure.Path] = failure.Error
 		}
 	}
-	changes := diff(before, after, diffExcluded)
+	changes := diff(before, after, diffExcluded, s.manifest.Roots)
 	coveragePrefixes := failurePrefixes(coverageGaps)
 	coverageMessages := failureMessages(coverageGaps)
 	for index := range changes {
@@ -551,7 +551,7 @@ func captureRoot(root, destination string, excluded []string) (rootManifest, []C
 
 	var captureFailures []CaptureFailure
 	var copiedBytes int64
-	if info.IsDir() && !containsExcludedPath(source, excluded) {
+	if info.IsDir() && !isExcluded(source, excluded) && !containsExcludedPath(source, excluded) {
 		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 			return state, beforeFailures, methods, 0, 0, err
 		}
@@ -960,10 +960,10 @@ func entryFromInfo(path string, info fs.FileInfo) (Entry, error) {
 	return entry, nil
 }
 
-func diff(before, after map[string]Entry, uncaptured map[string]bool) []Change {
+func diff(before, after map[string]Entry, uncaptured map[string]bool, roots []rootManifest) []Change {
 	changes := make([]Change, 0)
 	for path, oldEntry := range before {
-		if coveredBy(path, uncaptured) {
+		if excludedFromDiff(path, uncaptured, roots) {
 			continue
 		}
 		newEntry, exists := after[path]
@@ -978,7 +978,7 @@ func diff(before, after map[string]Entry, uncaptured map[string]bool) []Change {
 		}
 	}
 	for path, newEntry := range after {
-		if _, existed := before[path]; existed || coveredBy(path, uncaptured) {
+		if _, existed := before[path]; existed || excludedFromDiff(path, uncaptured, roots) {
 			continue
 		}
 		afterCopy := newEntry
@@ -986,6 +986,28 @@ func diff(before, after map[string]Entry, uncaptured map[string]bool) []Change {
 	}
 	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
 	return changes
+}
+
+func excludedFromDiff(path string, uncaptured map[string]bool, roots []rootManifest) bool {
+	if !coveredBy(path, uncaptured) {
+		return false
+	}
+	for _, root := range roots {
+		if !root.Existed || (path != root.Path && !strings.HasPrefix(path, root.Path+string(os.PathSeparator))) {
+			continue
+		}
+		coveredByRootFailure := false
+		for failure := range root.Uncaptured {
+			if path == failure || strings.HasPrefix(path, failure+string(os.PathSeparator)) {
+				coveredByRootFailure = true
+				break
+			}
+		}
+		if !coveredByRootFailure {
+			return false
+		}
+	}
+	return true
 }
 
 func entriesDiffer(before, after Entry) bool {

@@ -46,6 +46,21 @@ func IsScopeConfigError(err error) bool {
 	return errors.As(err, &configErr)
 }
 
+type scopeEnvironmentError struct {
+	err error
+}
+
+func (err *scopeEnvironmentError) Error() string { return err.err.Error() }
+func (err *scopeEnvironmentError) Unwrap() error { return err.err }
+
+func classifyConfigValidationError(err error) error {
+	var environmentErr *scopeEnvironmentError
+	if errors.As(err, &environmentErr) {
+		return err
+	}
+	return &scopeConfigError{err: err}
+}
+
 type scopeConfig struct {
 	Watch   []string `yaml:"watch"`
 	Exclude []string `yaml:"exclude"`
@@ -98,7 +113,7 @@ func ResolveScope(options ScopeOptions) (Scope, error) {
 	}
 	excluded, err := normalizeExclusions(config.Exclude)
 	if err != nil {
-		return Scope{}, &scopeConfigError{err: fmt.Errorf("resolve excluded paths: %w", err)}
+		return Scope{}, fmt.Errorf("resolve excluded paths: %w", err)
 	}
 
 	explicit, err = absoluteUniquePaths(explicit)
@@ -163,7 +178,7 @@ func loadScopeConfig(stateDir, homeDirectory string, includeWatch bool) (scopeCo
 	if includeWatch {
 		config.Watch, err = validateConfigPaths(filename, "watch", config.Watch, homeDirectory)
 		if err != nil {
-			return scopeConfig{}, &scopeConfigError{err: err}
+			return scopeConfig{}, classifyConfigValidationError(err)
 		}
 	} else {
 		if err := validateConfigPathForms(filename, "watch", config.Watch); err != nil {
@@ -173,7 +188,7 @@ func loadScopeConfig(stateDir, homeDirectory string, includeWatch bool) (scopeCo
 	}
 	config.Exclude, err = validateConfigPaths(filename, "exclude", config.Exclude, homeDirectory)
 	if err != nil {
-		return scopeConfig{}, &scopeConfigError{err: err}
+		return scopeConfig{}, classifyConfigValidationError(err)
 	}
 	return config, nil
 }
@@ -225,7 +240,7 @@ func expandConfigHome(path, homeDirectory string) (string, error) {
 		var err error
 		homeDirectory, err = os.UserHomeDir()
 		if err != nil {
-			return "", fmt.Errorf("expand %q: find home directory: %w", path, err)
+			return "", &scopeEnvironmentError{err: fmt.Errorf("expand %q: find home directory: %w", path, err)}
 		}
 	}
 	if path == "~" {

@@ -214,37 +214,22 @@ func TestAdditiveSubtreeBehindSymlinkKeepsRemainderDisclosure(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertRollbackFailure(t, summary.Uncaptured, logicalData, "symlinked directory target")
+	writeRollbackTestFile(t, filepath.Join(dataTarget, "cache", "cached.txt"), "cached-after")
 	if err := os.Remove(filepath.Join(dataTarget, "reports", "report.txt")); err != nil {
 		t.Fatal(err)
 	}
 	sealed := session.Seal(time.Now())
 	assertRollbackFailure(t, sealed.Uncaptured, logicalData, "symlinked directory target")
-}
-
-func TestDanglingDefaultSymlinkIsKeptForCoverageDisclosure(t *testing.T) {
-	stateDir := t.TempDir()
-	home := t.TempDir()
-	project := t.TempDir()
-	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	documents := filepath.Join(home, "Documents")
-	if err := os.Symlink(filepath.Join(t.TempDir(), "offline-documents"), documents); err != nil {
-		t.Fatal(err)
-	}
-
-	scope, err := ResolveScope(ScopeOptions{
-		StateDir: stateDir, WorkingDirectory: project, HomeDirectory: home,
-	})
+	logicalCache := filepath.Join(logicalData, "cache", "cached.txt")
+	assertRollbackChange(t, sealed.Changes, "modified", logicalCache)
+	results, err := Restore(stateDir, "partial-symlink", []string{logicalCache}, false)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("restore explicitly watched symlink subtree: %v", err)
 	}
-	for _, watched := range scope.Watched {
-		if watched == documents {
-			return
-		}
+	if len(results) != 1 || results[0].Status != "restored" {
+		t.Fatalf("restore results = %#v, want modified cache file restored", results)
 	}
-	t.Fatalf("watched = %#v, want dangling default symlink %q retained for disclosure", scope.Watched, documents)
+	assertRollbackTestFile(t, filepath.Join(dataTarget, "cache", "cached.txt"), "cached")
 }
 
 func TestAdditiveExplicitWatchExcludedByConfigIsReported(t *testing.T) {
