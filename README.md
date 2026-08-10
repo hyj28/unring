@@ -81,6 +81,8 @@ exclude:
   - ~/Pictures/Lightroom Catalog
 ```
 
+If an exclusion completely covers a path named by `--watch`, `--watch-only`, or the config
+`watch` list, unring names that path as not snapshotted instead of silently dropping it.
 Missing default directories are ignored because the user did not choose them. A missing
 path named by `--watch`, `--watch-only`, or `config.yaml` is reported before the child
 starts without preventing the session from running.

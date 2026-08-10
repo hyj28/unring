@@ -181,6 +181,110 @@ func TestAdditiveSymlinkedRootInsideDefaultIsCapturedWithoutFalseGap(t *testing.
 	assertRollbackChange(t, sealed.Changes, "deleted", filepath.Join(logical, "protected.txt"))
 }
 
+func TestAdditiveSubtreeBehindSymlinkKeepsRemainderDisclosure(t *testing.T) {
+	stateDir := t.TempDir()
+	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dataTarget := t.TempDir()
+	for _, directory := range []string{"cache", "reports"} {
+		if err := os.Mkdir(filepath.Join(dataTarget, directory), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logicalData := filepath.Join(project, "data")
+	if err := os.Symlink(dataTarget, logicalData); err != nil {
+		t.Fatal(err)
+	}
+	writeRollbackTestFile(t, filepath.Join(dataTarget, "cache", "cached.txt"), "cached")
+	writeRollbackTestFile(t, filepath.Join(dataTarget, "reports", "report.txt"), "report")
+
+	scope, err := ResolveScope(ScopeOptions{
+		StateDir: stateDir, WorkingDirectory: project, HomeDirectory: t.TempDir(),
+		Watch: []string{filepath.Join(logicalData, "cache")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, summary, err := StartScope(
+		stateDir, "partial-symlink", scope, DefaultRetentionBytes, time.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRollbackFailure(t, summary.Uncaptured, logicalData, "symlinked directory target")
+	if err := os.Remove(filepath.Join(dataTarget, "reports", "report.txt")); err != nil {
+		t.Fatal(err)
+	}
+	sealed := session.Seal(time.Now())
+	assertRollbackFailure(t, sealed.Uncaptured, logicalData, "symlinked directory target")
+}
+
+func TestDanglingDefaultSymlinkIsKeptForCoverageDisclosure(t *testing.T) {
+	stateDir := t.TempDir()
+	home := t.TempDir()
+	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	documents := filepath.Join(home, "Documents")
+	if err := os.Symlink(filepath.Join(t.TempDir(), "offline-documents"), documents); err != nil {
+		t.Fatal(err)
+	}
+
+	scope, err := ResolveScope(ScopeOptions{
+		StateDir: stateDir, WorkingDirectory: project, HomeDirectory: home,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, watched := range scope.Watched {
+		if watched == documents {
+			return
+		}
+	}
+	t.Fatalf("watched = %#v, want dangling default symlink %q retained for disclosure", scope.Watched, documents)
+}
+
+func TestAdditiveExplicitWatchExcludedByConfigIsReported(t *testing.T) {
+	stateDir := t.TempDir()
+	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	private := filepath.Join(project, "private")
+	keep := filepath.Join(private, "keep")
+	if err := os.MkdirAll(keep, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := "exclude:\n  - " + private + "\n"
+	if err := os.WriteFile(ScopeConfigPath(stateDir), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scope, err := ResolveScope(ScopeOptions{
+		StateDir: stateDir, WorkingDirectory: project, HomeDirectory: t.TempDir(),
+		Watch: []string{keep},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(scope.Watched, []string{project}) {
+		t.Fatalf("watched = %#v, want default project root", scope.Watched)
+	}
+	assertRollbackFailure(t, scope.Uncaptured, keep, "excluded by config")
+	session, summary, err := StartScope(
+		stateDir, "additive-excluded", scope, DefaultRetentionBytes, time.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRollbackFailure(t, summary.Uncaptured, keep, "excluded by config")
+	sealed := session.Seal(time.Now())
+	assertRollbackFailure(t, sealed.Uncaptured, keep, "excluded by config")
+}
+
 func resolvedTestPath(t *testing.T, path string) string {
 	t.Helper()
 	resolved, err := filepath.EvalSymlinks(path)

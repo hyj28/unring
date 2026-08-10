@@ -209,12 +209,22 @@ func RetentionCapForState(stateDir string) (int64, error) {
 // platform's recursive fast path, then falls back to per-entry capture so that
 // one unreadable path does not erase coverage for the rest of a tree.
 func Start(stateDir, sessionID string, watched []string, capBytes int64, now time.Time) (*Session, Summary, error) {
-	return StartWithExclusions(stateDir, sessionID, watched, nil, capBytes, now)
+	return start(stateDir, sessionID, watched, nil, nil, capBytes, now)
 }
 
 // StartWithExclusions captures watched paths while omitting physically resolved
 // config exclusions in addition to unring's own state directory.
 func StartWithExclusions(stateDir, sessionID string, watched, excluded []string, capBytes int64, now time.Time) (*Session, Summary, error) {
+	return start(stateDir, sessionID, watched, excluded, nil, capBytes, now)
+}
+
+// StartScope captures a previously resolved scope, including any explicit
+// watches that configuration exclusions made uncapturable.
+func StartScope(stateDir, sessionID string, scope Scope, capBytes int64, now time.Time) (*Session, Summary, error) {
+	return start(stateDir, sessionID, scope.Watched, scope.Excluded, scope.Uncaptured, capBytes, now)
+}
+
+func start(stateDir, sessionID string, watched, excluded []string, preflightFailures []CaptureFailure, capBytes int64, now time.Time) (*Session, Summary, error) {
 	if sessionID == "" || strings.ContainsAny(sessionID, `/\\`) {
 		return nil, Summary{}, errors.New("start file snapshot: invalid session id")
 	}
@@ -280,6 +290,13 @@ func StartWithExclusions(stateDir, sessionID string, watched, excluded []string,
 			return nil, Summary{}, fmt.Errorf("snapshot %s: %w", root, captureErr)
 		}
 	}
+	for _, failure := range preflightFailures {
+		if !attachManifestFailure(&m, failure) {
+			return nil, Summary{}, fmt.Errorf("record preflight snapshot failure for %s: no watched root contains it", failure.Path)
+		}
+		failures = append(failures, failure)
+	}
+	failures = mergeFailures(failures)
 	m.Storage = storageDescription(methods)
 	if err := writeManifest(temporary, m); err != nil {
 		return nil, Summary{}, err
@@ -329,6 +346,24 @@ func StartWithExclusions(stateDir, sessionID string, watched, excluded []string,
 	summary.Evicted = evicted
 	session.summary = summary
 	return session, summary, nil
+}
+
+func attachManifestFailure(value *manifest, failure CaptureFailure) bool {
+	matched := -1
+	for index := range value.Roots {
+		root := &value.Roots[index]
+		if failure.Path != root.Path && !strings.HasPrefix(failure.Path, root.Path+string(os.PathSeparator)) {
+			continue
+		}
+		if matched < 0 || len(root.Path) > len(value.Roots[matched].Path) {
+			matched = index
+		}
+	}
+	if matched >= 0 {
+		value.Roots[matched].Uncaptured[failure.Path] = failure.Error
+		return true
+	}
+	return false
 }
 
 // Seal scans the watched paths after the child exits and records the diff.
@@ -1039,6 +1074,10 @@ func overlappingRootExclusions(roots []string) []string {
 				physical = filepath.Join(physical, component)
 				info, err := os.Lstat(logical)
 				if err == nil && info.Mode()&os.ModeSymlink != 0 {
+					resolvedBoundary, err := resolveExistingPath(logical)
+					if err != nil || resolvedBoundary != resolvedCandidate {
+						break
+					}
 					if !unique[physical] {
 						unique[physical] = true
 						exclusions = append(exclusions, physical)

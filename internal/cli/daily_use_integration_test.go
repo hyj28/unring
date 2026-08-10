@@ -618,6 +618,103 @@ func TestConfigurableSnapshotScopeThroughCLI(t *testing.T) {
 	})
 }
 
+func TestExplicitWatchExcludedByConfigIsReportedThroughCLI(t *testing.T) {
+	stateDir := t.TempDir()
+	project := t.TempDir()
+	private := filepath.Join(project, "private")
+	keep := filepath.Join(private, "keep")
+	if err := os.MkdirAll(keep, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	important := filepath.Join(keep, "important.txt")
+	writeTestFile(t, important, "important")
+	configFile := filepath.Join(stateDir, "config.yaml")
+	if err := os.WriteFile(configFile, []byte("exclude:\n  - "+private+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	binary := buildTestBinary(t)
+
+	command := exec.Command(binary, "run", "--watch-only", keep, "--", "/bin/rm", important)
+	command.Dir = project
+	command.Env = os.Environ()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		t.Fatalf("excluded explicit watch run: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+	}
+	for _, want := range []string{"FILE NOT SNAPSHOTTED", keep, "excluded"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("excluded explicit watch warning omitted %q:\n%s", want, stderr.String())
+		}
+	}
+
+	sessionID := newestSessionID(t, binary)
+	logCommand := exec.Command(binary, "log", "--json", sessionID)
+	logCommand.Env = os.Environ()
+	logOutput, err := logCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("read excluded-watch audit: %v\n%s", err, logOutput)
+	}
+	for _, want := range []string{`"path": "` + keep + `"`, "excluded"} {
+		if !strings.Contains(string(logOutput), want) {
+			t.Fatalf("excluded explicit watch audit omitted %q:\n%s", want, logOutput)
+		}
+	}
+}
+
+func TestWatchOnlyDoesNotRequireHomeAndScopeFailuresKeepInternalExitCode(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	binary := buildTestBinary(t)
+	withoutHome := func() []string {
+		var environment []string
+		for _, entry := range os.Environ() {
+			if !strings.HasPrefix(entry, "HOME=") {
+				environment = append(environment, entry)
+			}
+		}
+		return environment
+	}
+
+	watchOnlyState := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", watchOnlyState)
+	if err := os.WriteFile(
+		filepath.Join(watchOnlyState, "config.yaml"),
+		[]byte("watch:\n  - ~/discarded-by-watch-only\n"), 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	watchOnly := exec.Command(binary, "run", "--watch-only", t.TempDir(), "--", "/usr/bin/true")
+	watchOnly.Env = withoutHome()
+	if output, err := watchOnly.CombinedOutput(); err != nil {
+		t.Fatalf("watch-only with HOME unset: %v\n%s", err, output)
+	}
+
+	defaultState := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", defaultState)
+	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defaultRun := exec.Command(binary, "run", "--", "/usr/bin/true")
+	defaultRun.Dir = project
+	defaultRun.Env = withoutHome()
+	output, err := defaultRun.CombinedOutput()
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() != internalErrorExitCode {
+		t.Fatalf("default scope without HOME exit = %v, want %d\n%s", err, internalErrorExitCode, output)
+	}
+	if !strings.Contains(string(output), "find home directory for default snapshot scope") {
+		t.Fatalf("internal scope error omitted cause:\n%s", output)
+	}
+}
+
 func TestCurrentSnapshotOverCapRemainsRestorable(t *testing.T) {
 	stateDir := t.TempDir()
 	root := t.TempDir()

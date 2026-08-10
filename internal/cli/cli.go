@@ -198,18 +198,16 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		fmt.Fprintf(stderr, "unring: find working directory for file snapshot: %v\n", err)
 		return internalErrorExitCode
 	}
-	homeDirectory, err := os.UserHomeDir()
-	if err != nil {
-		fmt.Fprintf(stderr, "unring: find home directory for file snapshot: %v\n", err)
-		return internalErrorExitCode
-	}
 	scope, err := localrollback.ResolveScope(localrollback.ScopeOptions{
 		StateDir: auditStore.StateDir(), WorkingDirectory: workingDirectory,
-		HomeDirectory: homeDirectory, Watch: watched, WatchOnly: watchedOnly,
+		Watch: watched, WatchOnly: watchedOnly,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "unring: choose file snapshot scope: %v\n", err)
-		return usageExitCode
+		if localrollback.IsScopeConfigError(err) {
+			return usageExitCode
+		}
+		return internalErrorExitCode
 	}
 	watchPaths := scope.Watched
 	if capBytes < 0 {
@@ -229,8 +227,8 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		return internalErrorExitCode
 	}
 	auditRecord := auditSession.Snapshot()
-	fileSession, fileSummary, err := localrollback.StartWithExclusions(
-		auditStore.StateDir(), auditRecord.ID, watchPaths, scope.Excluded, capBytes, auditRecord.StartedAt,
+	fileSession, fileSummary, err := localrollback.StartScope(
+		auditStore.StateDir(), auditRecord.ID, scope, capBytes, auditRecord.StartedAt,
 	)
 	if err != nil {
 		_ = auditSession.Update(func(record *audit.Record) {
