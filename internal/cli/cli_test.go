@@ -122,7 +122,7 @@ func TestUnreachableDatabaseErrorIsActionable(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgresql://postgres@127.0.0.1:1/postgres?sslmode=disable")
 	var stdout, stderr bytes.Buffer
 	exitCode := Main(
-		[]string{"run", "--discard", "--watch", t.TempDir(), "--", "true"},
+		[]string{"run", "--discard", "--watch-only", t.TempDir(), "--", "true"},
 		strings.NewReader(""), &stdout, &stderr,
 	)
 	if exitCode != internalErrorExitCode {

@@ -152,9 +152,11 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	outboundEnabled := flags.Bool("outbound", false, "enable HTTPS interception, adapters, and the gh shim")
 	retentionCap := flags.Int64("snapshot-cap-bytes", -1, "snapshot retention cap in bytes")
 	var watched stringListFlag
-	flags.Var(&watched, "watch", "path to snapshot (repeatable; replaces the default scope)")
+	var watchedOnly stringListFlag
+	flags.Var(&watched, "watch", "additional path to snapshot (repeatable)")
+	flags.Var(&watchedOnly, "watch-only", "replacement snapshot path (repeatable; excludes the default and config watch scope)")
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: unring run [--commit | --discard] [--outbound] [--watch path] -- <command> [args...]")
+		fmt.Fprintln(stderr, "Usage: unring run [--commit | --discard] [--outbound] [--watch path | --watch-only path] -- <command> [args...]")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr,
 			"Run one bounded command with optional PostgreSQL and supported HTTPS effects held for review.")
@@ -171,6 +173,10 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		fmt.Fprintln(stderr, "unring: --commit and --discard are mutually exclusive")
 		return usageExitCode
 	}
+	if len(watched) > 0 && len(watchedOnly) > 0 {
+		fmt.Fprintln(stderr, "unring: --watch and --watch-only are mutually exclusive")
+		return usageExitCode
+	}
 	command := flags.Args()
 	if len(command) == 0 {
 		fmt.Fprintln(stderr, "unring: no child command given")
@@ -182,30 +188,30 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		fmt.Fprintln(stderr, "unring: --snapshot-cap-bytes must be non-negative")
 		return usageExitCode
 	}
-	watchPaths := []string(watched)
-	if len(watchPaths) == 0 {
-		workingDirectory, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(stderr, "unring: find working directory for file snapshot: %v\n", err)
-			return internalErrorExitCode
-		}
-		homeDirectory, err := os.UserHomeDir()
-		if err != nil {
-			fmt.Fprintf(stderr, "unring: find home directory for file snapshot: %v\n", err)
-			return internalErrorExitCode
-		}
-		watchPaths, err = localrollback.DefaultWatchPaths(workingDirectory, homeDirectory)
-		if err != nil {
-			fmt.Fprintf(stderr, "unring: choose file snapshot scope: %v\n", err)
-			return internalErrorExitCode
-		}
-	}
-
 	auditStore, err := audit.OpenStore()
 	if err != nil {
 		fmt.Fprintf(stderr, "unring: open audit log: %v\n", err)
 		return internalErrorExitCode
 	}
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: find working directory for file snapshot: %v\n", err)
+		return internalErrorExitCode
+	}
+	homeDirectory, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: find home directory for file snapshot: %v\n", err)
+		return internalErrorExitCode
+	}
+	scope, err := localrollback.ResolveScope(localrollback.ScopeOptions{
+		StateDir: auditStore.StateDir(), WorkingDirectory: workingDirectory,
+		HomeDirectory: homeDirectory, Watch: watched, WatchOnly: watchedOnly,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: choose file snapshot scope: %v\n", err)
+		return usageExitCode
+	}
+	watchPaths := scope.Watched
 	if capBytes < 0 {
 		capBytes, err = localrollback.RetentionCapForState(auditStore.StateDir())
 		if err != nil {
@@ -223,8 +229,8 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		return internalErrorExitCode
 	}
 	auditRecord := auditSession.Snapshot()
-	fileSession, fileSummary, err := localrollback.Start(
-		auditStore.StateDir(), auditRecord.ID, watchPaths, capBytes, auditRecord.StartedAt,
+	fileSession, fileSummary, err := localrollback.StartWithExclusions(
+		auditStore.StateDir(), auditRecord.ID, watchPaths, scope.Excluded, capBytes, auditRecord.StartedAt,
 	)
 	if err != nil {
 		_ = auditSession.Update(func(record *audit.Record) {
@@ -2066,7 +2072,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  unring run -- <one-shot-agent-command> [args...]")
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "Usage:")
-	fmt.Fprintln(output, "  unring run [--commit | --discard] [--outbound] [--watch path] -- <command> [args...]")
+	fmt.Fprintln(output, "  unring run [--commit | --discard] [--outbound] [--watch path | --watch-only path] -- <command> [args...]")
 	fmt.Fprintln(output, "  unring log [--json] [session-id]")
 	fmt.Fprintln(output, "  unring restore [--force] [--all] <session-id> [changed-path ...]")
 	fmt.Fprintln(output, "  unring snapshots")

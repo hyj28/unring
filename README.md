@@ -53,9 +53,10 @@ unring run -- your-one-shot-agent-command
 ```
 
 Before the child starts, unring snapshots the project tree plus `~/Documents`,
-`~/Desktop`, `~/.config`, `~/.ssh`, and `~/.aws`. Use a repeatable `--watch` flag to
-replace that default scope. On APFS the fast path uses copy-on-write clones. If cloning
-is unavailable, unring copies bytes for real and reports that cost. If one unreadable
+`~/Desktop`, `~/.config`, `~/.ssh`, and `~/.aws`. A repeatable `--watch` flag adds paths
+to that default scope; use repeatable `--watch-only` when the named paths should replace
+it. On APFS the fast path uses copy-on-write clones. If cloning is unavailable, unring
+copies bytes for real and reports that cost. If one unreadable
 path breaks the recursive clone, unring falls back to per-entry capture and names every
 path it could not protect; an omitted path is never silently presented as snapshotted.
 Symlinked watched roots are resolved, so iCloud-backed `~/Documents` and `~/Desktop`
@@ -67,8 +68,22 @@ link group honestly.
 **Anything outside the watched scope is neither captured nor reported.** If the agent
 deletes a directory that was not watched, unring holds no copy of it and the change list
 will not mention it — the session simply looks clean. Widen the scope with `--watch` when
-a run might touch something outside it. Note that `--watch` currently *replaces* the
-default scope rather than adding to it.
+a run might touch something outside it.
+
+The optional `<state-root>/config.yaml` records additive watches and subtractive
+exclusions. Config paths must be absolute or begin with `~/`; relative paths are rejected.
+Exclusions also apply to `--watch-only`:
+
+```yaml
+watch:
+  - ~/Pictures
+exclude:
+  - ~/Pictures/Lightroom Catalog
+```
+
+Missing default directories are ignored because the user did not choose them. A missing
+path named by `--watch`, `--watch-only`, or `config.yaml` is reported before the child
+starts without preventing the session from running.
 
 Two limits are worth knowing before relying on the scope. Data protected by macOS privacy
 controls — the Photos library, for instance — cannot be read by unring at all, so adding

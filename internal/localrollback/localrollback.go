@@ -209,6 +209,12 @@ func RetentionCapForState(stateDir string) (int64, error) {
 // platform's recursive fast path, then falls back to per-entry capture so that
 // one unreadable path does not erase coverage for the rest of a tree.
 func Start(stateDir, sessionID string, watched []string, capBytes int64, now time.Time) (*Session, Summary, error) {
+	return StartWithExclusions(stateDir, sessionID, watched, nil, capBytes, now)
+}
+
+// StartWithExclusions captures watched paths while omitting physically resolved
+// config exclusions in addition to unring's own state directory.
+func StartWithExclusions(stateDir, sessionID string, watched, excluded []string, capBytes int64, now time.Time) (*Session, Summary, error) {
 	if sessionID == "" || strings.ContainsAny(sessionID, `/\\`) {
 		return nil, Summary{}, errors.New("start file snapshot: invalid session id")
 	}
@@ -249,7 +255,9 @@ func Start(stateDir, sessionID string, watched []string, capBytes int64, now tim
 	if err != nil {
 		return nil, Summary{}, fmt.Errorf("resolve state directory symlinks: %w", err)
 	}
-	m.Excluded = []string{filepath.Clean(resolvedStateDir)}
+	m.Excluded = append([]string(nil), excluded...)
+	m.Excluded = append(m.Excluded, filepath.Clean(resolvedStateDir))
+	m.Excluded = append(m.Excluded, overlappingRootExclusions(roots)...)
 	availableBefore, storageMeasured, storageMeasureErr := filesystemAvailableBytes(snapshotRoot)
 	if storageMeasureErr != nil {
 		return nil, Summary{}, fmt.Errorf("measure snapshot storage before capture: %w", storageMeasureErr)
@@ -984,7 +992,17 @@ func normalizeRoots(paths []string) ([]string, error) {
 	for _, candidate := range roots {
 		covered := false
 		for _, parent := range filtered {
-			if candidate == parent || strings.HasPrefix(candidate, parent+string(os.PathSeparator)) {
+			if candidate == parent {
+				covered = true
+				break
+			}
+			if !strings.HasPrefix(candidate, parent+string(os.PathSeparator)) {
+				continue
+			}
+			resolvedParent, parentErr := resolveExistingPath(parent)
+			resolvedCandidate, candidateErr := resolveExistingPath(candidate)
+			if parentErr == nil && candidateErr == nil &&
+				(resolvedCandidate == resolvedParent || strings.HasPrefix(resolvedCandidate, resolvedParent+string(os.PathSeparator))) {
 				covered = true
 				break
 			}
@@ -994,6 +1012,44 @@ func normalizeRoots(paths []string) ([]string, error) {
 		}
 	}
 	return filtered, nil
+}
+
+func overlappingRootExclusions(roots []string) []string {
+	unique := make(map[string]bool)
+	var exclusions []string
+	for _, candidate := range roots {
+		for _, parent := range roots {
+			if candidate == parent || !strings.HasPrefix(candidate, parent+string(os.PathSeparator)) {
+				continue
+			}
+			resolvedParent, parentErr := resolveExistingPath(parent)
+			resolvedCandidate, candidateErr := resolveExistingPath(candidate)
+			if parentErr != nil || candidateErr != nil || resolvedCandidate == resolvedParent ||
+				strings.HasPrefix(resolvedCandidate, resolvedParent+string(os.PathSeparator)) {
+				continue
+			}
+			relative, err := filepath.Rel(parent, candidate)
+			if err != nil {
+				continue
+			}
+			logical := parent
+			physical := resolvedParent
+			for _, component := range strings.Split(relative, string(os.PathSeparator)) {
+				logical = filepath.Join(logical, component)
+				physical = filepath.Join(physical, component)
+				info, err := os.Lstat(logical)
+				if err == nil && info.Mode()&os.ModeSymlink != 0 {
+					if !unique[physical] {
+						unique[physical] = true
+						exclusions = append(exclusions, physical)
+					}
+					break
+				}
+			}
+		}
+	}
+	sort.Strings(exclusions)
+	return exclusions
 }
 
 func projectRoot(directory string) (string, error) {
