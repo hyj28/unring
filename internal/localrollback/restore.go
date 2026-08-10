@@ -400,7 +400,7 @@ func summaryFromManifest(value manifest, retained bool) Summary {
 		RetentionCap: value.RetentionCap, Retained: retained,
 		ChangeListScope: value.ChangeListScope,
 		ChangeListRoots: append([]string(nil), value.ChangeListRoots...),
-		ScanRoot: value.ScanRoot, ScanExcluded: append([]string(nil), value.ScanExcluded...),
+		ScanRoot:        value.ScanRoot, ScanExcluded: append([]string(nil), value.ScanExcluded...),
 		ScanFailures:    append([]CaptureFailure(nil), value.ScanFailures...),
 		ScanBeforeFiles: value.ScanBeforeFiles, ScanAfterFiles: value.ScanAfterFiles,
 		ScanBeforeMillis: value.ScanBeforeMillis, ScanAfterMillis: value.ScanAfterMillis,

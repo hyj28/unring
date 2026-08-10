@@ -302,8 +302,8 @@ func start(
 	m := manifest{
 		Version: manifestVersion, SessionID: sessionID, StartedAt: now.UTC(),
 		Complete: false, RetentionCap: capBytes, ScanRoot: scanRoot,
-		ChangeListScope: changeListScope,
-		ChangeListRoots: append([]string(nil), changeListRoots...),
+		ChangeListScope:   changeListScope,
+		ChangeListRoots:   append([]string(nil), changeListRoots...),
 		ScanExcluded:      append([]string(nil), scanExcluded...),
 		ScanExcludedNames: append([]string(nil), scanExcludedNames...),
 	}
@@ -407,7 +407,7 @@ func start(
 		RetentionCap: capBytes, Retained: true,
 		ChangeListScope: m.ChangeListScope,
 		ChangeListRoots: append([]string(nil), m.ChangeListRoots...),
-		ScanRoot: m.ScanRoot, ScanExcluded: append([]string(nil), m.ScanExcluded...),
+		ScanRoot:        m.ScanRoot, ScanExcluded: append([]string(nil), m.ScanExcluded...),
 		ScanFailures:    append([]CaptureFailure(nil), m.ScanFailures...),
 		ScanBeforeFiles: m.ScanBeforeFiles, ScanBeforeMillis: m.ScanBeforeMillis,
 		Backstop: m.Backstop,
@@ -539,14 +539,16 @@ func (s *Session) Seal(now time.Time) Summary {
 	for index := range changes {
 		changeIndexes[changes[index].Path] = index
 	}
+	exclusionChecks := make(map[string]timeMachineExclusionCheck)
 	for _, change := range wideChanges {
-		if pathInsideCapturedRoot(change.Path, s.manifest.Roots) {
-			continue
-		}
+		change, cloneCovered := mapWideChangeToClonePath(change, s.manifest.Roots)
 		if _, exists := changeIndexes[change.Path]; exists {
 			continue
 		}
-		classifyWideChange(&change, s.platform, &s.manifest.Backstop)
+		if cloneCovered {
+			continue
+		}
+		classifyWideChange(&change, s.platform, &s.manifest.Backstop, exclusionChecks)
 		changeIndexes[change.Path] = len(changes)
 		changes = append(changes, change)
 	}
@@ -607,18 +609,46 @@ func (s *Session) Seal(now time.Time) Summary {
 	return s.summary
 }
 
-func pathInsideCapturedRoot(path string, roots []rootManifest) bool {
-	for _, root := range roots {
+func mapWideChangeToClonePath(change Change, roots []rootManifest) (Change, bool) {
+	matchedRoot := -1
+	matchedPrefix := ""
+	for index, root := range roots {
 		for _, candidate := range []string{root.Path, root.Source} {
-			if candidate != "" && (path == candidate || strings.HasPrefix(path, candidate+string(os.PathSeparator))) {
-				return true
+			if candidate == "" || (change.Path != candidate && !strings.HasPrefix(change.Path, candidate+string(os.PathSeparator))) {
+				continue
+			}
+			if len(candidate) > len(matchedPrefix) {
+				matchedRoot = index
+				matchedPrefix = candidate
 			}
 		}
 	}
-	return false
+	if matchedRoot < 0 {
+		return change, false
+	}
+	root := roots[matchedRoot]
+	relative, err := filepath.Rel(matchedPrefix, change.Path)
+	if err == nil && relative != "." {
+		change.Path = filepath.Join(root.Path, relative)
+	} else {
+		change.Path = root.Path
+	}
+	if !root.Existed {
+		return change, false
+	}
+	uncaptured := make(map[string]bool, len(root.Uncaptured))
+	for path := range root.Uncaptured {
+		uncaptured[path] = true
+	}
+	return change, !coveredBy(change.Path, uncaptured)
 }
 
-func classifyWideChange(change *Change, platform VolumeSnapshotPlatform, backstop *Backstop) {
+type timeMachineExclusionCheck struct {
+	excluded bool
+	err      error
+}
+
+func classifyWideChange(change *Change, platform VolumeSnapshotPlatform, backstop *Backstop, checks map[string]timeMachineExclusionCheck) {
 	change.RestoreSource = RestoreSourceNone
 	entry := change.Before
 	if entry == nil {
@@ -638,13 +668,21 @@ func classifyWideChange(change *Change, platform VolumeSnapshotPlatform, backsto
 		change.UnrestorableReason = "no whole-volume snapshot was taken for this session"
 		return
 	}
-	excluded, err := platform.IsExcluded(change.Path)
-	if err != nil {
-		change.UnrestorableReason = "could not verify that the path was included in the Time Machine backstop: " + err.Error()
+	checkPath := change.Path
+	if entry == nil || entry.Type != "directory" {
+		checkPath = filepath.Dir(change.Path)
+	}
+	check, ok := checks[checkPath]
+	if !ok {
+		check.excluded, check.err = platform.IsExcluded(checkPath)
+		checks[checkPath] = check
+	}
+	if check.err != nil {
+		change.UnrestorableReason = "could not verify that the path was included in the Time Machine backstop: " + check.err.Error()
 		return
 	}
-	if excluded {
-		failure := CaptureFailure{Path: change.Path, Error: "excluded from the Time Machine backup"}
+	if check.excluded {
+		failure := CaptureFailure{Path: checkPath, Error: "excluded from the Time Machine backup"}
 		backstop.Excluded = mergeFailures(backstop.Excluded, []CaptureFailure{failure})
 		change.UnrestorableReason = "path was excluded from the Time Machine backup"
 		return

@@ -70,8 +70,12 @@ The change list is wider than the clone scope: unring scans the home directory b
 after the child runs, excluding `~/Library`, `node_modules`, `.git`, `.cache`, and `~/go/pkg`.
 The scan is metadata-only and its progress is announced because it can take several seconds.
 A replacement `--watch-only` scope also replaces this wider scan; the clone diff already
-covers exactly those explicitly selected roots. Additive `--watch` leaves the home-wide scan
-enabled. Scan entry counts and elapsed times are retained in the session audit record.
+covers exactly those explicitly selected roots. Changes elsewhere are not reported or
+written to the audit record, even when the whole-volume snapshot contains them, so the
+session can look clean after such a change. Additive `--watch` leaves the home-wide scan
+enabled. Even then, the change list stops at the home scan and clone roots: changes in
+locations such as `/etc`, `/opt`, `/tmp`, or another volume are not reported. Scan entry
+counts and elapsed times are retained in the session audit record.
 A change inside the clone scope remains restorable without privileges. A reported change
 outside it is marked **snapshot only** and requires `sudo` to mount the read-only APFS
 snapshot before restoring prior contents.

@@ -561,6 +561,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	if result.Err != nil {
 		auditError = joinErrorText(auditError, result.Err)
 	}
+	printScanFinishing(stderr, fileSummary)
 	fileSummary = fileSession.Seal(time.Now())
 	printScanFinished(stderr, fileSummary)
 	if evicted, usage, retentionErr := localrollback.EnforceRetention(
@@ -861,6 +862,7 @@ func printSnapshotStarted(output io.Writer, summary localrollback.Summary) {
 			fmt.Fprintf(output, "unring: whole-volume backstop recorded %s on %s.\n", snapshot.Name, snapshot.MountPoint)
 		}
 	}
+	printChangeListLimitation(output, summary, "unring: ")
 	for _, failure := range summary.Backstop.Excluded {
 		fmt.Fprintf(output, "unring: PATH OUTSIDE WHOLE-VOLUME BACKSTOP: %s: %s\n", failure.Path, failure.Error)
 	}
@@ -887,6 +889,35 @@ func printSnapshotStarted(output io.Writer, summary localrollback.Summary) {
 			"unring: snapshot storage is an upper-bound estimate of %d bytes; retention will not evict snapshots based on that estimate.\n",
 			summary.StorageBytes)
 	}
+}
+
+func printChangeListLimitation(output io.Writer, summary localrollback.Summary, prefix string) {
+	if os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") != "" || summary.ChangeListScope == "" {
+		return
+	}
+	fmt.Fprintf(output, "%s============================================================\n", prefix)
+	fmt.Fprintf(output, "%sCHANGE LIST IS NOT WHOLE-VOLUME\n", prefix)
+	switch summary.ChangeListScope {
+	case localrollback.ChangeListScopeWatchOnly:
+		fmt.Fprintf(output, "%sIt is limited by --watch-only to: %s\n", prefix, strings.Join(summary.ChangeListRoots, ", "))
+		fmt.Fprintf(output, "%sChanges elsewhere are not reported or written to the audit record, even when the APFS snapshot contains them; the session can look clean after such a change.\n", prefix)
+	case localrollback.ChangeListScopeHomeAndClone:
+		fmt.Fprintf(output, "%sChange reporting covers the home scan and clone roots: %s\n", prefix, strings.Join(summary.ChangeListRoots, ", "))
+		fmt.Fprintf(output, "%sChanges outside the home scan and clone roots are not reported, including /etc, /opt, /tmp, or another volume, even when the APFS snapshot contains them.\n", prefix)
+	default:
+		fmt.Fprintf(output, "%sChange reporting is limited to the clone roots: %s\n", prefix, strings.Join(summary.ChangeListRoots, ", "))
+		fmt.Fprintf(output, "%sChanges elsewhere are not reported, even when a volume snapshot contains them.\n", prefix)
+	}
+	fmt.Fprintf(output, "%s============================================================\n", prefix)
+}
+
+func printScanFinishing(output io.Writer, summary localrollback.Summary) {
+	if summary.ScanRoot == "" || os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") != "" {
+		return
+	}
+	fmt.Fprintf(output,
+		"unring: rescanning %s and checking Time Machine inclusion for changed directories; large change sets may take time.\n",
+		summary.ScanRoot)
 }
 
 func printScanFinished(output io.Writer, summary localrollback.Summary) {
@@ -956,6 +987,7 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 	for _, failure := range summary.Backstop.Excluded {
 		fmt.Fprintf(output, "  OUTSIDE VOLUME BACKSTOP: %s: %s\n", failure.Path, failure.Error)
 	}
+	printChangeListLimitation(output, summary, "  ")
 	for _, failure := range summary.ScanFailures {
 		fmt.Fprintf(output, "  CHANGE-LIST SCAN INCOMPLETE: %s: %s\n", failure.Path, failure.Error)
 	}
@@ -1402,9 +1434,9 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 			restoreEvent.Status = "error"
 			if result.Err != nil {
 				restoreEvent.Error = result.Err.Error()
-				fmt.Fprintf(stderr, "error     %s: %v\n", result.Path, result.Err)
+				fmt.Fprintf(stderr, "error     %s: %v; not restored\n", result.Path, result.Err)
 			} else {
-				fmt.Fprintf(stderr, "error     %s\n", result.Path)
+				fmt.Fprintf(stderr, "error     %s; not restored\n", result.Path)
 			}
 		}
 		record.Files.RestoreEvents = append(record.Files.RestoreEvents, restoreEvent)
