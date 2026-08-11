@@ -8,6 +8,10 @@ import (
 	"syscall"
 )
 
+func newVolumeSnapshotPlatform() VolumeSnapshotPlatform {
+	return unavailableSnapshotPlatform{reason: "whole-volume APFS snapshots are available only on macOS"}
+}
+
 func cloneDirectory(source, destination string) (string, error) {
 	return "", syscall.ENOTSUP
 }

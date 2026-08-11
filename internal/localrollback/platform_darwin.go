@@ -3,11 +3,153 @@
 package localrollback
 
 import (
+	"bytes"
+	"fmt"
 	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
+
+type commandOutputRunner interface {
+	Run(name string, args ...string) ([]byte, error)
+}
+
+type execOutputRunner struct{}
+
+func (execOutputRunner) Run(name string, args ...string) ([]byte, error) {
+	command := exec.Command(name, args...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			return output, err
+		}
+		return output, fmt.Errorf("%w: %s", err, message)
+	}
+	return output, nil
+}
+
+type darwinVolumeSnapshotPlatform struct {
+	runner commandOutputRunner
+}
+
+func newVolumeSnapshotPlatform() VolumeSnapshotPlatform {
+	return &darwinVolumeSnapshotPlatform{runner: execOutputRunner{}}
+}
+
+func (*darwinVolumeSnapshotPlatform) Supported() (bool, string) {
+	return true, ""
+}
+
+func (*darwinVolumeSnapshotPlatform) VolumeForPath(path string) (Volume, error) {
+	path, err := nearestExistingPath(path)
+	if err != nil {
+		return Volume{}, err
+	}
+	var stat unix.Statfs_t
+	if err := unix.Statfs(path, &stat); err != nil {
+		return Volume{}, err
+	}
+	return Volume{
+		ID:         int8String(stat.Mntfromname[:]),
+		MountPoint: int8String(stat.Mntonname[:]),
+		Filesystem: int8String(stat.Fstypename[:]),
+	}, nil
+}
+
+func (platform *darwinVolumeSnapshotPlatform) IsExcluded(path string) (bool, error) {
+	output, err := platform.runner.Run("/usr/bin/tmutil", "isexcluded", path)
+	if err != nil {
+		return false, err
+	}
+	line := strings.TrimSpace(string(output))
+	switch {
+	case strings.HasPrefix(line, "[Excluded]"):
+		return true, nil
+	case strings.HasPrefix(line, "[Included]"):
+		return false, nil
+	default:
+		return false, fmt.Errorf("unexpected tmutil isexcluded output: %q", line)
+	}
+}
+
+func (platform *darwinVolumeSnapshotPlatform) ListSnapshots(volume Volume) ([]string, error) {
+	output, err := platform.runner.Run("/usr/bin/tmutil", "listlocalsnapshots", volume.MountPoint)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, line := range bytes.Split(output, []byte{'\n'}) {
+		name := strings.TrimSpace(string(line))
+		if strings.HasPrefix(name, "com.apple.TimeMachine.") && strings.HasSuffix(name, ".local") {
+			names = append(names, name)
+		}
+	}
+	return names, nil
+}
+
+var localSnapshotDate = regexp.MustCompile(`(?m)(\d{4}-\d{2}-\d{2}-\d{6})`)
+
+func (platform *darwinVolumeSnapshotPlatform) CreateSnapshots() (string, error) {
+	output, err := platform.runner.Run("/usr/bin/tmutil", "localsnapshot")
+	if err != nil {
+		return "", err
+	}
+	match := localSnapshotDate.FindSubmatch(output)
+	if len(match) != 2 {
+		return "", nil
+	}
+	return "com.apple.TimeMachine." + string(match[1]) + ".local", nil
+}
+
+func (platform *darwinVolumeSnapshotPlatform) MountSnapshot(snapshot VolumeSnapshot, mountPoint string) error {
+	_, err := platform.runner.Run(
+		"/usr/bin/sudo", "/sbin/mount_apfs", "-o", "rdonly", "-s", snapshot.Name,
+		snapshot.MountPoint, mountPoint,
+	)
+	return err
+}
+
+func (platform *darwinVolumeSnapshotPlatform) UnmountSnapshot(mountPoint string) error {
+	_, err := platform.runner.Run("/usr/bin/sudo", "/sbin/umount", mountPoint)
+	return err
+}
+
+func nearestExistingPath(path string) (string, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	for {
+		if _, err := os.Lstat(path); err == nil {
+			return path, nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return "", os.ErrNotExist
+		}
+		path = parent
+	}
+}
+
+func int8String(value []byte) string {
+	result := make([]byte, 0, len(value))
+	for _, character := range value {
+		if character == 0 {
+			break
+		}
+		result = append(result, character)
+	}
+	return string(result)
+}
 
 func cloneDirectory(source, destination string) (string, error) {
 	return "clonefile", unix.Clonefile(source, destination, 0)

@@ -115,16 +115,16 @@ Design: [docs/LOCAL-ROLLBACK-DESIGN.md §8](docs/LOCAL-ROLLBACK-DESIGN.md). Deci
 The narrow clone scope leaves anything outside it uncaptured and unreported; a whole-volume
 APFS snapshot costs 180 ms and covers the disk.
 
-- [ ] M10.1 Take a whole-volume snapshot at session start as the backstop, keeping the
+- [x] M10.1 Take a whole-volume snapshot at session start as the backstop, keeping the
       `clonefile` capture for the precise change list and privilege-free restore
-- [ ] M10.2 Widen the change-list scan past the clone scope — home minus `~/Library`,
+- [x] M10.2 Widen the change-list scan past the clone scope — home minus `~/Library`,
       `node_modules`, `.git`, `.cache`, `go/pkg` — and report paths TCC or permissions
       made unreadable rather than reporting them as unchanged
-- [ ] M10.3 Restore a path from the volume snapshot, stating that it needs `sudo` before
+- [x] M10.3 Restore a path from the volume snapshot, stating that it needs `sudo` before
       asking for it, and failing clearly when the snapshot has been purged
 - [x] M10.4 Config file at the state directory with `watch` and `exclude` lists; `--watch`
       becomes additive and `--watch-only` takes over the replacing behaviour
-- [ ] M10.5 Report backstop coverage honestly: no Time Machine, a path excluded from it
+- [x] M10.5 Report backstop coverage honestly: no Time Machine, a path excluded from it
       (`tmutil isexcluded`), or Linux — say so prominently and keep running
 - [x] M10.6 Skip a nonexistent *default* path silently; report a nonexistent path the user
       named explicitly
