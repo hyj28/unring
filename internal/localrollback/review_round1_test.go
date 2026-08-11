@@ -117,8 +117,8 @@ func TestSealMemoizesTimeMachineExclusionByChangedDirectory(t *testing.T) {
 	if len(summary.Changes) != 500 {
 		t.Fatalf("changes = %d, want 500", len(summary.Changes))
 	}
-	if len(platform.isExcludedCalls) == 0 || len(platform.isExcludedCalls) > 500 {
-		t.Fatalf("IsExcluded call count = %d, want between 1 and 500", len(platform.isExcludedCalls))
+	if len(platform.isExcludedCalls) != 500 {
+		t.Fatalf("IsExcluded call count = %d, want one exact lookup for each of 500 included changed paths", len(platform.isExcludedCalls))
 	}
 }
 

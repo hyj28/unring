@@ -216,6 +216,13 @@ func restoreVolumeOne(platform VolumeSnapshotPlatform, value manifest, change Ch
 		snapshotSourcePath = change.VolumeSnapshotPath
 	}
 	snapshotPath, err := mountedSnapshotPath(mountPoint, change.VolumeSnapshot.MountPoint, snapshotSourcePath)
+	if err == nil {
+		followFinalSymlink := change.Before != nil && change.Before.Type != "symlink"
+		snapshotPath, err = resolveMountedSnapshotPath(mountPoint, snapshotPath, followFinalSymlink)
+	}
+	if err == nil {
+		err = validateMountedSnapshotObject(snapshotPath, change.Before)
+	}
 	refusedAfterMount := false
 	if err == nil && possibleRestored {
 		var matches bool
@@ -321,6 +328,101 @@ func mountedSnapshotPath(mountedRoot, volumeMountPoint, original string) (string
 		return "", errors.New("mounted snapshot path escaped its root")
 	}
 	return path, nil
+}
+
+func resolveMountedSnapshotPath(mountedRoot, path string, followFinalSymlink bool) (string, error) {
+	root, err := filepath.Abs(mountedRoot)
+	if err != nil {
+		return "", err
+	}
+	root = filepath.Clean(root)
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	path = filepath.Clean(path)
+	if path != root && !strings.HasPrefix(path, root+string(os.PathSeparator)) {
+		return "", errors.New("mounted snapshot path escaped its root before resolution")
+	}
+	relative, err := filepath.Rel(root, path)
+	if err != nil {
+		return "", err
+	}
+	pending := pathComponents(relative)
+	resolved := make([]string, 0, len(pending))
+	symlinkCount := 0
+	for len(pending) > 0 {
+		component := pending[0]
+		pending = pending[1:]
+		switch component {
+		case "", ".":
+			continue
+		case "..":
+			if len(resolved) == 0 {
+				return "", errors.New("mounted snapshot symlink escaped its root")
+			}
+			resolved = resolved[:len(resolved)-1]
+			continue
+		}
+		candidate := filepath.Join(append([]string{root}, append(resolved, component)...)...)
+		info, err := os.Lstat(candidate)
+		if err != nil {
+			return "", fmt.Errorf("resolve mounted snapshot path %s: %w", candidate, err)
+		}
+		finalComponent := len(pending) == 0
+		if info.Mode()&os.ModeSymlink == 0 || finalComponent && !followFinalSymlink {
+			resolved = append(resolved, component)
+			continue
+		}
+		symlinkCount++
+		if symlinkCount > 255 {
+			return "", errors.New("resolve mounted snapshot path: too many symlinks")
+		}
+		target, err := os.Readlink(candidate)
+		if err != nil {
+			return "", fmt.Errorf("read mounted snapshot symlink %s: %w", candidate, err)
+		}
+		if filepath.IsAbs(target) {
+			resolved = resolved[:0]
+			target = strings.TrimPrefix(filepath.Clean(target), string(os.PathSeparator))
+		}
+		pending = append(pathComponents(target), pending...)
+	}
+	resolvedPath := filepath.Join(append([]string{root}, resolved...)...)
+	if resolvedPath != root && !strings.HasPrefix(resolvedPath, root+string(os.PathSeparator)) {
+		return "", errors.New("resolved mounted snapshot path escaped its root")
+	}
+	return resolvedPath, nil
+}
+
+func pathComponents(path string) []string {
+	if path == "." || path == "" {
+		return nil
+	}
+	return strings.Split(path, string(os.PathSeparator))
+}
+
+func validateMountedSnapshotObject(path string, metadata *Entry) error {
+	if metadata == nil {
+		return errors.New("snapshot metadata is absent")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect mounted snapshot path %s: %w", path, err)
+	}
+	valid := false
+	switch metadata.Type {
+	case "directory":
+		valid = info.IsDir()
+	case "symlink":
+		valid = info.Mode()&os.ModeSymlink != 0
+	case "file":
+		valid = info.Mode().IsRegular()
+	}
+	if !valid {
+		return fmt.Errorf("mounted snapshot path %s has type %s, want %s", path, info.Mode().Type(), metadata.Type)
+	}
+	return nil
 }
 
 func wrapUnmountError(err error) error {

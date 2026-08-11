@@ -299,3 +299,63 @@ func TestVolumeRestoreReadsPhysicalSnapshotPathBehindLogicalSymlink(t *testing.T
 		t.Fatalf("restored contents = %q, want snapshot bytes rather than live bytes", contents)
 	}
 }
+
+func TestVolumeRestoreRerootsAbsoluteSnapshotSymlink(t *testing.T) {
+	base := t.TempDir()
+	stateDir := t.TempDir()
+	physicalRoot := filepath.Join(base, "physical-config")
+	logicalRoot := filepath.Join(base, "logical-config")
+	if err := os.Mkdir(physicalRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(physicalRoot, logicalRoot); err != nil {
+		t.Fatal(err)
+	}
+	physicalFile := filepath.Join(physicalRoot, "credentials.json")
+	logicalFile := filepath.Join(logicalRoot, "credentials.json")
+	if err := os.WriteFile(physicalFile, []byte("pre-session bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, _, err := currentEntry(logicalFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(physicalFile, []byte("post-session-live"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	after, _, err := currentEntry(logicalFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := &VolumeSnapshot{
+		Name:     "com.apple.TimeMachine.2026-08-09-230000.local",
+		VolumeID: "review-round-2-disk", MountPoint: "/",
+	}
+	platform := &reviewRound2Platform{
+		created: true, present: true, excluded: map[string]bool{},
+		snapshotFiles: map[string]string{physicalFile: "pre-session bytes"},
+		snapshotLinks: map[string]string{logicalRoot: physicalRoot},
+	}
+	restorePlatform := SetVolumeSnapshotPlatformForTest(platform)
+	defer restorePlatform()
+	// This deliberately models a stored change from before physical snapshot
+	// source paths were recorded. Its logical path traverses the absolute link.
+	summary := Summary{Changes: []Change{{
+		Kind: "modified", Path: logicalFile, Before: &before, After: &after,
+		RestoreSource: RestoreSourceVolume, VolumeSnapshot: snapshot,
+	}}}
+	results, err := RestoreRecorded(stateDir, "absolute-snapshot-symlink", summary, []string{logicalFile}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Status != "restored" {
+		t.Fatalf("restore results = %#v, want one restored path", results)
+	}
+	contents, err := os.ReadFile(physicalFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "pre-session bytes" {
+		t.Fatalf("restored contents = %q, want literal pre-session snapshot bytes", contents)
+	}
+}
