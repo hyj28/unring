@@ -196,6 +196,9 @@ func TestCLIDefaultScopeQualifiesWholeVolumeBackstopClaim(t *testing.T) {
 		if got := changeListDisclosure(t, storedStdout.String()); got != liveDisclosure {
 			t.Fatalf("%s disclosure drifted from live output:\n%s\nwant:\n%s", command, got, liveDisclosure)
 		}
+		if !strings.Contains(storedStdout.String(), "Home scan exclusions: Library, node_modules, .git, .cache, and go/pkg.") {
+			t.Fatalf("%s stored disclosure omitted home-scan exclusions:\n%s", command, storedStdout.String())
+		}
 	}
 }
 
@@ -338,6 +341,72 @@ func TestUnsealedManifestNeverOverridesFinalAuditChanges(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestStoredDisclosureAppearsForChangedRestoreListingAndRestoreActions(t *testing.T) {
+	t.Setenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP", "")
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", t.TempDir())
+	root := t.TempDir()
+	path := filepath.Join(root, "changed.txt")
+	if err := os.WriteFile(path, []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	platform := &reviewRoundCLIPlatform{}
+	restorePlatform := localrollback.SetVolumeSnapshotPlatformForTest(platform)
+	defer restorePlatform()
+	var runStdout, runStderr bytes.Buffer
+	if exitCode := Main([]string{
+		"run", "--discard", "--watch-only", root, "--",
+		"/bin/sh", "-c", `printf after > "$1"`, "unring-review", path,
+	}, strings.NewReader(""), &runStdout, &runStderr); exitCode != 0 {
+		t.Fatalf("run exit = %d: %s", exitCode, runStderr.String())
+	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %d, %v", len(records), err)
+	}
+	if len(records[0].Files.Changes) != 1 || records[0].Files.Changes[0].Path != path {
+		t.Fatalf("recorded changes = %#v, want modified %s", records[0].Files.Changes, path)
+	}
+	liveDisclosure := changeListDisclosure(t, runStderr.String())
+
+	var listingStdout, listingStderr bytes.Buffer
+	if exitCode := Main([]string{"restore", records[0].ID}, strings.NewReader(""), &listingStdout, &listingStderr); exitCode != 0 {
+		t.Fatalf("restore listing exit = %d; stderr: %s", exitCode, listingStderr.String())
+	}
+	if got := changeListDisclosure(t, listingStdout.String()); got != liveDisclosure {
+		t.Fatalf("changed restore listing disclosure drifted from live output:\n%s\nwant:\n%s", got, liveDisclosure)
+	}
+	if !strings.Contains(listingStdout.String(), path) {
+		t.Fatalf("changed restore listing omitted %s:\n%s", path, listingStdout.String())
+	}
+
+	var selectedStdout, selectedStderr bytes.Buffer
+	if exitCode := Main([]string{"restore", records[0].ID, path}, strings.NewReader(""), &selectedStdout, &selectedStderr); exitCode != 0 {
+		t.Fatalf("selected restore exit = %d; stderr: %s", exitCode, selectedStderr.String())
+	}
+	if got := changeListDisclosure(t, selectedStdout.String()); got != liveDisclosure {
+		t.Fatalf("selected restore disclosure drifted from live output:\n%s\nwant:\n%s", got, liveDisclosure)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil || string(contents) != "before" {
+		t.Fatalf("selected restore contents = %q, %v; want before", contents, err)
+	}
+
+	var allStdout, allStderr bytes.Buffer
+	if exitCode := Main([]string{"restore", "--all", records[0].ID}, strings.NewReader(""), &allStdout, &allStderr); exitCode != 0 {
+		t.Fatalf("restore --all exit = %d; stderr: %s", exitCode, allStderr.String())
+	}
+	bannerIndex := strings.Index(allStdout.String(), "CHANGE LIST IS NOT WHOLE-VOLUME")
+	resultIndex := strings.Index(allStdout.String(), "already restored")
+	if bannerIndex < 0 || resultIndex < 0 || bannerIndex > resultIndex {
+		t.Fatalf("restore --all did not print disclosure before its result:\n%s", allStdout.String())
+	}
 }
 
 func changeListDisclosure(t *testing.T, output string) string {

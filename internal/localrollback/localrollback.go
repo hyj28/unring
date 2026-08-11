@@ -90,6 +90,7 @@ type Summary struct {
 	ScanBeforeMillis int64            `json:"change_scan_before_ms,omitempty"`
 	ScanAfterMillis  int64            `json:"change_scan_after_ms,omitempty"`
 	Backstop         Backstop         `json:"backstop"`
+	manifestEndedAt  time.Time
 }
 
 type rootManifest struct {

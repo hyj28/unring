@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -55,5 +56,25 @@ func TestLoadSummaryDoesNotInventScopeForLegacyManifest(t *testing.T) {
 	}
 	if summary.ChangeListScope != "" || len(summary.ChangeListRoots) != 0 {
 		t.Fatalf("legacy scope = %q, roots %#v; want no claim", summary.ChangeListScope, summary.ChangeListRoots)
+	}
+}
+
+func TestLoadSealedSummaryRejectsUnsealedManifest(t *testing.T) {
+	stateDir := t.TempDir()
+	directory := filepath.Join(stateDir, "snapshots", "unsealed-session")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManifest(directory, manifest{
+		Version: manifestVersion, SessionID: "unsealed-session",
+		ChangeListScope: ChangeListScopeWatchOnly,
+		ChangeListRoots: []string{"/literal/watched/root"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadSealedSummary(stateDir, "unsealed-session")
+	if err == nil || !strings.Contains(err.Error(), "capture is still in progress") {
+		t.Fatalf("LoadSealedSummary() error = %v, want unsealed-manifest refusal", err)
 	}
 }

@@ -40,6 +40,7 @@ const (
 	defaultReviewWidth    = 80
 
 	quietSessionDisclosure = "unring: nothing intercepted. Outbound is not covered unless --outbound was given. Not visible to unring: SSH/git push, raw sockets, unshimmed CLIs."
+	homeScanExclusions     = "Library, node_modules, .git, .cache, and go/pkg"
 )
 
 type stringListFlag []string
@@ -229,8 +230,8 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	auditRecord := auditSession.Snapshot()
 	if scope.ScanRoot != "" && os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") == "" {
 		fmt.Fprintf(stderr,
-			"unring: scanning %s for the widened change list; this metadata scan may take several seconds and excludes Library, node_modules, .git, .cache, and go/pkg.\n",
-			scope.ScanRoot)
+			"unring: scanning %s for the widened change list; this metadata scan may take several seconds and excludes %s.\n",
+			scope.ScanRoot, homeScanExclusions)
 	} else if scope.ScanError != "" {
 		fmt.Fprintf(stderr, "unring: WIDENED CHANGE LIST UNAVAILABLE: %s\n", scope.ScanError)
 	}
@@ -911,6 +912,14 @@ func printChangeListLimitation(output io.Writer, summary localrollback.Summary, 
 	fmt.Fprintf(output, "%s============================================================\n", prefix)
 }
 
+func printStoredChangeListLimitation(output io.Writer, summary localrollback.Summary, prefix string) {
+	printChangeListLimitation(output, summary, prefix)
+	if os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") != "" || summary.ChangeListScope != localrollback.ChangeListScopeHomeAndClone {
+		return
+	}
+	fmt.Fprintf(output, "%sHome scan exclusions: %s.\n", prefix, homeScanExclusions)
+}
+
 func printScanFinishing(output io.Writer, summary localrollback.Summary) {
 	if summary.ScanRoot == "" || os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") != "" {
 		return
@@ -987,7 +996,7 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 	for _, failure := range summary.Backstop.Excluded {
 		fmt.Fprintf(output, "  OUTSIDE VOLUME BACKSTOP: %s: %s\n", failure.Path, failure.Error)
 	}
-	printChangeListLimitation(output, summary, "  ")
+	printStoredChangeListLimitation(output, summary, "  ")
 	for _, failure := range summary.ScanFailures {
 		fmt.Fprintf(output, "  CHANGE-LIST SCAN INCOMPLETE: %s: %s\n", failure.Path, failure.Error)
 	}
@@ -1362,14 +1371,14 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 	record.Files = loadStoredFileSummary(store.StateDir(), record)
 	if len(record.Files.Changes) == 0 {
 		fmt.Fprintf(stdout, "Session %s changed no watched files.\n", record.ID)
-		printChangeListLimitation(stdout, record.Files, "")
+		printStoredChangeListLimitation(stdout, record.Files, "")
 		return 0
 	}
 	if len(selections) == 0 && !restoreAll {
 		printRestoreListing(stdout, record)
 		return 0
 	}
-	printChangeListLimitation(stdout, record.Files, "")
+	printStoredChangeListLimitation(stdout, record.Files, "")
 	if restoreAll {
 		if len(selections) > 0 {
 			fmt.Fprintln(stderr, "unring: --all cannot be combined with selected paths")
@@ -1510,7 +1519,7 @@ func snapshotsCommand(args []string, stdout, stderr io.Writer) int {
 
 func printRestoreListing(output io.Writer, record audit.Record) {
 	fmt.Fprintf(output, "UNRING FILE CHANGES %s\n", record.ID)
-	printChangeListLimitation(output, record.Files, "  ")
+	printStoredChangeListLimitation(output, record.Files, "  ")
 	for _, change := range record.Files.Changes {
 		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
 		if change.RestoreSource == localrollback.RestoreSourceVolume {
@@ -1537,14 +1546,17 @@ func printRestoreListing(output io.Writer, record audit.Record) {
 }
 
 func loadStoredFileSummary(stateDir string, record audit.Record) localrollback.Summary {
-	summary, err := localrollback.LoadSummary(stateDir, record.ID)
+	manifestSummary, err := localrollback.LoadSealedSummary(stateDir, record.ID)
 	if err != nil {
 		// Clone retention can evict the manifest before the audit record. The
-		// audit copy remains the durable source for those older sessions.
+		// audit copy also remains authoritative when the manifest is unsealed.
 		return record.Files
 	}
-	summary.Evicted = append([]string(nil), record.Files.Evicted...)
-	summary.RestoreEvents = append([]localrollback.RestoreRecord(nil), record.Files.RestoreEvents...)
+	summary := record.Files
+	// The audit record is the later, more durable copy of changes and errors.
+	// Only the manifest's persisted disclosure fields are needed here.
+	summary.ChangeListScope = manifestSummary.ChangeListScope
+	summary.ChangeListRoots = append([]string(nil), manifestSummary.ChangeListRoots...)
 	return summary
 }
 
