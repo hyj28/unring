@@ -250,6 +250,96 @@ func TestStoredLegacyManifestMakesNoChangeListClaim(t *testing.T) {
 	}
 }
 
+func TestUnsealedManifestNeverOverridesFinalAuditChanges(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	stateDir := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	root := t.TempDir()
+	modified := filepath.Join(root, "secrets.env")
+	created := filepath.Join(root, "new.txt")
+	if err := os.WriteFile(modified, []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var runStdout, runStderr bytes.Buffer
+	if exitCode := Main([]string{
+		"run", "--discard", "--watch-only", root, "--", "/bin/sh", "-c",
+		`printf after > "$1"; printf new > "$2"`, "unring-review", modified, created,
+	}, strings.NewReader(""), &runStdout, &runStderr); exitCode != 0 {
+		t.Fatalf("run exit = %d: %s", exitCode, runStderr.String())
+	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %d, %v", len(records), err)
+	}
+	if len(records[0].Files.Changes) != 2 {
+		t.Fatalf("audit changes = %#v, want two durable changes", records[0].Files.Changes)
+	}
+	manifestPath := filepath.Join(stateDir, "snapshots", records[0].ID, "manifest.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	delete(document, "ended_at")
+	delete(document, "changes")
+	document["complete"] = false
+	data, err = json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(manifestPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("restore listing", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		exitCode := Main([]string{"restore", records[0].ID}, strings.NewReader(""), &stdout, &stderr)
+		if exitCode != 0 {
+			t.Fatalf("restore listing exit = %d; stderr: %s", exitCode, stderr.String())
+		}
+		for _, path := range []string{modified, created} {
+			if !strings.Contains(stdout.String(), path) {
+				t.Errorf("restore listing lost audited change %s:\n%s", path, stdout.String())
+			}
+		}
+		if strings.Contains(stdout.String(), "changed no watched files") {
+			t.Errorf("restore listing falsely reported a clean session:\n%s", stdout.String())
+		}
+	})
+
+	t.Run("restore all refuses unsealed manifest", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		exitCode := Main([]string{"restore", "--all", records[0].ID}, strings.NewReader(""), &stdout, &stderr)
+		if exitCode != internalErrorExitCode {
+			t.Errorf("restore --all exit = %d, want %d; stdout: %s; stderr: %s", exitCode, internalErrorExitCode, stdout.String(), stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "capture is still in progress and cannot be restored") {
+			t.Errorf("restore --all did not preserve the unsealed-manifest refusal:\n%s", stderr.String())
+		}
+	})
+
+	t.Run("JSON log keeps audit changes", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		exitCode := Main([]string{"log", "--json", records[0].ID}, strings.NewReader(""), &stdout, &stderr)
+		if exitCode != 0 {
+			t.Fatalf("JSON log exit = %d; stderr: %s", exitCode, stderr.String())
+		}
+		for _, path := range []string{modified, created} {
+			if !strings.Contains(stdout.String(), `"path": "`+path+`"`) {
+				t.Errorf("JSON log lost audited change %s:\n%s", path, stdout.String())
+			}
+		}
+	})
+}
+
 func changeListDisclosure(t *testing.T, output string) string {
 	t.Helper()
 	const boundary = "============================================================"
