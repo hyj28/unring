@@ -912,12 +912,30 @@ func printChangeListLimitation(output io.Writer, summary localrollback.Summary, 
 	fmt.Fprintf(output, "%s============================================================\n", prefix)
 }
 
-func printStoredChangeListLimitation(output io.Writer, summary localrollback.Summary, prefix string) {
+func printStoredChangeListLimitation(output io.Writer, summary localrollback.Summary, prefix string, includeScanFailures bool) {
 	printChangeListLimitation(output, summary, prefix)
-	if os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") != "" || summary.ChangeListScope != localrollback.ChangeListScopeHomeAndClone {
+	if os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") != "" {
 		return
 	}
-	fmt.Fprintf(output, "%sHome scan exclusions: %s.\n", prefix, homeScanExclusions)
+	if summary.ChangeListScope == localrollback.ChangeListScopeHomeAndClone {
+		fmt.Fprintf(output, "%sHome scan exclusions: %s.\n", prefix, homeScanExclusions)
+		if len(summary.ScanExcluded) > 0 {
+			fmt.Fprintf(output, "%sHome scan excluded paths recorded for this session: %s.\n",
+				prefix, strings.Join(summary.ScanExcluded, ", "))
+		}
+	}
+	if includeScanFailures && len(summary.ScanFailures) > 0 {
+		paths := make([]string, 0, len(summary.ScanFailures))
+		for _, failure := range summary.ScanFailures {
+			path := failure.Path
+			if path == "" {
+				path = "unknown path"
+			}
+			paths = append(paths, path)
+		}
+		fmt.Fprintf(output, "%sCHANGE-LIST SCAN INCOMPLETE at recorded paths: %s.\n",
+			prefix, strings.Join(paths, ", "))
+	}
 }
 
 func printScanFinishing(output io.Writer, summary localrollback.Summary) {
@@ -996,7 +1014,7 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 	for _, failure := range summary.Backstop.Excluded {
 		fmt.Fprintf(output, "  OUTSIDE VOLUME BACKSTOP: %s: %s\n", failure.Path, failure.Error)
 	}
-	printStoredChangeListLimitation(output, summary, "  ")
+	printStoredChangeListLimitation(output, summary, "  ", false)
 	for _, failure := range summary.ScanFailures {
 		fmt.Fprintf(output, "  CHANGE-LIST SCAN INCOMPLETE: %s: %s\n", failure.Path, failure.Error)
 	}
@@ -1371,14 +1389,14 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 	record.Files = loadStoredFileSummary(store.StateDir(), record)
 	if len(record.Files.Changes) == 0 {
 		fmt.Fprintf(stdout, "Session %s changed no watched files.\n", record.ID)
-		printStoredChangeListLimitation(stdout, record.Files, "")
+		printStoredChangeListLimitation(stdout, record.Files, "", true)
 		return 0
 	}
 	if len(selections) == 0 && !restoreAll {
 		printRestoreListing(stdout, record)
 		return 0
 	}
-	printStoredChangeListLimitation(stdout, record.Files, "")
+	printStoredChangeListLimitation(stdout, record.Files, "", true)
 	if restoreAll {
 		if len(selections) > 0 {
 			fmt.Fprintln(stderr, "unring: --all cannot be combined with selected paths")
@@ -1519,7 +1537,7 @@ func snapshotsCommand(args []string, stdout, stderr io.Writer) int {
 
 func printRestoreListing(output io.Writer, record audit.Record) {
 	fmt.Fprintf(output, "UNRING FILE CHANGES %s\n", record.ID)
-	printStoredChangeListLimitation(output, record.Files, "  ")
+	printStoredChangeListLimitation(output, record.Files, "  ", true)
 	for _, change := range record.Files.Changes {
 		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
 		if change.RestoreSource == localrollback.RestoreSourceVolume {

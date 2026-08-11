@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hyj28/unring/internal/audit"
 	"github.com/hyj28/unring/internal/localrollback"
@@ -199,6 +200,103 @@ func TestCLIDefaultScopeQualifiesWholeVolumeBackstopClaim(t *testing.T) {
 		if !strings.Contains(storedStdout.String(), "Home scan exclusions: Library, node_modules, .git, .cache, and go/pkg.") {
 			t.Fatalf("%s stored disclosure omitted home-scan exclusions:\n%s", command, storedStdout.String())
 		}
+	}
+}
+
+func TestStoredRestoreListingNamesRecordedScanFailures(t *testing.T) {
+	t.Setenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP", "")
+	t.Setenv("DATABASE_URL", "")
+	stateDir := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	home := filepath.Join(t.TempDir(), "home")
+	failedPath := filepath.Join(home, "Pictures", "Photos Library.photoslibrary")
+	record, err := audit.NewRecord([]string{"/usr/bin/true"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Files = localrollback.Summary{
+		Watched:         []string{home},
+		Complete:        true,
+		ChangeListScope: localrollback.ChangeListScopeHomeAndClone,
+		ChangeListRoots: []string{home},
+		ScanRoot:        home,
+		ScanFailures: []localrollback.CaptureFailure{{
+			Path: failedPath, Error: "permission denied",
+		}},
+	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if exitCode := Main([]string{"restore", record.ID}, strings.NewReader(""), &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("restore listing exit = %d; stderr: %s", exitCode, stderr.String())
+	}
+	for _, want := range []string{"CHANGE-LIST SCAN INCOMPLETE", failedPath} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stored restore listing omitted recorded scan failure %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestStoredRestoreListingNamesConfiguredScanExclusions(t *testing.T) {
+	t.Setenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP", "")
+	t.Setenv("DATABASE_URL", "")
+	stateDir := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configuredExclusion := filepath.Join(home, "Documents", "secrets")
+	if err := os.MkdirAll(configuredExclusion, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resolvedConfiguredExclusion, err := filepath.EvalSymlinks(configuredExclusion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := "exclude:\n  - " + configuredExclusion + "\n"
+	if err := os.WriteFile(filepath.Join(stateDir, "config.yaml"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(project)
+	platform := &reviewRoundCLIPlatform{}
+	restorePlatform := localrollback.SetVolumeSnapshotPlatformForTest(platform)
+	defer restorePlatform()
+	var runStdout, runStderr bytes.Buffer
+	if exitCode := Main([]string{"run", "--discard", "--", "/usr/bin/true"}, strings.NewReader(""), &runStdout, &runStderr); exitCode != 0 {
+		t.Fatalf("run exit = %d: %s", exitCode, runStderr.String())
+	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %d, %v", len(records), err)
+	}
+	configuredExclusionPersisted := false
+	for _, excluded := range records[0].Files.ScanExcluded {
+		if excluded == resolvedConfiguredExclusion {
+			configuredExclusionPersisted = true
+			break
+		}
+	}
+	if !configuredExclusionPersisted {
+		t.Fatalf("configured exclusion %s was not persisted: %#v", resolvedConfiguredExclusion, records[0].Files.ScanExcluded)
+	}
+	var stdout, stderr bytes.Buffer
+	if exitCode := Main([]string{"restore", records[0].ID}, strings.NewReader(""), &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("restore listing exit = %d; stderr: %s", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), resolvedConfiguredExclusion) {
+		t.Fatalf("stored restore listing omitted configured scan exclusion %s:\n%s", resolvedConfiguredExclusion, stdout.String())
 	}
 }
 
