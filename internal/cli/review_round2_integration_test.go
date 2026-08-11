@@ -130,6 +130,25 @@ func TestCLIFailedHomeScanClaimsCloneRootsOnly(t *testing.T) {
 	if len(records[0].Files.ScanFailures) != 1 || records[0].Files.ScanFailures[0].Path == "" {
 		t.Fatalf("scan failures = %#v, want a nonempty path label", records[0].Files.ScanFailures)
 	}
+	wantDisclosure := "" +
+		"============================================================\n" +
+		"CHANGE LIST IS NOT WHOLE-VOLUME\n" +
+		"Change reporting is limited to the clone roots: " + project + "\n" +
+		"Changes elsewhere are not reported, even when a volume snapshot contains them.\n" +
+		"============================================================"
+	liveDisclosure := changeListDisclosure(t, stderr.String())
+	if liveDisclosure != wantDisclosure {
+		t.Fatalf("live failed-scan disclosure:\n%s\nwant:\n%s", liveDisclosure, wantDisclosure)
+	}
+	for _, command := range []string{"log", "restore"} {
+		var storedStdout, storedStderr bytes.Buffer
+		if exitCode := Main([]string{command, records[0].ID}, strings.NewReader(""), &storedStdout, &storedStderr); exitCode != 0 {
+			t.Fatalf("%s stored session exit = %d; stderr: %s", command, exitCode, storedStderr.String())
+		}
+		if got := changeListDisclosure(t, storedStdout.String()); got != liveDisclosure {
+			t.Fatalf("%s disclosure drifted from live output:\n%s\nwant:\n%s", command, got, liveDisclosure)
+		}
+	}
 	if !errors.Is(os.Remove(missingHome), os.ErrNotExist) {
 		t.Fatal("missing home unexpectedly exists")
 	}

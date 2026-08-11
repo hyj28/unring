@@ -1290,6 +1290,7 @@ func logCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "unring: %v\n", err)
 		return internalErrorExitCode
 	}
+	record.Files = loadStoredFileSummary(store.StateDir(), record)
 	if *asJSON {
 		return writeJSON(stdout, stderr, record)
 	}
@@ -1358,14 +1359,17 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "unring: %v\n", err)
 		return internalErrorExitCode
 	}
+	record.Files = loadStoredFileSummary(store.StateDir(), record)
 	if len(record.Files.Changes) == 0 {
 		fmt.Fprintf(stdout, "Session %s changed no watched files.\n", record.ID)
+		printChangeListLimitation(stdout, record.Files, "")
 		return 0
 	}
 	if len(selections) == 0 && !restoreAll {
 		printRestoreListing(stdout, record)
 		return 0
 	}
+	printChangeListLimitation(stdout, record.Files, "")
 	if restoreAll {
 		if len(selections) > 0 {
 			fmt.Fprintln(stderr, "unring: --all cannot be combined with selected paths")
@@ -1506,6 +1510,7 @@ func snapshotsCommand(args []string, stdout, stderr io.Writer) int {
 
 func printRestoreListing(output io.Writer, record audit.Record) {
 	fmt.Fprintf(output, "UNRING FILE CHANGES %s\n", record.ID)
+	printChangeListLimitation(output, record.Files, "  ")
 	for _, change := range record.Files.Changes {
 		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
 		if change.RestoreSource == localrollback.RestoreSourceVolume {
@@ -1529,6 +1534,18 @@ func printRestoreListing(output io.Writer, record audit.Record) {
 	} else {
 		fmt.Fprintln(output, "No changed path has restorable snapshot data.")
 	}
+}
+
+func loadStoredFileSummary(stateDir string, record audit.Record) localrollback.Summary {
+	summary, err := localrollback.LoadSummary(stateDir, record.ID)
+	if err != nil {
+		// Clone retention can evict the manifest before the audit record. The
+		// audit copy remains the durable source for those older sessions.
+		return record.Files
+	}
+	summary.Evicted = append([]string(nil), record.Files.Evicted...)
+	summary.RestoreEvents = append([]localrollback.RestoreRecord(nil), record.Files.RestoreEvents...)
+	return summary
 }
 
 func hasRestorableFileChange(changes []localrollback.Change) bool {

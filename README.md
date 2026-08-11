@@ -121,6 +121,11 @@ unring restore --force <session-id> path     # explicitly overwrite a conflict
 unring snapshots                             # inspect clone usage and APFS backstop presence
 ```
 
+The `unring restore` and detailed `unring log <session-id>` output repeat the session's
+recorded change-list scope. A clean stored change list therefore does not hide whether
+`--watch-only`, a failed widened scan, or the normal home-and-clone boundary left changes
+elsewhere unreported.
+
 A clone-covered path changed after the session is refused by default. Its pre-session
 snapshot is written alongside the current file, and only `--force` permits replacement.
 Snapshot-only restore announces why root is required before invoking `sudo`; it fails

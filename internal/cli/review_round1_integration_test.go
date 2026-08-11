@@ -2,7 +2,9 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -114,6 +116,27 @@ func TestCLIWatchOnlyDisclosesUnreportedWholeVolumeChanges(t *testing.T) {
 		!strings.Contains(encoded.String(), `"watch-only"`) {
 		t.Fatalf("audit omitted structured change-list limitation: %s", encoded.String())
 	}
+
+	wantDisclosure := fmt.Sprintf(""+
+		"============================================================\n"+
+		"CHANGE LIST IS NOT WHOLE-VOLUME\n"+
+		"It is limited by --watch-only to: %s\n"+
+		"Changes elsewhere are not reported or written to the audit record, even when the APFS snapshot contains them; the session can look clean after such a change.\n"+
+		"============================================================", watched)
+	liveDisclosure := changeListDisclosure(t, stderr.String())
+	if liveDisclosure != wantDisclosure {
+		t.Fatalf("live watch-only disclosure:\n%s\nwant:\n%s", liveDisclosure, wantDisclosure)
+	}
+	for _, command := range []string{"log", "restore"} {
+		var storedStdout, storedStderr bytes.Buffer
+		if exitCode := Main([]string{command, records[0].ID}, strings.NewReader(""), &storedStdout, &storedStderr); exitCode != 0 {
+			t.Fatalf("%s stored session exit = %d; stderr: %s", command, exitCode, storedStderr.String())
+		}
+		storedDisclosure := changeListDisclosure(t, storedStdout.String())
+		if storedDisclosure != liveDisclosure {
+			t.Fatalf("%s disclosure drifted from live output:\n%s\nwant:\n%s", command, storedDisclosure, liveDisclosure)
+		}
+	}
 }
 
 func TestCLIDefaultScopeQualifiesWholeVolumeBackstopClaim(t *testing.T) {
@@ -143,6 +166,112 @@ func TestCLIDefaultScopeQualifiesWholeVolumeBackstopClaim(t *testing.T) {
 			t.Fatalf("default disclosure omitted %q:\n%s", literal, stderr.String())
 		}
 	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %d, %v", len(records), err)
+	}
+	resolvedHome, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDisclosure := fmt.Sprintf(""+
+		"============================================================\n"+
+		"CHANGE LIST IS NOT WHOLE-VOLUME\n"+
+		"Change reporting covers the home scan and clone roots: %s, %s\n"+
+		"Changes outside the home scan and clone roots are not reported, including /etc, /opt, /tmp, or another volume, even when the APFS snapshot contains them.\n"+
+		"============================================================", resolvedHome, project)
+	liveDisclosure := changeListDisclosure(t, stderr.String())
+	if liveDisclosure != wantDisclosure {
+		t.Fatalf("live default-scope disclosure:\n%s\nwant:\n%s", liveDisclosure, wantDisclosure)
+	}
+	for _, command := range []string{"log", "restore"} {
+		var storedStdout, storedStderr bytes.Buffer
+		if exitCode := Main([]string{command, records[0].ID}, strings.NewReader(""), &storedStdout, &storedStderr); exitCode != 0 {
+			t.Fatalf("%s stored session exit = %d; stderr: %s", command, exitCode, storedStderr.String())
+		}
+		if got := changeListDisclosure(t, storedStdout.String()); got != liveDisclosure {
+			t.Fatalf("%s disclosure drifted from live output:\n%s\nwant:\n%s", command, got, liveDisclosure)
+		}
+	}
+}
+
+func TestStoredLegacyManifestMakesNoChangeListClaim(t *testing.T) {
+	t.Setenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP", "")
+	t.Setenv("DATABASE_URL", "")
+	stateDir := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	root := t.TempDir()
+	platform := &reviewRoundCLIPlatform{}
+	restorePlatform := localrollback.SetVolumeSnapshotPlatformForTest(platform)
+	defer restorePlatform()
+	var runStdout, runStderr bytes.Buffer
+	if exitCode := Main([]string{"run", "--discard", "--watch-only", root, "--", "/usr/bin/true"}, strings.NewReader(""), &runStdout, &runStderr); exitCode != 0 {
+		t.Fatalf("run exit = %d: %s", exitCode, runStderr.String())
+	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %d, %v", len(records), err)
+	}
+	manifestPath := filepath.Join(stateDir, "snapshots", records[0].ID, "manifest.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	delete(document, "change_list_scope")
+	delete(document, "change_list_roots")
+	data, err = json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(manifestPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range []string{"log", "restore"} {
+		var stdout, stderr bytes.Buffer
+		if exitCode := Main([]string{command, records[0].ID}, strings.NewReader(""), &stdout, &stderr); exitCode != 0 {
+			t.Fatalf("%s legacy session exit = %d; stderr: %s", command, exitCode, stderr.String())
+		}
+		if strings.Contains(stdout.String(), "CHANGE LIST IS NOT WHOLE-VOLUME") {
+			t.Fatalf("%s invented a scope claim for a legacy manifest:\n%s", command, stdout.String())
+		}
+	}
+}
+
+func changeListDisclosure(t *testing.T, output string) string {
+	t.Helper()
+	const boundary = "============================================================"
+	var disclosure []string
+	inside := false
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimPrefix(line, "unring: ")
+		line = strings.TrimPrefix(line, "  ")
+		if line == boundary {
+			disclosure = append(disclosure, line)
+			if inside {
+				return strings.Join(disclosure, "\n")
+			}
+			inside = true
+			continue
+		}
+		if inside {
+			disclosure = append(disclosure, line)
+		}
+	}
+	t.Fatalf("change-list disclosure not found in:\n%s", output)
+	return ""
 }
 
 func TestCLIMountPermissionFailureNeverReportsRestored(t *testing.T) {
