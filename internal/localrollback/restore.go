@@ -218,7 +218,9 @@ func restoreVolumeOne(platform VolumeSnapshotPlatform, value manifest, change Ch
 	snapshotPath, err := mountedSnapshotPath(mountPoint, change.VolumeSnapshot.MountPoint, snapshotSourcePath)
 	if err == nil {
 		followFinalSymlink := change.Before != nil && change.Before.Type != "symlink"
-		snapshotPath, err = resolveMountedSnapshotPath(mountPoint, snapshotPath, followFinalSymlink)
+		snapshotPath, err = resolveMountedSnapshotPath(
+			mountPoint, change.VolumeSnapshot.MountPoint, snapshotPath, followFinalSymlink,
+		)
 	}
 	if err == nil {
 		err = validateMountedSnapshotObject(snapshotPath, change.Before)
@@ -330,7 +332,7 @@ func mountedSnapshotPath(mountedRoot, volumeMountPoint, original string) (string
 	return path, nil
 }
 
-func resolveMountedSnapshotPath(mountedRoot, path string, followFinalSymlink bool) (string, error) {
+func resolveMountedSnapshotPath(mountedRoot, volumeMountPoint, path string, followFinalSymlink bool) (string, error) {
 	root, err := filepath.Abs(mountedRoot)
 	if err != nil {
 		return "", err
@@ -384,7 +386,14 @@ func resolveMountedSnapshotPath(mountedRoot, path string, followFinalSymlink boo
 		}
 		if filepath.IsAbs(target) {
 			resolved = resolved[:0]
-			target = strings.TrimPrefix(filepath.Clean(target), string(os.PathSeparator))
+			rerooted, err := mountedSnapshotPath(root, volumeMountPoint, target)
+			if err != nil {
+				return "", fmt.Errorf("reroot mounted snapshot symlink %s: %w", candidate, err)
+			}
+			target, err = filepath.Rel(root, rerooted)
+			if err != nil {
+				return "", fmt.Errorf("resolve rerooted mounted snapshot symlink %s: %w", candidate, err)
+			}
 		}
 		pending = append(pathComponents(target), pending...)
 	}

@@ -87,7 +87,7 @@ func TestRestoreRecordedOrdersCreatedTreeAfterCloneEviction(t *testing.T) {
 	}
 }
 
-func TestSealMemoizesTimeMachineExclusionByChangedDirectory(t *testing.T) {
+func TestSealChecksEveryIncludedChangedPathForTimeMachineExclusion(t *testing.T) {
 	home := t.TempDir()
 	stateDir := t.TempDir()
 	cloneRoot := filepath.Join(home, "watched")
