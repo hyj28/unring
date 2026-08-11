@@ -40,6 +40,7 @@ const (
 	defaultReviewWidth    = 80
 
 	quietSessionDisclosure = "unring: nothing intercepted. Outbound is not covered unless --outbound was given. Not visible to unring: SSH/git push, raw sockets, unshimmed CLIs."
+	homeScanExclusions     = "Library, node_modules, .git, .cache, and go/pkg"
 )
 
 type stringListFlag []string
@@ -229,8 +230,8 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	auditRecord := auditSession.Snapshot()
 	if scope.ScanRoot != "" && os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") == "" {
 		fmt.Fprintf(stderr,
-			"unring: scanning %s for the widened change list; this metadata scan may take several seconds and excludes Library, node_modules, .git, .cache, and go/pkg.\n",
-			scope.ScanRoot)
+			"unring: scanning %s for the widened change list; this metadata scan may take several seconds and excludes %s.\n",
+			scope.ScanRoot, homeScanExclusions)
 	} else if scope.ScanError != "" {
 		fmt.Fprintf(stderr, "unring: WIDENED CHANGE LIST UNAVAILABLE: %s\n", scope.ScanError)
 	}
@@ -911,6 +912,32 @@ func printChangeListLimitation(output io.Writer, summary localrollback.Summary, 
 	fmt.Fprintf(output, "%s============================================================\n", prefix)
 }
 
+func printStoredChangeListLimitation(output io.Writer, summary localrollback.Summary, prefix string, includeScanFailures bool) {
+	printChangeListLimitation(output, summary, prefix)
+	if os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") != "" {
+		return
+	}
+	if summary.ChangeListScope == localrollback.ChangeListScopeHomeAndClone {
+		fmt.Fprintf(output, "%sHome scan exclusions: %s.\n", prefix, homeScanExclusions)
+		if len(summary.ScanExcluded) > 0 {
+			fmt.Fprintf(output, "%sHome scan excluded paths recorded for this session: %s.\n",
+				prefix, strings.Join(summary.ScanExcluded, ", "))
+		}
+	}
+	if includeScanFailures && len(summary.ScanFailures) > 0 {
+		paths := make([]string, 0, len(summary.ScanFailures))
+		for _, failure := range summary.ScanFailures {
+			path := failure.Path
+			if path == "" {
+				path = "unknown path"
+			}
+			paths = append(paths, path)
+		}
+		fmt.Fprintf(output, "%sCHANGE-LIST SCAN INCOMPLETE at recorded paths: %s.\n",
+			prefix, strings.Join(paths, ", "))
+	}
+}
+
 func printScanFinishing(output io.Writer, summary localrollback.Summary) {
 	if summary.ScanRoot == "" || os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") != "" {
 		return
@@ -987,7 +1014,7 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 	for _, failure := range summary.Backstop.Excluded {
 		fmt.Fprintf(output, "  OUTSIDE VOLUME BACKSTOP: %s: %s\n", failure.Path, failure.Error)
 	}
-	printChangeListLimitation(output, summary, "  ")
+	printStoredChangeListLimitation(output, summary, "  ", false)
 	for _, failure := range summary.ScanFailures {
 		fmt.Fprintf(output, "  CHANGE-LIST SCAN INCOMPLETE: %s: %s\n", failure.Path, failure.Error)
 	}
@@ -1290,6 +1317,7 @@ func logCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "unring: %v\n", err)
 		return internalErrorExitCode
 	}
+	record.Files = loadStoredFileSummary(store.StateDir(), record)
 	if *asJSON {
 		return writeJSON(stdout, stderr, record)
 	}
@@ -1358,14 +1386,17 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "unring: %v\n", err)
 		return internalErrorExitCode
 	}
+	record.Files = loadStoredFileSummary(store.StateDir(), record)
 	if len(record.Files.Changes) == 0 {
 		fmt.Fprintf(stdout, "Session %s changed no watched files.\n", record.ID)
+		printStoredChangeListLimitation(stdout, record.Files, "", true)
 		return 0
 	}
 	if len(selections) == 0 && !restoreAll {
 		printRestoreListing(stdout, record)
 		return 0
 	}
+	printStoredChangeListLimitation(stdout, record.Files, "", true)
 	if restoreAll {
 		if len(selections) > 0 {
 			fmt.Fprintln(stderr, "unring: --all cannot be combined with selected paths")
@@ -1506,6 +1537,7 @@ func snapshotsCommand(args []string, stdout, stderr io.Writer) int {
 
 func printRestoreListing(output io.Writer, record audit.Record) {
 	fmt.Fprintf(output, "UNRING FILE CHANGES %s\n", record.ID)
+	printStoredChangeListLimitation(output, record.Files, "  ", true)
 	for _, change := range record.Files.Changes {
 		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
 		if change.RestoreSource == localrollback.RestoreSourceVolume {
@@ -1529,6 +1561,21 @@ func printRestoreListing(output io.Writer, record audit.Record) {
 	} else {
 		fmt.Fprintln(output, "No changed path has restorable snapshot data.")
 	}
+}
+
+func loadStoredFileSummary(stateDir string, record audit.Record) localrollback.Summary {
+	manifestSummary, err := localrollback.LoadSealedSummary(stateDir, record.ID)
+	if err != nil {
+		// Clone retention can evict the manifest before the audit record. The
+		// audit copy also remains authoritative when the manifest is unsealed.
+		return record.Files
+	}
+	summary := record.Files
+	// The audit record is the later, more durable copy of changes and errors.
+	// Only the manifest's persisted disclosure fields are needed here.
+	summary.ChangeListScope = manifestSummary.ChangeListScope
+	summary.ChangeListRoots = append([]string(nil), manifestSummary.ChangeListRoots...)
+	return summary
 }
 
 func hasRestorableFileChange(changes []localrollback.Change) bool {

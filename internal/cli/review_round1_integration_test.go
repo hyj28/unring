@@ -2,11 +2,14 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hyj28/unring/internal/audit"
 	"github.com/hyj28/unring/internal/localrollback"
@@ -114,6 +117,27 @@ func TestCLIWatchOnlyDisclosesUnreportedWholeVolumeChanges(t *testing.T) {
 		!strings.Contains(encoded.String(), `"watch-only"`) {
 		t.Fatalf("audit omitted structured change-list limitation: %s", encoded.String())
 	}
+
+	wantDisclosure := fmt.Sprintf(""+
+		"============================================================\n"+
+		"CHANGE LIST IS NOT WHOLE-VOLUME\n"+
+		"It is limited by --watch-only to: %s\n"+
+		"Changes elsewhere are not reported or written to the audit record, even when the APFS snapshot contains them; the session can look clean after such a change.\n"+
+		"============================================================", watched)
+	liveDisclosure := changeListDisclosure(t, stderr.String())
+	if liveDisclosure != wantDisclosure {
+		t.Fatalf("live watch-only disclosure:\n%s\nwant:\n%s", liveDisclosure, wantDisclosure)
+	}
+	for _, command := range []string{"log", "restore"} {
+		var storedStdout, storedStderr bytes.Buffer
+		if exitCode := Main([]string{command, records[0].ID}, strings.NewReader(""), &storedStdout, &storedStderr); exitCode != 0 {
+			t.Fatalf("%s stored session exit = %d; stderr: %s", command, exitCode, storedStderr.String())
+		}
+		storedDisclosure := changeListDisclosure(t, storedStdout.String())
+		if storedDisclosure != liveDisclosure {
+			t.Fatalf("%s disclosure drifted from live output:\n%s\nwant:\n%s", command, storedDisclosure, liveDisclosure)
+		}
+	}
 }
 
 func TestCLIDefaultScopeQualifiesWholeVolumeBackstopClaim(t *testing.T) {
@@ -143,6 +167,368 @@ func TestCLIDefaultScopeQualifiesWholeVolumeBackstopClaim(t *testing.T) {
 			t.Fatalf("default disclosure omitted %q:\n%s", literal, stderr.String())
 		}
 	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %d, %v", len(records), err)
+	}
+	resolvedHome, err := filepath.EvalSymlinks(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDisclosure := fmt.Sprintf(""+
+		"============================================================\n"+
+		"CHANGE LIST IS NOT WHOLE-VOLUME\n"+
+		"Change reporting covers the home scan and clone roots: %s, %s\n"+
+		"Changes outside the home scan and clone roots are not reported, including /etc, /opt, /tmp, or another volume, even when the APFS snapshot contains them.\n"+
+		"============================================================", resolvedHome, project)
+	liveDisclosure := changeListDisclosure(t, stderr.String())
+	if liveDisclosure != wantDisclosure {
+		t.Fatalf("live default-scope disclosure:\n%s\nwant:\n%s", liveDisclosure, wantDisclosure)
+	}
+	for _, command := range []string{"log", "restore"} {
+		var storedStdout, storedStderr bytes.Buffer
+		if exitCode := Main([]string{command, records[0].ID}, strings.NewReader(""), &storedStdout, &storedStderr); exitCode != 0 {
+			t.Fatalf("%s stored session exit = %d; stderr: %s", command, exitCode, storedStderr.String())
+		}
+		if got := changeListDisclosure(t, storedStdout.String()); got != liveDisclosure {
+			t.Fatalf("%s disclosure drifted from live output:\n%s\nwant:\n%s", command, got, liveDisclosure)
+		}
+		if !strings.Contains(storedStdout.String(), "Home scan exclusions: Library, node_modules, .git, .cache, and go/pkg.") {
+			t.Fatalf("%s stored disclosure omitted home-scan exclusions:\n%s", command, storedStdout.String())
+		}
+	}
+}
+
+func TestStoredRestoreListingNamesRecordedScanFailures(t *testing.T) {
+	t.Setenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP", "")
+	t.Setenv("DATABASE_URL", "")
+	stateDir := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	home := filepath.Join(t.TempDir(), "home")
+	failedPath := filepath.Join(home, "Pictures", "Photos Library.photoslibrary")
+	record, err := audit.NewRecord([]string{"/usr/bin/true"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Files = localrollback.Summary{
+		Watched:         []string{home},
+		Complete:        true,
+		ChangeListScope: localrollback.ChangeListScopeHomeAndClone,
+		ChangeListRoots: []string{home},
+		ScanRoot:        home,
+		ScanFailures: []localrollback.CaptureFailure{{
+			Path: failedPath, Error: "permission denied",
+		}},
+	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if exitCode := Main([]string{"restore", record.ID}, strings.NewReader(""), &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("restore listing exit = %d; stderr: %s", exitCode, stderr.String())
+	}
+	for _, want := range []string{"CHANGE-LIST SCAN INCOMPLETE", failedPath} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stored restore listing omitted recorded scan failure %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestStoredRestoreListingNamesConfiguredScanExclusions(t *testing.T) {
+	t.Setenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP", "")
+	t.Setenv("DATABASE_URL", "")
+	stateDir := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configuredExclusion := filepath.Join(home, "Documents", "secrets")
+	if err := os.MkdirAll(configuredExclusion, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resolvedConfiguredExclusion, err := filepath.EvalSymlinks(configuredExclusion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := "exclude:\n  - " + configuredExclusion + "\n"
+	if err := os.WriteFile(filepath.Join(stateDir, "config.yaml"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(project)
+	platform := &reviewRoundCLIPlatform{}
+	restorePlatform := localrollback.SetVolumeSnapshotPlatformForTest(platform)
+	defer restorePlatform()
+	var runStdout, runStderr bytes.Buffer
+	if exitCode := Main([]string{"run", "--discard", "--", "/usr/bin/true"}, strings.NewReader(""), &runStdout, &runStderr); exitCode != 0 {
+		t.Fatalf("run exit = %d: %s", exitCode, runStderr.String())
+	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %d, %v", len(records), err)
+	}
+	configuredExclusionPersisted := false
+	for _, excluded := range records[0].Files.ScanExcluded {
+		if excluded == resolvedConfiguredExclusion {
+			configuredExclusionPersisted = true
+			break
+		}
+	}
+	if !configuredExclusionPersisted {
+		t.Fatalf("configured exclusion %s was not persisted: %#v", resolvedConfiguredExclusion, records[0].Files.ScanExcluded)
+	}
+	var stdout, stderr bytes.Buffer
+	if exitCode := Main([]string{"restore", records[0].ID}, strings.NewReader(""), &stdout, &stderr); exitCode != 0 {
+		t.Fatalf("restore listing exit = %d; stderr: %s", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), resolvedConfiguredExclusion) {
+		t.Fatalf("stored restore listing omitted configured scan exclusion %s:\n%s", resolvedConfiguredExclusion, stdout.String())
+	}
+}
+
+func TestStoredLegacyManifestMakesNoChangeListClaim(t *testing.T) {
+	t.Setenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP", "")
+	t.Setenv("DATABASE_URL", "")
+	stateDir := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	root := t.TempDir()
+	platform := &reviewRoundCLIPlatform{}
+	restorePlatform := localrollback.SetVolumeSnapshotPlatformForTest(platform)
+	defer restorePlatform()
+	var runStdout, runStderr bytes.Buffer
+	if exitCode := Main([]string{"run", "--discard", "--watch-only", root, "--", "/usr/bin/true"}, strings.NewReader(""), &runStdout, &runStderr); exitCode != 0 {
+		t.Fatalf("run exit = %d: %s", exitCode, runStderr.String())
+	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %d, %v", len(records), err)
+	}
+	manifestPath := filepath.Join(stateDir, "snapshots", records[0].ID, "manifest.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	delete(document, "change_list_scope")
+	delete(document, "change_list_roots")
+	data, err = json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(manifestPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range []string{"log", "restore"} {
+		var stdout, stderr bytes.Buffer
+		if exitCode := Main([]string{command, records[0].ID}, strings.NewReader(""), &stdout, &stderr); exitCode != 0 {
+			t.Fatalf("%s legacy session exit = %d; stderr: %s", command, exitCode, stderr.String())
+		}
+		if strings.Contains(stdout.String(), "CHANGE LIST IS NOT WHOLE-VOLUME") {
+			t.Fatalf("%s invented a scope claim for a legacy manifest:\n%s", command, stdout.String())
+		}
+	}
+}
+
+func TestUnsealedManifestNeverOverridesFinalAuditChanges(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	stateDir := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	root := t.TempDir()
+	modified := filepath.Join(root, "secrets.env")
+	created := filepath.Join(root, "new.txt")
+	if err := os.WriteFile(modified, []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var runStdout, runStderr bytes.Buffer
+	if exitCode := Main([]string{
+		"run", "--discard", "--watch-only", root, "--", "/bin/sh", "-c",
+		`printf after > "$1"; printf new > "$2"`, "unring-review", modified, created,
+	}, strings.NewReader(""), &runStdout, &runStderr); exitCode != 0 {
+		t.Fatalf("run exit = %d: %s", exitCode, runStderr.String())
+	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %d, %v", len(records), err)
+	}
+	if len(records[0].Files.Changes) != 2 {
+		t.Fatalf("audit changes = %#v, want two durable changes", records[0].Files.Changes)
+	}
+	manifestPath := filepath.Join(stateDir, "snapshots", records[0].ID, "manifest.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	delete(document, "ended_at")
+	delete(document, "changes")
+	document["complete"] = false
+	data, err = json.MarshalIndent(document, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(manifestPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("restore listing", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		exitCode := Main([]string{"restore", records[0].ID}, strings.NewReader(""), &stdout, &stderr)
+		if exitCode != 0 {
+			t.Fatalf("restore listing exit = %d; stderr: %s", exitCode, stderr.String())
+		}
+		for _, path := range []string{modified, created} {
+			if !strings.Contains(stdout.String(), path) {
+				t.Errorf("restore listing lost audited change %s:\n%s", path, stdout.String())
+			}
+		}
+		if strings.Contains(stdout.String(), "changed no watched files") {
+			t.Errorf("restore listing falsely reported a clean session:\n%s", stdout.String())
+		}
+	})
+
+	t.Run("restore all refuses unsealed manifest", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		exitCode := Main([]string{"restore", "--all", records[0].ID}, strings.NewReader(""), &stdout, &stderr)
+		if exitCode != internalErrorExitCode {
+			t.Errorf("restore --all exit = %d, want %d; stdout: %s; stderr: %s", exitCode, internalErrorExitCode, stdout.String(), stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "capture is still in progress and cannot be restored") {
+			t.Errorf("restore --all did not preserve the unsealed-manifest refusal:\n%s", stderr.String())
+		}
+	})
+
+	t.Run("JSON log keeps audit changes", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		exitCode := Main([]string{"log", "--json", records[0].ID}, strings.NewReader(""), &stdout, &stderr)
+		if exitCode != 0 {
+			t.Fatalf("JSON log exit = %d; stderr: %s", exitCode, stderr.String())
+		}
+		for _, path := range []string{modified, created} {
+			if !strings.Contains(stdout.String(), `"path": "`+path+`"`) {
+				t.Errorf("JSON log lost audited change %s:\n%s", path, stdout.String())
+			}
+		}
+	})
+}
+
+func TestStoredDisclosureAppearsForChangedRestoreListingAndRestoreActions(t *testing.T) {
+	t.Setenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP", "")
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", t.TempDir())
+	root := t.TempDir()
+	path := filepath.Join(root, "changed.txt")
+	if err := os.WriteFile(path, []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	platform := &reviewRoundCLIPlatform{}
+	restorePlatform := localrollback.SetVolumeSnapshotPlatformForTest(platform)
+	defer restorePlatform()
+	var runStdout, runStderr bytes.Buffer
+	if exitCode := Main([]string{
+		"run", "--discard", "--watch-only", root, "--",
+		"/bin/sh", "-c", `printf after > "$1"`, "unring-review", path,
+	}, strings.NewReader(""), &runStdout, &runStderr); exitCode != 0 {
+		t.Fatalf("run exit = %d: %s", exitCode, runStderr.String())
+	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %d, %v", len(records), err)
+	}
+	if len(records[0].Files.Changes) != 1 || records[0].Files.Changes[0].Path != path {
+		t.Fatalf("recorded changes = %#v, want modified %s", records[0].Files.Changes, path)
+	}
+	liveDisclosure := changeListDisclosure(t, runStderr.String())
+
+	var listingStdout, listingStderr bytes.Buffer
+	if exitCode := Main([]string{"restore", records[0].ID}, strings.NewReader(""), &listingStdout, &listingStderr); exitCode != 0 {
+		t.Fatalf("restore listing exit = %d; stderr: %s", exitCode, listingStderr.String())
+	}
+	if got := changeListDisclosure(t, listingStdout.String()); got != liveDisclosure {
+		t.Fatalf("changed restore listing disclosure drifted from live output:\n%s\nwant:\n%s", got, liveDisclosure)
+	}
+	if !strings.Contains(listingStdout.String(), path) {
+		t.Fatalf("changed restore listing omitted %s:\n%s", path, listingStdout.String())
+	}
+
+	var selectedStdout, selectedStderr bytes.Buffer
+	if exitCode := Main([]string{"restore", records[0].ID, path}, strings.NewReader(""), &selectedStdout, &selectedStderr); exitCode != 0 {
+		t.Fatalf("selected restore exit = %d; stderr: %s", exitCode, selectedStderr.String())
+	}
+	if got := changeListDisclosure(t, selectedStdout.String()); got != liveDisclosure {
+		t.Fatalf("selected restore disclosure drifted from live output:\n%s\nwant:\n%s", got, liveDisclosure)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil || string(contents) != "before" {
+		t.Fatalf("selected restore contents = %q, %v; want before", contents, err)
+	}
+
+	var allStdout, allStderr bytes.Buffer
+	if exitCode := Main([]string{"restore", "--all", records[0].ID}, strings.NewReader(""), &allStdout, &allStderr); exitCode != 0 {
+		t.Fatalf("restore --all exit = %d; stderr: %s", exitCode, allStderr.String())
+	}
+	bannerIndex := strings.Index(allStdout.String(), "CHANGE LIST IS NOT WHOLE-VOLUME")
+	resultIndex := strings.Index(allStdout.String(), "already restored")
+	if bannerIndex < 0 || resultIndex < 0 || bannerIndex > resultIndex {
+		t.Fatalf("restore --all did not print disclosure before its result:\n%s", allStdout.String())
+	}
+}
+
+func changeListDisclosure(t *testing.T, output string) string {
+	t.Helper()
+	const boundary = "============================================================"
+	var disclosure []string
+	inside := false
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimPrefix(line, "unring: ")
+		line = strings.TrimPrefix(line, "  ")
+		if line == boundary {
+			disclosure = append(disclosure, line)
+			if inside {
+				return strings.Join(disclosure, "\n")
+			}
+			inside = true
+			continue
+		}
+		if inside {
+			disclosure = append(disclosure, line)
+		}
+	}
+	t.Fatalf("change-list disclosure not found in:\n%s", output)
+	return ""
 }
 
 func TestCLIMountPermissionFailureNeverReportsRestored(t *testing.T) {

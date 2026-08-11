@@ -508,24 +508,6 @@ func buildTestBinary(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("resolve repository root: %v", err)
 	}
-	moduleCache := strings.TrimSpace(os.Getenv("GOMODCACHE"))
-	if moduleCache == "" {
-		command := exec.Command("go", "env", "GOMODCACHE")
-		output, err := command.Output()
-		if err != nil {
-			t.Fatalf("find existing Go module cache: %v", err)
-		}
-		moduleCache = strings.TrimSpace(string(output))
-	}
-	buildCache := strings.TrimSpace(os.Getenv("GOCACHE"))
-	if buildCache == "" {
-		command := exec.Command("go", "env", "GOCACHE")
-		output, err := command.Output()
-		if err != nil {
-			t.Fatalf("find existing Go build cache: %v", err)
-		}
-		buildCache = strings.TrimSpace(string(output))
-	}
 	// Every built CLI inherits a fabricated default snapshot scope. Most run
 	// invocations pass --watch-only explicitly; shortcut invocations cannot do that
 	// without changing the behavior under test, so isolate both inputs used by
@@ -536,8 +518,8 @@ func buildTestBinary(t *testing.T) string {
 	// Both Go caches default to a location under HOME, so the fabricated HOME
 	// above would otherwise hand every test an empty build cache and recompile
 	// libpg_query from source once per test.
-	t.Setenv("GOMODCACHE", moduleCache)
-	t.Setenv("GOCACHE", buildCache)
+	t.Setenv("GOMODCACHE", inheritedGoCaches.module)
+	t.Setenv("GOCACHE", inheritedGoCaches.build)
 
 	binary := filepath.Join(t.TempDir(), "unring")
 	build := exec.Command("go", "build", "-o", binary, "./cmd/unring")

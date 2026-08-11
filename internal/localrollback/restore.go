@@ -40,6 +40,20 @@ func LoadSummary(stateDir, sessionID string) (Summary, error) {
 	return summaryFromManifest(value, true), nil
 }
 
+// LoadSealedSummary loads a durable file summary only after capture has ended.
+// An unsealed manifest can be the stale StartScope copy left behind when Seal
+// could not publish its final update, so it must never override the audit log.
+func LoadSealedSummary(stateDir, sessionID string) (Summary, error) {
+	summary, err := LoadSummary(stateDir, sessionID)
+	if err != nil {
+		return Summary{}, err
+	}
+	if summary.manifestEndedAt.IsZero() {
+		return Summary{}, fmt.Errorf("snapshot %s is incomplete because capture is still in progress", sessionID)
+	}
+	return summary, nil
+}
+
 // Restore applies selected file changes. Paths are exact absolute paths or
 // paths relative to the caller's current working directory.
 func Restore(stateDir, sessionID string, selections []string, force bool) ([]RestoreResult, error) {
@@ -514,7 +528,7 @@ func summaryFromManifest(value manifest, retained bool) Summary {
 		ScanFailures:    append([]CaptureFailure(nil), value.ScanFailures...),
 		ScanBeforeFiles: value.ScanBeforeFiles, ScanAfterFiles: value.ScanAfterFiles,
 		ScanBeforeMillis: value.ScanBeforeMillis, ScanAfterMillis: value.ScanAfterMillis,
-		Backstop: value.Backstop,
+		Backstop: value.Backstop, manifestEndedAt: value.EndedAt,
 	}
 }
 
