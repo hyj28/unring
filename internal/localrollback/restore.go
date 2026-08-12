@@ -79,32 +79,11 @@ func Restore(stateDir, sessionID string, selections []string, force bool) ([]Res
 	}
 	selected = orderRestoreChanges(selected)
 	rootDirectory := filepath.Join(stateDir, "snapshots", value.SessionID)
-	results := make([]RestoreResult, 0, len(selected))
 	platform := currentSnapshotPlatform()
-	for _, change := range selected {
-		if change.UnrestorableReason != "" {
-			results = append(results, RestoreResult{
-				Path: change.Path, Status: "unavailable",
-				Err: fmt.Errorf("path was outside snapshot coverage: %s", change.UnrestorableReason),
-			})
-			continue
-		}
-		var result RestoreResult
-		switch change.RestoreSource {
-		case RestoreSourceVolume:
-			result = restoreVolumeOne(platform, value, change, force)
-		case RestoreSourceNone:
-			result = RestoreResult{
-				Path: change.Path, Status: "unavailable",
-				Err: errors.New("no volume snapshot was taken for this path in this session"),
-			}
-		default:
-			// Manifests written before restore-source tagging are clone-backed.
-			result = restoreOne(rootDirectory, value, change, force)
-		}
-		results = append(results, result)
-	}
-	return results, nil
+	return restoreSelection(platform, selected, force, func(change Change) RestoreResult {
+		// Manifests written before restore-source tagging are clone-backed.
+		return restoreOne(rootDirectory, value, change, force)
+	}), nil
 }
 
 // RestoreRecorded restores from an audit summary when available. It preserves
@@ -131,100 +110,168 @@ func RestoreRecorded(stateDir, sessionID string, summary Summary, selections []s
 	}
 	defer unlock()
 	platform := currentSnapshotPlatform()
-	value := manifest{SessionID: sessionID, Changes: summary.Changes, Backstop: summary.Backstop}
-	results := make([]RestoreResult, 0, len(selected))
-	for _, change := range selected {
-		switch {
-		case change.UnrestorableReason != "":
-			results = append(results, RestoreResult{
-				Path: change.Path, Status: "unavailable",
-				Err: fmt.Errorf("path was outside snapshot coverage: %s", change.UnrestorableReason),
-			})
-		case change.RestoreSource == RestoreSourceVolume:
-			results = append(results, restoreVolumeOne(platform, value, change, force))
-		case change.RestoreSource == RestoreSourceNone:
-			results = append(results, RestoreResult{
-				Path: change.Path, Status: "unavailable",
-				Err: errors.New("no volume snapshot was taken for this path in this session"),
-			})
-		default:
-			results = append(results, RestoreResult{
-				Path: change.Path, Status: "unavailable",
-				Err: errors.New("clone snapshot data was evicted; this path was not stored in the volume-snapshot restore layer"),
-			})
+	return restoreSelection(platform, selected, force, func(change Change) RestoreResult {
+		return RestoreResult{
+			Path: change.Path, Status: "unavailable",
+			Err: errors.New("clone snapshot data was evicted; this path was not stored in the volume-snapshot restore layer"),
 		}
-	}
-	return results, nil
+	}), nil
 }
 
-func restoreVolumeOne(platform VolumeSnapshotPlatform, value manifest, change Change, force bool) RestoreResult {
+type volumeRestorePlan struct {
+	change           Change
+	conflict         bool
+	possibleRestored bool
+}
+
+type mountedRestoreGroup struct {
+	snapshot VolumeSnapshot
+	indexes  []int
+	plans    []volumeRestorePlan
+}
+
+func restoreSelection(
+	platform VolumeSnapshotPlatform,
+	selected []Change,
+	force bool,
+	restoreClone func(Change) RestoreResult,
+) []RestoreResult {
+	results := make([]RestoreResult, len(selected))
+	groupsBySnapshot := make(map[VolumeSnapshot]*mountedRestoreGroup)
+	var groups []*mountedRestoreGroup
+	for index, change := range selected {
+		switch {
+		case change.UnrestorableReason != "":
+			results[index] = RestoreResult{
+				Path: change.Path, Status: "unavailable",
+				Err: fmt.Errorf("path was outside snapshot coverage: %s", change.UnrestorableReason),
+			}
+		case change.RestoreSource == RestoreSourceVolume:
+			plan, result, needsMount := prepareVolumeRestore(change, force)
+			if !needsMount {
+				results[index] = result
+				continue
+			}
+			snapshot := *change.VolumeSnapshot
+			group := groupsBySnapshot[snapshot]
+			if group == nil {
+				group = &mountedRestoreGroup{snapshot: snapshot}
+				groupsBySnapshot[snapshot] = group
+				groups = append(groups, group)
+			}
+			group.indexes = append(group.indexes, index)
+			group.plans = append(group.plans, plan)
+		case change.RestoreSource == RestoreSourceNone:
+			results[index] = RestoreResult{
+				Path: change.Path, Status: "unavailable",
+				Err: errors.New("no volume snapshot was taken for this path in this session"),
+			}
+		default:
+			results[index] = restoreClone(change)
+		}
+	}
+	for _, group := range groups {
+		restoreMountedGroup(platform, group, force, results)
+	}
+	return results
+}
+
+func prepareVolumeRestore(change Change, force bool) (volumeRestorePlan, RestoreResult, bool) {
 	result := RestoreResult{Path: change.Path}
 	if change.VolumeSnapshot == nil {
 		result.Status = "unavailable"
 		result.Err = errors.New("the session did not record which volume snapshot contains this path")
-		return result
+		return volumeRestorePlan{}, result, false
 	}
 	current, exists, err := currentEntry(change.Path)
 	if err != nil {
 		result.Status, result.Err = "error", err
-		return result
+		return volumeRestorePlan{}, result, false
 	}
 	if change.Before == nil && !exists {
 		result.Status = "already-restored"
-		return result
+		return volumeRestorePlan{}, result, false
 	}
 	conflict := !matchesExpected(current, exists, change.After)
 	possibleRestored := matchesRestoredMetadata(current, exists, change.Before)
 	if conflict && !possibleRestored && !force {
 		result.Status = "refused"
 		result.Err = errors.New("path changed after the session ended; snapshot-only restores cannot write a conflict sidecar without mounting the APFS snapshot")
-		return result
-	}
-	volume := Volume{
-		ID: change.VolumeSnapshot.VolumeID, MountPoint: change.VolumeSnapshot.MountPoint,
-		Filesystem: "apfs",
-	}
-	names, err := platform.ListSnapshots(volume)
-	if err != nil {
-		result.Status = "unavailable"
-		result.Err = fmt.Errorf("could not verify volume snapshot %s before restore: %w", change.VolumeSnapshot.Name, err)
-		return result
-	}
-	present := false
-	for _, name := range names {
-		if name == change.VolumeSnapshot.Name {
-			present = true
-			break
-		}
-	}
-	if !present {
-		result.Status = "unavailable"
-		result.Err = fmt.Errorf("volume snapshot %s is no longer present; it was purged or deleted", change.VolumeSnapshot.Name)
-		return result
+		return volumeRestorePlan{}, result, false
 	}
 
 	if change.Kind == "created" {
 		if exists {
 			if err := os.Remove(change.Path); err != nil {
 				result.Status, result.Err = "error", err
-				return result
+				return volumeRestorePlan{}, result, false
 			}
 		}
 		result.Status = "restored"
-		return result
+		return volumeRestorePlan{}, result, false
+	}
+	return volumeRestorePlan{
+		change: change, conflict: conflict, possibleRestored: possibleRestored,
+	}, RestoreResult{}, true
+}
+
+func restoreMountedGroup(platform VolumeSnapshotPlatform, group *mountedRestoreGroup, force bool, results []RestoreResult) {
+	volume := Volume{
+		ID: group.snapshot.VolumeID, MountPoint: group.snapshot.MountPoint,
+		Filesystem: "apfs",
+	}
+	names, err := platform.ListSnapshots(volume)
+	if err != nil {
+		setMountedGroupError(group, results, "unavailable",
+			fmt.Errorf("could not verify volume snapshot %s before restore: %w", group.snapshot.Name, err))
+		return
+	}
+	present := false
+	for _, name := range names {
+		if name == group.snapshot.Name {
+			present = true
+			break
+		}
+	}
+	if !present {
+		setMountedGroupError(group, results, "unavailable",
+			fmt.Errorf("volume snapshot %s is no longer present; it was purged or deleted", group.snapshot.Name))
+		return
 	}
 
 	mountPoint, err := os.MkdirTemp("", "unring-volume-snapshot-*")
 	if err != nil {
-		result.Status, result.Err = "error", err
-		return result
+		setMountedGroupError(group, results, "error", err)
+		return
 	}
 	defer os.Remove(mountPoint)
-	if err := platform.MountSnapshot(*change.VolumeSnapshot, mountPoint); err != nil {
-		result.Status = "error"
-		result.Err = fmt.Errorf("mount volume snapshot %s with root privileges: %w", change.VolumeSnapshot.Name, err)
-		return result
+	if err := platform.MountSnapshot(group.snapshot, mountPoint); err != nil {
+		setMountedGroupError(group, results, "error",
+			fmt.Errorf("mount volume snapshot %s with root privileges: %w", group.snapshot.Name, err))
+		return
 	}
+	for planIndex, plan := range group.plans {
+		results[group.indexes[planIndex]] = restoreVolumeMounted(plan, mountPoint, force)
+	}
+	unmountErr := platform.UnmountSnapshot(mountPoint)
+	if unmountErr == nil {
+		return
+	}
+	for _, index := range group.indexes {
+		results[index].Status = "error"
+		results[index].Err = errors.Join(results[index].Err, wrapUnmountError(unmountErr))
+	}
+}
+
+func setMountedGroupError(group *mountedRestoreGroup, results []RestoreResult, status string, err error) {
+	for planIndex, index := range group.indexes {
+		results[index] = RestoreResult{Path: group.plans[planIndex].change.Path, Status: status, Err: err}
+	}
+}
+
+func restoreVolumeMounted(plan volumeRestorePlan, mountPoint string, force bool) RestoreResult {
+	change := plan.change
+	result := RestoreResult{Path: change.Path}
 	snapshotSourcePath := change.Path
 	if change.VolumeSnapshotPath != "" {
 		snapshotSourcePath = change.VolumeSnapshotPath
@@ -240,20 +287,14 @@ func restoreVolumeOne(platform VolumeSnapshotPlatform, value manifest, change Ch
 		err = validateMountedSnapshotObject(snapshotPath, change.Before)
 	}
 	refusedAfterMount := false
-	if err == nil && possibleRestored {
+	if err == nil && plan.possibleRestored {
 		var matches bool
 		matches, err = pathMatchesMountedBefore(snapshotPath, change.Path, change.Before)
 		if err == nil && matches {
-			unmountErr := platform.UnmountSnapshot(mountPoint)
-			if unmountErr != nil {
-				result.Status = "error"
-				result.Err = wrapUnmountError(unmountErr)
-				return result
-			}
 			result.Status = "already-restored"
 			return result
 		}
-		if err == nil && conflict && !force {
+		if err == nil && plan.conflict && !force {
 			err = errors.New("path changed after the session ended; not overwritten")
 			refusedAfterMount = true
 		}
@@ -261,13 +302,12 @@ func restoreVolumeOne(platform VolumeSnapshotPlatform, value manifest, change Ch
 	if err == nil {
 		err = restoreMountedSnapshotObject(snapshotPath, change.Path, change.Before)
 	}
-	unmountErr := platform.UnmountSnapshot(mountPoint)
-	if err != nil || unmountErr != nil {
+	if err != nil {
 		result.Status = "error"
-		if refusedAfterMount && unmountErr == nil {
+		if refusedAfterMount {
 			result.Status = "refused"
 		}
-		result.Err = errors.Join(err, wrapUnmountError(unmountErr))
+		result.Err = err
 		return result
 	}
 	result.Status = "restored"

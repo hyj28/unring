@@ -94,8 +94,8 @@ exclude:
 If an exclusion completely covers a path named by `--watch`, `--watch-only`, or the config
 `watch` list, unring names that path as not snapshotted instead of silently dropping it.
 Missing default directories are ignored because the user did not choose them. A missing
-path named by `--watch`, `--watch-only`, or `config.yaml` is reported before the child
-starts without preventing the session from running.
+path named by `--watch`, `--watch-only`, or the config `watch` list is a hard preflight
+error: the child does not start, and a `not_started` audit record names the path and reason.
 
 Two limits are worth knowing before relying on the scan. Data protected by macOS privacy
 controls — the Photos library, for instance — cannot be read by unring at all, so adding
@@ -116,7 +116,8 @@ After the child exits, inspect and restore file changes at any later time:
 ```sh
 unring restore <session-id>                  # list created, modified, deleted paths
 unring restore <session-id> path/to/file     # restore selected paths
-unring restore --all <session-id>            # restore all covered paths; report unavailable ones
+unring restore --all <session-id>            # restore covered paths except agent own-state
+unring restore --all --include-agent-state <session-id>
 unring restore --force <session-id> path     # explicitly overwrite a conflict
 unring snapshots                             # inspect clone usage and APFS backstop presence
 ```
@@ -138,6 +139,16 @@ report and enforce the same cap. `UNRING_SNAPSHOT_CAP_BYTES` supplies the initia
 state directory that has no persisted value; the first run persists that effective value.
 Where a filesystem cannot expose allocation changes cheaply, unring labels the figure as
 an upper bound and does not evict snapshots based on that estimate.
+
+Snapshot-only paths from the same recorded APFS snapshot are restored under one read-only
+mount per command, with one unmount after every selected path has been attempted. The
+declared agent-own-state roots are `~/.claude`, `~/.codex`, `~/.config/opencode`,
+`~/.local/share/opencode`, and `~/.cache/opencode`. Their changes remain in live output,
+the manifest, and stored listings under a separate label. `restore --all` names and skips
+them by default because rolling back an active agent's transcript or session state can be
+harmful; restore one explicitly by path or use `--include-agent-state` with `--all`.
+Unsupported special files such as Unix sockets also remain recorded, but render as an
+informational file-type note rather than as an actionable `FILE NOT SNAPSHOTTED` alarm.
 
 If this task needs PostgreSQL coverage, point `DATABASE_URL` at the real development
 database first:

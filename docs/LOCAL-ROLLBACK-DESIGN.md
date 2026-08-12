@@ -268,7 +268,7 @@ is expected to be inside it. See §8.8 — this was not verified.
 | 14 | The **change list scans wider than the clone**: the home directory minus `~/Library`, `node_modules`, `.git`, `.cache` and `go/pkg` — 340,595 files, ~5.6 s |
 | 15 | **Do not copy changed files out of the snapshot** at session end. Restoring from the snapshot requires `sudo`, and the purge risk is accepted rather than engineered around |
 | 16 | The **default clone scope is unchanged**. A config file at the state directory adds paths; `--watch` becomes **additive** and `--watch-only` takes over today's replacing behaviour |
-| 17 | A **default** path that does not exist is skipped silently; a path the user named explicitly and that does not exist is **reported**. The first is not the user's intent, the second is |
+| 17 | A **default** path that does not exist is skipped silently. This decision originally allowed an explicitly named missing path to run after being **reported**; the end-to-end finding recorded in §8.9 overturned that half. A missing config `watch`, `--watch`, or `--watch-only` path is now a hard preflight refusal, recorded as `not_started`, and the child does not start |
 | 18 | When the backstop is unavailable — no Time Machine, an excluded path, or Linux — **say so prominently and keep running**. Do not refuse to start |
 
 Decision 16 changes `--watch` because the current semantics is the failure this project
@@ -300,7 +300,7 @@ needs to be honest rather than approximate.
 - **Linux.** It has neither `clonefile` nor an equivalent backstop, so its protection is a
   tier below macOS. The documentation must say so plainly.
 
-### 8.9 Two more times measurement overturned reasoning
+### 8.9 Three more times measurement overturned reasoning
 
 Continuing the list in §7:
 
@@ -311,3 +311,8 @@ Continuing the list in §7:
    shallow uniform tree that was already hot in the page cache. Measured on the real home
    directory: **27 seconds**, a fourfold error — and the same mistake as §7's item 3, made
    again on a different quantity.
+6. "Reporting a missing explicitly watched path is enough." In a real session the warning
+   used the same alarm prefix as routine Unix-socket limitations, the child ran, and the
+   requested protection was absent. Reporting alone was indistinguishable from routine
+   noise. Explicitly named missing paths now refuse startup and leave a `not_started` audit
+   record naming the path and reason; missing default roots remain silent.

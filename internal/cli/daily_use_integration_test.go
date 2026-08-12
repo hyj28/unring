@@ -343,22 +343,28 @@ func TestRestoreRefusesAWatchRootRetargetEvenWithForce(t *testing.T) {
 	}
 }
 
-func TestMissingWatchedRootIsReportedAtStartAndInAudit(t *testing.T) {
+func TestMissingWatchedRootRefusesStartupAndIsRecordedInAudit(t *testing.T) {
 	stateDir := t.TempDir()
 	missing := filepath.Join(t.TempDir(), "Dcouments")
+	marker := filepath.Join(t.TempDir(), "child-ran")
 	t.Setenv("DATABASE_URL", "")
 	t.Setenv("UNRING_STATE_DIR", stateDir)
 	binary := buildTestBinary(t)
-	command := exec.Command(binary, "run", "--watch-only", missing, "--", "/usr/bin/true")
+	command := exec.Command(binary, "run", "--watch-only", missing, "--",
+		"/bin/sh", "-c", `printf ran > "$1"`, "unring-test", marker)
 	command.Env = os.Environ()
 	output, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("missing-watch run: %v\n%s", err, output)
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() != usageExitCode {
+		t.Fatalf("missing-watch exit = %v, want %d\n%s", err, usageExitCode, output)
 	}
-	for _, want := range []string{"FILE NOT SNAPSHOTTED", missing, "does not exist"} {
+	for _, want := range []string{missing, "does not exist"} {
 		if !strings.Contains(string(output), want) {
-			t.Fatalf("missing root warning omitted %q:\n%s", want, output)
+			t.Fatalf("missing root refusal omitted %q:\n%s", want, output)
 		}
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing watched root launched child: %v", err)
 	}
 	logCommand := exec.Command(binary, "log", "--json", newestSessionID(t, binary))
 	logCommand.Env = os.Environ()
@@ -366,7 +372,10 @@ func TestMissingWatchedRootIsReportedAtStartAndInAudit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("missing-watch audit: %v\n%s", err, logOutput)
 	}
-	for _, want := range []string{`"path": "` + missing + `"`, `"error": "watched path does not exist"`} {
+	for _, want := range []string{
+		`"outcome": "not_started"`, `"path": "` + missing + `"`,
+		`"error": "watched path does not exist"`,
+	} {
 		if !strings.Contains(string(logOutput), want) {
 			t.Fatalf("missing root audit omitted %q:\n%s", want, logOutput)
 		}
@@ -533,7 +542,7 @@ func TestConfigurableSnapshotScopeThroughCLI(t *testing.T) {
 		}
 	})
 
-	t.Run("missing defaults are silent and missing explicit paths are reported on stderr", func(t *testing.T) {
+	t.Run("missing defaults are silent and missing explicit paths refuse startup", func(t *testing.T) {
 		project := makeProject(t)
 		stateDir := t.TempDir()
 		t.Setenv("UNRING_STATE_DIR", stateDir)
@@ -547,19 +556,19 @@ func TestConfigurableSnapshotScopeThroughCLI(t *testing.T) {
 
 		for _, test := range []struct {
 			name string
-			args func(string) []string
+			args func(string, string) []string
 		}{
-			{name: "watch", args: func(path string) []string {
-				return []string{"run", "--watch", path, "--", "/usr/bin/true"}
+			{name: "watch", args: func(path, marker string) []string {
+				return []string{"run", "--watch", path, "--", "/bin/sh", "-c", `printf ran > "$1"`, "unring-test", marker}
 			}},
-			{name: "watch-only", args: func(path string) []string {
-				return []string{"run", "--watch-only", path, "--", "/usr/bin/true"}
+			{name: "watch-only", args: func(path, marker string) []string {
+				return []string{"run", "--watch-only", path, "--", "/bin/sh", "-c", `printf ran > "$1"`, "unring-test", marker}
 			}},
-			{name: "config", args: func(path string) []string {
+			{name: "config", args: func(path, marker string) []string {
 				if err := os.WriteFile(filepath.Join(stateDir, "config.yaml"), []byte("watch:\n  - "+path+"\n"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				return []string{"run", "--", "/usr/bin/true"}
+				return []string{"run", "--", "/bin/sh", "-c", `printf ran > "$1"`, "unring-test", marker}
 			}},
 		} {
 			t.Run(test.name, func(t *testing.T) {
@@ -567,14 +576,19 @@ func TestConfigurableSnapshotScopeThroughCLI(t *testing.T) {
 					t.Fatal(err)
 				}
 				missing := filepath.Join(t.TempDir(), "missing-explicit")
-				stdout, stderr, err := run(t, project, test.args(missing)...)
-				if err != nil {
-					t.Fatalf("missing explicit path was fatal: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+				marker := filepath.Join(t.TempDir(), "child-ran")
+				stdout, stderr, err := run(t, project, test.args(missing, marker)...)
+				var exitError *exec.ExitError
+				if !errors.As(err, &exitError) || exitError.ExitCode() != usageExitCode {
+					t.Fatalf("missing explicit path exit = %v, want %d\nstdout: %s\nstderr: %s", err, usageExitCode, stdout, stderr)
 				}
-				for _, want := range []string{"FILE NOT SNAPSHOTTED", missing, "does not exist"} {
+				for _, want := range []string{missing, "does not exist"} {
 					if !strings.Contains(stderr, want) {
-						t.Fatalf("missing explicit warning omitted %q: %s", want, stderr)
+						t.Fatalf("missing explicit refusal omitted %q: %s", want, stderr)
 					}
+				}
+				if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("missing explicit path launched child: %v", err)
 				}
 			})
 		}

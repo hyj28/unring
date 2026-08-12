@@ -58,6 +58,25 @@ func IsScopeConfigError(err error) bool {
 	return errors.As(err, &configErr)
 }
 
+type scopePreflightError struct {
+	failures []CaptureFailure
+}
+
+func (err *scopePreflightError) Error() string {
+	return formatFailures("explicitly watched paths are unavailable", err.failures)
+}
+
+// ScopePreflightFailures returns the explicit watched paths that made scope
+// resolution refuse to start. The returned failures are detached from the
+// error and are suitable for the durable audit record.
+func ScopePreflightFailures(err error) []CaptureFailure {
+	var preflightErr *scopePreflightError
+	if !errors.As(err, &preflightErr) {
+		return nil
+	}
+	return append([]CaptureFailure(nil), preflightErr.failures...)
+}
+
 type scopeEnvironmentError struct {
 	err error
 }
@@ -146,6 +165,17 @@ func ResolveScope(options ScopeOptions) (Scope, error) {
 	explicit, err = absoluteUniquePaths(explicit)
 	if err != nil {
 		return Scope{}, fmt.Errorf("resolve explicitly watched paths: %w", err)
+	}
+	var missingExplicit []CaptureFailure
+	for _, path := range explicit {
+		if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
+			missingExplicit = append(missingExplicit, CaptureFailure{
+				Path: path, Error: "watched path does not exist",
+			})
+		}
+	}
+	if len(missingExplicit) > 0 {
+		return Scope{}, &scopeConfigError{err: &scopePreflightError{failures: missingExplicit}}
 	}
 	var uncaptured []CaptureFailure
 	for _, path := range explicit {

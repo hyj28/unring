@@ -199,16 +199,41 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		fmt.Fprintf(stderr, "unring: find working directory for file snapshot: %v\n", err)
 		return internalErrorExitCode
 	}
+	auditSession, err := auditStore.Begin(command, time.Now())
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: begin audit log: %v\n", err)
+		return internalErrorExitCode
+	}
+	auditRecord := auditSession.Snapshot()
 	scope, err := localrollback.ResolveScope(localrollback.ScopeOptions{
 		StateDir: auditStore.StateDir(), WorkingDirectory: workingDirectory,
 		Watch: watched, WatchOnly: watchedOnly,
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "unring: choose file snapshot scope: %v\n", err)
+		exitCode := internalErrorExitCode
 		if localrollback.IsScopeConfigError(err) {
-			return usageExitCode
+			exitCode = usageExitCode
 		}
-		return internalErrorExitCode
+		failures := localrollback.ScopePreflightFailures(err)
+		watchedPaths := make([]string, 0, len(failures))
+		for _, failure := range failures {
+			watchedPaths = append(watchedPaths, failure.Path)
+		}
+		if updateErr := auditSession.Update(func(record *audit.Record) {
+			record.Files = localrollback.Summary{
+				Watched: watchedPaths, Uncaptured: failures, Complete: false,
+				Error: err.Error(), Retained: false,
+			}
+			record.EndedAt = time.Now().UTC()
+			record.ExitCode = exitCode
+			record.Error = err.Error()
+			record.Outcome = "not_started"
+			record.Outbound = *outboundEnabled
+		}); updateErr != nil {
+			fmt.Fprintf(stderr, "unring: record preflight refusal: %v\n", updateErr)
+		}
+		fmt.Fprintf(stderr, "unring: choose file snapshot scope: %v\n", err)
+		return exitCode
 	}
 	watchPaths := scope.Watched
 	if capBytes < 0 {
@@ -222,12 +247,6 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		fmt.Fprintf(stderr, "unring: save snapshot retention cap: %v\n", err)
 		return internalErrorExitCode
 	}
-	auditSession, err := auditStore.Begin(command, time.Now())
-	if err != nil {
-		fmt.Fprintf(stderr, "unring: begin audit log: %v\n", err)
-		return internalErrorExitCode
-	}
-	auditRecord := auditSession.Snapshot()
 	if scope.ScanRoot != "" && os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") == "" {
 		fmt.Fprintf(stderr,
 			"unring: scanning %s for the widened change list; this metadata scan may take several seconds and excludes %s.\n",
@@ -588,7 +607,11 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		}
 	}
 	if !fileSummary.Complete {
-		fmt.Fprintf(stderr, "unring: FILE COVERAGE INCOMPLETE: %s\n", fileSummary.Error)
+		if hasActionableFileCoverageFailure(fileSummary) {
+			fmt.Fprintf(stderr, "unring: FILE COVERAGE INCOMPLETE: %s\n", fileSummary.Error)
+		} else {
+			fmt.Fprintln(stderr, "unring: FILE COVERAGE NOTE: unsupported file types remain recorded but cannot be restored per path.")
+		}
 	}
 	printFileChanges(stdout, auditRecord.ID, fileSummary)
 	if err := auditSession.Update(func(record *audit.Record) { record.Files = fileSummary }); err != nil {
@@ -873,7 +896,7 @@ func printSnapshotStarted(output io.Writer, summary localrollback.Summary) {
 			summary.CopiedBytes)
 	}
 	for _, failure := range summary.Uncaptured {
-		fmt.Fprintf(output, "unring: FILE NOT SNAPSHOTTED: %s: %s\n", failure.Path, failure.Error)
+		printCaptureFailure(output, "unring: ", failure)
 	}
 	for _, failure := range summary.ScanFailures {
 		fmt.Fprintf(output, "unring: CHANGE-LIST SCAN INCOMPLETE: %s: %s\n", failure.Path, failure.Error)
@@ -973,13 +996,11 @@ func printFileChanges(output io.Writer, sessionID string, summary localrollback.
 	fmt.Fprintf(output,
 		"Files changed: %d created, %d modified, %d deleted. No file decision is needed now.\n",
 		created, modified, deleted)
-	for _, change := range summary.Changes {
-		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
-		if change.RestoreSource == localrollback.RestoreSourceVolume {
-			fmt.Fprintln(output, "             SNAPSHOT ONLY: restoring this path requires sudo to mount the APFS snapshot.")
-		} else if change.UnrestorableReason != "" {
-			fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
-		}
+	regular, agentState := groupAgentStateChanges(summary.Changes)
+	printLiveChanges(output, regular)
+	if len(agentState) > 0 {
+		fmt.Fprintln(output, "AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
+		printLiveChanges(output, agentState)
 	}
 	if summary.Retained && hasRestorableFileChange(summary.Changes) {
 		fmt.Fprintf(output, "Restore later with: unring restore %s\n", sessionID)
@@ -987,6 +1008,17 @@ func printFileChanges(output io.Writer, sessionID string, summary localrollback.
 		fmt.Fprintln(output, "No changed path has restorable snapshot data.")
 	} else {
 		fmt.Fprintln(output, "Snapshot data is no longer retained; these paths cannot be restored from this session.")
+	}
+}
+
+func printLiveChanges(output io.Writer, changes []localrollback.Change) {
+	for _, change := range changes {
+		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
+		if change.RestoreSource == localrollback.RestoreSourceVolume {
+			fmt.Fprintln(output, "             SNAPSHOT ONLY: restoring this path requires sudo to mount the APFS snapshot.")
+		} else if change.UnrestorableReason != "" {
+			fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
+		}
 	}
 }
 
@@ -1002,7 +1034,7 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 	fmt.Fprintf(output, "  Snapshot: %s; %d %s (%d logical); retained: %t\n",
 		summary.Storage, summary.StorageBytes, storageLabel, summary.LogicalBytes, summary.Retained)
 	for _, failure := range summary.Uncaptured {
-		fmt.Fprintf(output, "  NOT SNAPSHOTTED: %s: %s\n", failure.Path, failure.Error)
+		printCaptureFailure(output, "  ", failure)
 	}
 	if summary.Backstop.Available {
 		for _, snapshot := range summary.Backstop.Snapshots {
@@ -1023,7 +1055,40 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 			summary.ScanBeforeFiles, summary.ScanBeforeMillis,
 			summary.ScanAfterFiles, summary.ScanAfterMillis)
 	}
-	for _, change := range summary.Changes {
+	regular, agentState := groupAgentStateChanges(summary.Changes)
+	printStoredChanges(output, regular)
+	if len(agentState) > 0 {
+		fmt.Fprintln(output, "  AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
+		printStoredChanges(output, agentState)
+	}
+	if summary.Error != "" {
+		if hasActionableFileCoverageFailure(summary) {
+			fmt.Fprintf(output, "  INCOMPLETE: %s\n", summary.Error)
+		} else {
+			fmt.Fprintf(output, "  Coverage note: %s\n", summary.Error)
+		}
+	}
+}
+
+func printCaptureFailure(output io.Writer, prefix string, failure localrollback.CaptureFailure) {
+	if localrollback.IsUnsupportedFileTypeFailure(failure) {
+		fmt.Fprintf(output, "%sUNSUPPORTED FILE TYPE (informational): %s: %s\n", prefix, failure.Path, failure.Error)
+		return
+	}
+	fmt.Fprintf(output, "%sFILE NOT SNAPSHOTTED: %s: %s\n", prefix, failure.Path, failure.Error)
+}
+
+func hasActionableFileCoverageFailure(summary localrollback.Summary) bool {
+	for _, failure := range summary.Uncaptured {
+		if !localrollback.IsUnsupportedFileTypeFailure(failure) {
+			return true
+		}
+	}
+	return len(summary.ScanFailures) > 0
+}
+
+func printStoredChanges(output io.Writer, changes []localrollback.Change) {
+	for _, change := range changes {
 		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
 		if change.RestoreSource == localrollback.RestoreSourceVolume {
 			fmt.Fprintln(output, "             SNAPSHOT ONLY: requires sudo to mount the APFS snapshot")
@@ -1031,9 +1096,23 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 			fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
 		}
 	}
-	if summary.Error != "" {
-		fmt.Fprintf(output, "  INCOMPLETE: %s\n", summary.Error)
+}
+
+func groupAgentStateChanges(changes []localrollback.Change) ([]localrollback.Change, []localrollback.Change) {
+	regular := make([]localrollback.Change, 0, len(changes))
+	agentState := make([]localrollback.Change, 0)
+	for _, change := range changes {
+		if isAgentStateChange(change) {
+			agentState = append(agentState, change)
+		} else {
+			regular = append(regular, change)
+		}
 	}
+	return regular, agentState
+}
+
+func isAgentStateChange(change localrollback.Change) bool {
+	return localrollback.IsAgentStatePath(change.Path, "")
 }
 
 func printOutboundDisabled(output io.Writer) {
@@ -1338,6 +1417,7 @@ func writeJSON(stdout, stderr io.Writer, value any) int {
 func restoreCommand(args []string, stdout, stderr io.Writer) int {
 	force := false
 	restoreAll := false
+	includeAgentState := false
 	var sessionID string
 	var selections []string
 	for index := 0; index < len(args); index++ {
@@ -1346,6 +1426,8 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 			force = true
 		case "--all":
 			restoreAll = true
+		case "--include-agent-state":
+			includeAgentState = true
 		case "--path":
 			index++
 			if index >= len(args) {
@@ -1354,7 +1436,7 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 			}
 			selections = append(selections, args[index])
 		case "-h", "--help":
-			fmt.Fprintln(stdout, "Usage: unring restore [--force] [--all] <session-id> [changed-path ...]")
+			fmt.Fprintln(stdout, "Usage: unring restore [--force] [--all [--include-agent-state]] <session-id> [changed-path ...]")
 			fmt.Fprintln(stdout, "With no changed paths, list the files available to restore.")
 			return 0
 		case "--":
@@ -1373,7 +1455,11 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	if sessionID == "" {
-		fmt.Fprintln(stderr, "Usage: unring restore [--force] [--all] <session-id> [changed-path ...]")
+		fmt.Fprintln(stderr, "Usage: unring restore [--force] [--all [--include-agent-state]] <session-id> [changed-path ...]")
+		return usageExitCode
+	}
+	if includeAgentState && !restoreAll {
+		fmt.Fprintln(stderr, "unring: --include-agent-state requires --all")
 		return usageExitCode
 	}
 	store, err := audit.OpenStore()
@@ -1402,8 +1488,20 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "unring: --all cannot be combined with selected paths")
 			return usageExitCode
 		}
+		var skippedAgentState []localrollback.Change
 		for _, change := range record.Files.Changes {
+			if !includeAgentState && isAgentStateChange(change) {
+				skippedAgentState = append(skippedAgentState, change)
+				continue
+			}
 			selections = append(selections, change.Path)
+		}
+		if len(skippedAgentState) > 0 {
+			fmt.Fprintln(stdout, "Skipped agent own-state paths; restore --all excludes them by default:")
+			for _, change := range skippedAgentState {
+				fmt.Fprintf(stdout, "  skipped  %s\n", change.Path)
+			}
+			fmt.Fprintf(stdout, "Include them with: unring restore --all --include-agent-state %s\n", record.ID)
 		}
 	}
 	selectedChanges, err := localrollback.ChangesForRestore(record.Files.Changes, selections)
@@ -1538,13 +1636,26 @@ func snapshotsCommand(args []string, stdout, stderr io.Writer) int {
 func printRestoreListing(output io.Writer, record audit.Record) {
 	fmt.Fprintf(output, "UNRING FILE CHANGES %s\n", record.ID)
 	printStoredChangeListLimitation(output, record.Files, "  ", true)
-	for _, change := range record.Files.Changes {
+	regular, agentState := groupAgentStateChanges(record.Files.Changes)
+	for _, change := range regular {
 		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
 		if change.RestoreSource == localrollback.RestoreSourceVolume {
 			fmt.Fprintln(output, "             SNAPSHOT ONLY: restore requires sudo because APFS snapshot mounting is root-only")
 		} else if change.UnrestorableReason != "" {
 			fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
 		}
+	}
+	if len(agentState) > 0 {
+		fmt.Fprintln(output, "AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
+		for _, change := range agentState {
+			fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
+			if change.RestoreSource == localrollback.RestoreSourceVolume {
+				fmt.Fprintln(output, "             SNAPSHOT ONLY: restore requires sudo because APFS snapshot mounting is root-only")
+			} else if change.UnrestorableReason != "" {
+				fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
+			}
+		}
+		fmt.Fprintf(output, "Include this group with: unring restore --all --include-agent-state %s\n", record.ID)
 	}
 	if !record.Files.Retained {
 		if hasVolumeRestorableFileChange(record.Files.Changes) {
@@ -1557,7 +1668,7 @@ func printRestoreListing(output io.Writer, record audit.Record) {
 	}
 	if hasRestorableFileChange(record.Files.Changes) {
 		fmt.Fprintf(output, "Restore selected paths with: unring restore %s <path> [...]\n", record.ID)
-		fmt.Fprintf(output, "Restore every restorable path with: unring restore --all %s\n", record.ID)
+		fmt.Fprintf(output, "Restore every restorable path except agent own-state with: unring restore --all %s\n", record.ID)
 	} else {
 		fmt.Fprintln(output, "No changed path has restorable snapshot data.")
 	}
@@ -2271,7 +2382,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "Usage:")
 	fmt.Fprintln(output, "  unring run [--commit | --discard] [--outbound] [--watch path | --watch-only path] -- <command> [args...]")
 	fmt.Fprintln(output, "  unring log [--json] [session-id]")
-	fmt.Fprintln(output, "  unring restore [--force] [--all] <session-id> [changed-path ...]")
+	fmt.Fprintln(output, "  unring restore [--force] [--all [--include-agent-state]] <session-id> [changed-path ...]")
 	fmt.Fprintln(output, "  unring snapshots")
 	fmt.Fprintln(output, "  unring <command-on-PATH> [--] [args...]")
 	fmt.Fprintln(output, "  unring claude|codex|opencode [--] [args...]")

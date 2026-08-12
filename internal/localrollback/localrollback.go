@@ -24,6 +24,9 @@ const (
 	RestoreSourceClone          = "clone"
 	RestoreSourceVolume         = "volume-snapshot"
 	RestoreSourceNone           = "none"
+	// UnsupportedFileTypeCoverageReason is retained for special files such as
+	// Unix sockets that cannot be restored meaningfully per path.
+	UnsupportedFileTypeCoverageReason = "unsupported file type is outside snapshot coverage"
 )
 
 // Entry is the metadata used to detect a file change and a later restore conflict.
@@ -41,6 +44,12 @@ type Entry struct {
 type CaptureFailure struct {
 	Path  string `json:"path"`
 	Error string `json:"error"`
+}
+
+// IsUnsupportedFileTypeFailure identifies the declared informational coverage
+// class for special files that cannot be restored meaningfully per path.
+func IsUnsupportedFileTypeFailure(failure CaptureFailure) bool {
+	return strings.HasPrefix(failure.Error, "unsupported file type")
 }
 
 // Change is one created, modified, or deleted path.
@@ -810,7 +819,7 @@ func coverageFailures(entries map[string]Entry, alreadyUncaptured map[string]str
 		}
 		switch {
 		case entry.Type == "other":
-			failures = append(failures, CaptureFailure{Path: path, Error: "unsupported file type is outside snapshot coverage"})
+			failures = append(failures, CaptureFailure{Path: path, Error: UnsupportedFileTypeCoverageReason})
 		case entry.Type == "file" && entry.Links > 1:
 			failures = append(failures, CaptureFailure{Path: path, Error: "hard-linked files are outside snapshot coverage; restoring one path could silently break the link group"})
 		case entry.Type == "symlink":
@@ -1028,7 +1037,7 @@ func reconcileCapture(
 		}
 		switch {
 		case beforeEntry.Type == "other":
-			failures = append(failures, CaptureFailure{Path: path, Error: "unsupported file type is outside snapshot coverage"})
+			failures = append(failures, CaptureFailure{Path: path, Error: UnsupportedFileTypeCoverageReason})
 			failed[path] = true
 		case beforeEntry.Type == "file" && beforeEntry.Links > 1:
 			failures = append(failures, CaptureFailure{Path: path, Error: "hard-linked files are outside snapshot coverage; restoring one path could silently break the link group"})
