@@ -34,6 +34,7 @@ type ScopeOptions struct {
 // and explicit watches that those exclusions prevent from being captured.
 type Scope struct {
 	Watched           []string
+	AgentStateRoots   []string
 	Excluded          []string
 	Uncaptured        []CaptureFailure
 	ChangeListScope   string
@@ -229,6 +230,7 @@ func ResolveScope(options ScopeOptions) (Scope, error) {
 	}
 	return Scope{
 		Watched: filtered, Excluded: excluded, Uncaptured: uncaptured,
+		AgentStateRoots: AgentStateRoots(homeDirectory),
 		ChangeListScope: changeListScope, ChangeListRoots: changeListRoots,
 		ScanRoot: scanRoot, ScanExcluded: scanExcluded,
 		ScanExcludedNames: scanExcludedNames,

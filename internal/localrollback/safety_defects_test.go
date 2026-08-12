@@ -1,6 +1,7 @@
 package localrollback
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,22 +68,83 @@ func TestRestoreRecordedContinuesAfterMountedPathFailureAndUnmounts(t *testing.T
 	}
 }
 
-func TestRestoreRecordedWithoutVolumePathsDoesNotMount(t *testing.T) {
+func TestRestoreRecordedCreatedVolumePathDoesNotMount(t *testing.T) {
 	platform := &fakeVolumeSnapshotPlatform{created: true, present: true, excluded: map[string]bool{}}
 	restorePlatform := SetVolumeSnapshotPlatformForTest(platform)
 	defer restorePlatform()
-	path := filepath.Join(t.TempDir(), "evicted.txt")
-	change := Change{Kind: "created", Path: path, RestoreSource: RestoreSourceClone}
-
-	results, err := RestoreRecorded(t.TempDir(), "clone-only-selection", Summary{Changes: []Change{change}}, []string{path}, false)
+	path := filepath.Join(t.TempDir(), "created.txt")
+	if err := os.WriteFile(path, []byte("created during session"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	after, _, err := currentEntry(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].Status != "unavailable" {
-		t.Fatalf("restore results = %#v, want one unavailable clone path", results)
+	change := Change{
+		Kind: "created", Path: path, After: &after, RestoreSource: RestoreSourceVolume,
+		VolumeSnapshot: &VolumeSnapshot{
+			Name:     "com.apple.TimeMachine.2026-08-09-120000.local",
+			VolumeID: "disk-test-apfs", MountPoint: "/",
+		},
+	}
+
+	results, err := RestoreRecorded(t.TempDir(), "created-volume-selection", Summary{Changes: []Change{change}}, []string{path}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Status != "restored" {
+		t.Fatalf("restore results = %#v, want one restored created path", results)
 	}
 	if platform.mountCalls != 0 || platform.unmountCalls != 0 {
 		t.Fatalf("mount/unmount calls = %d/%d, want literal 0/0", platform.mountCalls, platform.unmountCalls)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("created volume path remains after restore: %v", err)
+	}
+}
+
+func TestCompletenessIsInformationalOnlyForExactUnsupportedFailures(t *testing.T) {
+	unsupported := CaptureFailure{Path: "/tmp/agent.sock", Error: UnsupportedFileTypeCoverageReason}
+	unsupportedError := "post-session coverage incomplete: /tmp/agent.sock: unsupported file type is outside snapshot coverage"
+	if !HasOnlyUnsupportedFileTypeFailures(Summary{
+		Complete: false, Uncaptured: []CaptureFailure{unsupported}, Error: unsupportedError,
+	}) {
+		t.Fatal("exact unsupported-only failure was not classified as informational")
+	}
+	for _, summary := range []Summary{
+		{Complete: false, Uncaptured: []CaptureFailure{unsupported}, Error: unsupportedError + "; write manifest: no space left on device"},
+		{Complete: false, Error: "measure retained snapshot: input/output error"},
+		{Complete: false, Uncaptured: []CaptureFailure{unsupported}, ScanFailures: []CaptureFailure{{Path: "/tmp", Error: "permission denied"}}, Error: unsupportedError},
+	} {
+		if HasOnlyUnsupportedFileTypeFailures(summary) {
+			t.Fatalf("actionable incomplete summary was classified informational: %#v", summary)
+		}
+	}
+}
+
+func TestAgentStateRootsResolveSymlinkedHome(t *testing.T) {
+	physicalHome := t.TempDir()
+	logicalHome := filepath.Join(t.TempDir(), "home")
+	if err := os.Symlink(physicalHome, logicalHome); err != nil {
+		t.Fatal(err)
+	}
+	resolvedHome, err := filepath.EvalSymlinks(physicalHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(resolvedHome, ".claude")
+	roots := AgentStateRoots(logicalHome)
+	found := false
+	for _, root := range roots {
+		if root == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("resolved agent roots = %#v, want root %q", roots, want)
+	}
+	if !IsAgentStatePathWithin(filepath.Join(want, "settings.json"), roots) {
+		t.Fatal("resolved agent-state path was not recognized")
 	}
 }
 

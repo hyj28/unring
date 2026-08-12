@@ -144,7 +144,10 @@ Snapshot-only paths from the same recorded APFS snapshot are restored under one 
 mount per command, with one unmount after every selected path has been attempted. The
 declared agent-own-state roots are `~/.claude`, `~/.codex`, `~/.config/opencode`,
 `~/.local/share/opencode`, and `~/.cache/opencode`. Their changes remain in live output,
-the manifest, and stored listings under a separate label. `restore --all` names and skips
+the manifest, and stored listings under a separate label. Their logical and physically
+resolved roots are persisted
+with the session, so later restores do not depend on the restoring process's `HOME`.
+`restore --all` names and skips
 them by default because rolling back an active agent's transcript or session state can be
 harmful; restore one explicitly by path or use `--include-agent-state` with `--all`.
 Unsupported special files such as Unix sockets also remain recorded, but render as an

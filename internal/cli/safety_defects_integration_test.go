@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -43,6 +44,9 @@ func TestAgentOwnStateIsGroupedSkippedByAllAndExplicitlyRestorable(t *testing.T)
 	}
 
 	sessionID := newestSessionID(t, binary)
+	// The stored roots, not the restore process's environment, must control the
+	// safety grouping. Model sudo/env -i by changing HOME before every read.
+	t.Setenv("HOME", t.TempDir())
 	log := exec.Command(binary, "log", sessionID)
 	log.Env = os.Environ()
 	logOutput, err := log.CombinedOutput()
@@ -53,6 +57,16 @@ func TestAgentOwnStateIsGroupedSkippedByAllAndExplicitlyRestorable(t *testing.T)
 		if !strings.Contains(string(logOutput), want) {
 			t.Fatalf("stored listing omitted %q:\n%s", want, logOutput)
 		}
+	}
+	jsonLog := exec.Command(binary, "log", "--json", sessionID)
+	jsonLog.Env = os.Environ()
+	jsonOutput, err := jsonLog.CombinedOutput()
+	if err != nil {
+		t.Fatalf("stored agent-state roots: %v\n%s", err, jsonOutput)
+	}
+	if !strings.Contains(string(jsonOutput), `"agent_state_roots": [`) ||
+		!strings.Contains(string(jsonOutput), filepath.Join(home, ".claude")) {
+		t.Fatalf("audit record omitted persisted agent-state roots:\n%s", jsonOutput)
 	}
 
 	restoreAll := exec.Command(binary, "restore", "--all", sessionID)
@@ -80,7 +94,7 @@ func TestAgentOwnStateIsGroupedSkippedByAllAndExplicitlyRestorable(t *testing.T)
 	assertTestFile(t, agentPath, "before")
 }
 
-func TestUnsupportedFileTypeIsInformationalAndManifestIsUnchanged(t *testing.T) {
+func TestUnsupportedFileTypeStaysRecordedAndMixedGapStaysLoud(t *testing.T) {
 	stateDir := t.TempDir()
 	watched, err := os.MkdirTemp("/tmp", "unring-socket-test-")
 	if err != nil {
@@ -93,11 +107,14 @@ func TestUnsupportedFileTypeIsInformationalAndManifestIsUnchanged(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer listener.Close()
+	externalDirectory := t.TempDir()
+	symlinkPath := filepath.Join(watched, "linked-directory")
 	t.Setenv("DATABASE_URL", "")
 	t.Setenv("UNRING_STATE_DIR", stateDir)
 	binary := buildTestBinary(t)
 
-	run := exec.Command(binary, "run", "--discard", "--watch-only", watched, "--", "/usr/bin/true")
+	run := exec.Command(binary, "run", "--discard", "--watch-only", watched, "--",
+		"/bin/ln", "-s", externalDirectory, symlinkPath)
 	run.Env = os.Environ()
 	runOutput, err := run.CombinedOutput()
 	if err != nil {
@@ -109,16 +126,24 @@ func TestUnsupportedFileTypeIsInformationalAndManifestIsUnchanged(t *testing.T) 
 	if strings.Contains(string(runOutput), "FILE NOT SNAPSHOTTED: "+socketPath) {
 		t.Fatalf("unsupported type retained actionable alarm prefix:\n%s", runOutput)
 	}
+	for _, want := range []string{
+		"FILE COVERAGE INCOMPLETE", symlinkPath,
+		"symlinked directory target is not followed or snapshotted",
+	} {
+		if !strings.Contains(string(runOutput), want) {
+			t.Fatalf("mixed actionable gap omitted %q:\n%s", want, runOutput)
+		}
+	}
 
 	sessionID := newestSessionID(t, binary)
 	manifestPath := filepath.Join(stateDir, "snapshots", sessionID, "manifest.json")
-	manifestBefore, err := os.ReadFile(manifestPath)
+	manifest, err := os.ReadFile(manifestPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, literal := range []string{socketPath, "unsupported file type"} {
-		if !bytes.Contains(manifestBefore, []byte(literal)) {
-			t.Fatalf("stored manifest omitted literal %q:\n%s", literal, manifestBefore)
+		if !bytes.Contains(manifest, []byte(literal)) {
+			t.Fatalf("stored manifest omitted literal %q:\n%s", literal, manifest)
 		}
 	}
 
@@ -134,11 +159,44 @@ func TestUnsupportedFileTypeIsInformationalAndManifestIsUnchanged(t *testing.T) 
 	if strings.Contains(string(logOutput), "FILE NOT SNAPSHOTTED: "+socketPath) {
 		t.Fatalf("stored unsupported type retained actionable alarm prefix:\n%s", logOutput)
 	}
-	manifestAfter, err := os.ReadFile(manifestPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(manifestBefore, manifestAfter) {
-		t.Fatal("rendering the lower-prominence disclosure changed the recorded manifest")
+}
+
+func TestRetentionCapPreflightErrorsLeaveNoPendingAuditRecord(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	binary := buildTestBinary(t)
+	for _, test := range []struct {
+		name string
+		args []string
+	}{
+		{name: "read stored cap", args: nil},
+		{name: "save explicit cap", args: []string{"--snapshot-cap-bytes", "1024"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			t.Setenv("UNRING_STATE_DIR", stateDir)
+			if err := os.Mkdir(filepath.Join(stateDir, "snapshot-retention-cap"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(t.TempDir(), "child-ran")
+			args := append([]string{"run"}, test.args...)
+			args = append(args, "--watch-only", t.TempDir(), "--",
+				"/bin/sh", "-c", `printf ran > "$1"`, "unring-test", marker)
+			command := exec.Command(binary, args...)
+			command.Env = os.Environ()
+			output, err := command.CombinedOutput()
+			if err == nil {
+				t.Fatalf("retention-cap preflight unexpectedly succeeded:\n%s", output)
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("retention-cap error launched child: %v", err)
+			}
+			entries, err := os.ReadDir(filepath.Join(stateDir, "logs"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("retention-cap error left audit records: %#v", entries)
+			}
+		})
 	}
 }

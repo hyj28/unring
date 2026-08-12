@@ -199,12 +199,6 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		fmt.Fprintf(stderr, "unring: find working directory for file snapshot: %v\n", err)
 		return internalErrorExitCode
 	}
-	auditSession, err := auditStore.Begin(command, time.Now())
-	if err != nil {
-		fmt.Fprintf(stderr, "unring: begin audit log: %v\n", err)
-		return internalErrorExitCode
-	}
-	auditRecord := auditSession.Snapshot()
 	scope, err := localrollback.ResolveScope(localrollback.ScopeOptions{
 		StateDir: auditStore.StateDir(), WorkingDirectory: workingDirectory,
 		Watch: watched, WatchOnly: watchedOnly,
@@ -219,17 +213,11 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		for _, failure := range failures {
 			watchedPaths = append(watchedPaths, failure.Path)
 		}
-		if updateErr := auditSession.Update(func(record *audit.Record) {
-			record.Files = localrollback.Summary{
+		if updateErr := recordNotStarted(auditStore, command, *outboundEnabled, exitCode, err,
+			localrollback.Summary{
 				Watched: watchedPaths, Uncaptured: failures, Complete: false,
 				Error: err.Error(), Retained: false,
-			}
-			record.EndedAt = time.Now().UTC()
-			record.ExitCode = exitCode
-			record.Error = err.Error()
-			record.Outcome = "not_started"
-			record.Outbound = *outboundEnabled
-		}); updateErr != nil {
+			}); updateErr != nil {
 			fmt.Fprintf(stderr, "unring: record preflight refusal: %v\n", updateErr)
 		}
 		fmt.Fprintf(stderr, "unring: choose file snapshot scope: %v\n", err)
@@ -247,6 +235,12 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		fmt.Fprintf(stderr, "unring: save snapshot retention cap: %v\n", err)
 		return internalErrorExitCode
 	}
+	auditSession, err := auditStore.Begin(command, time.Now())
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: begin audit log: %v\n", err)
+		return internalErrorExitCode
+	}
+	auditRecord := auditSession.Snapshot()
 	if scope.ScanRoot != "" && os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") == "" {
 		fmt.Fprintf(stderr,
 			"unring: scanning %s for the widened change list; this metadata scan may take several seconds and excludes %s.\n",
@@ -258,16 +252,11 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		auditStore.StateDir(), auditRecord.ID, scope, capBytes, auditRecord.StartedAt,
 	)
 	if err != nil {
-		_ = auditSession.Update(func(record *audit.Record) {
-			record.Files = localrollback.Summary{
+		_ = finishNotStarted(auditSession, *outboundEnabled, internalErrorExitCode, err,
+			localrollback.Summary{
 				Watched: watchPaths, Complete: false, Error: err.Error(),
 				RetentionCap: capBytes, Retained: false,
-			}
-			record.EndedAt = time.Now().UTC()
-			record.ExitCode = internalErrorExitCode
-			record.Error = err.Error()
-			record.Outcome = "not_started"
-		})
+			})
 		fmt.Fprintf(stderr, "unring: create file snapshot: %v\n", err)
 		return internalErrorExitCode
 	}
@@ -279,6 +268,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			record.GH = ghshim.Summary{Sealed: true}
 		}
 	}); err != nil {
+		_ = finishNotStarted(auditSession, *outboundEnabled, internalErrorExitCode, err, fileSummary)
 		fmt.Fprintf(stderr, "unring: record file snapshot: %v\n", err)
 		return internalErrorExitCode
 	}
@@ -868,6 +858,38 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	return result.ExitCode
 }
 
+func recordNotStarted(
+	store *audit.Store,
+	command []string,
+	outbound bool,
+	exitCode int,
+	reason error,
+	files localrollback.Summary,
+) error {
+	session, err := store.Begin(command, time.Now())
+	if err != nil {
+		return err
+	}
+	return finishNotStarted(session, outbound, exitCode, reason, files)
+}
+
+func finishNotStarted(
+	session *audit.Session,
+	outbound bool,
+	exitCode int,
+	reason error,
+	files localrollback.Summary,
+) error {
+	return session.Update(func(record *audit.Record) {
+		record.Files = files
+		record.EndedAt = time.Now().UTC()
+		record.ExitCode = exitCode
+		record.Error = reason.Error()
+		record.Outcome = "not_started"
+		record.Outbound = outbound
+	})
+}
+
 func printSnapshotStarted(output io.Writer, summary localrollback.Summary) {
 	if summary.ScanRoot != "" && os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") == "" {
 		fmt.Fprintf(output,
@@ -996,7 +1018,7 @@ func printFileChanges(output io.Writer, sessionID string, summary localrollback.
 	fmt.Fprintf(output,
 		"Files changed: %d created, %d modified, %d deleted. No file decision is needed now.\n",
 		created, modified, deleted)
-	regular, agentState := groupAgentStateChanges(summary.Changes)
+	regular, agentState := groupAgentStateChanges(summary.Changes, summary.AgentStateRoots)
 	printLiveChanges(output, regular)
 	if len(agentState) > 0 {
 		fmt.Fprintln(output, "AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
@@ -1055,7 +1077,7 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 			summary.ScanBeforeFiles, summary.ScanBeforeMillis,
 			summary.ScanAfterFiles, summary.ScanAfterMillis)
 	}
-	regular, agentState := groupAgentStateChanges(summary.Changes)
+	regular, agentState := groupAgentStateChanges(summary.Changes, summary.AgentStateRoots)
 	printStoredChanges(output, regular)
 	if len(agentState) > 0 {
 		fmt.Fprintln(output, "  AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
@@ -1079,12 +1101,7 @@ func printCaptureFailure(output io.Writer, prefix string, failure localrollback.
 }
 
 func hasActionableFileCoverageFailure(summary localrollback.Summary) bool {
-	for _, failure := range summary.Uncaptured {
-		if !localrollback.IsUnsupportedFileTypeFailure(failure) {
-			return true
-		}
-	}
-	return len(summary.ScanFailures) > 0
+	return !localrollback.HasOnlyUnsupportedFileTypeFailures(summary)
 }
 
 func printStoredChanges(output io.Writer, changes []localrollback.Change) {
@@ -1098,11 +1115,12 @@ func printStoredChanges(output io.Writer, changes []localrollback.Change) {
 	}
 }
 
-func groupAgentStateChanges(changes []localrollback.Change) ([]localrollback.Change, []localrollback.Change) {
+func groupAgentStateChanges(changes []localrollback.Change, recordedRoots []string) ([]localrollback.Change, []localrollback.Change) {
+	roots := recordedAgentStateRoots(recordedRoots)
 	regular := make([]localrollback.Change, 0, len(changes))
 	agentState := make([]localrollback.Change, 0)
 	for _, change := range changes {
-		if isAgentStateChange(change) {
+		if isAgentStateChange(change, roots) {
 			agentState = append(agentState, change)
 		} else {
 			regular = append(regular, change)
@@ -1111,8 +1129,17 @@ func groupAgentStateChanges(changes []localrollback.Change) ([]localrollback.Cha
 	return regular, agentState
 }
 
-func isAgentStateChange(change localrollback.Change) bool {
-	return localrollback.IsAgentStatePath(change.Path, "")
+func recordedAgentStateRoots(roots []string) []string {
+	if len(roots) > 0 {
+		return roots
+	}
+	// Records created before agent-state roots were persisted fall back to the
+	// current environment for backward compatibility.
+	return localrollback.AgentStateRoots("")
+}
+
+func isAgentStateChange(change localrollback.Change, roots []string) bool {
+	return localrollback.IsAgentStatePathWithin(change.Path, roots)
 }
 
 func printOutboundDisabled(output io.Writer) {
@@ -1489,8 +1516,9 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 			return usageExitCode
 		}
 		var skippedAgentState []localrollback.Change
+		agentStateRoots := recordedAgentStateRoots(record.Files.AgentStateRoots)
 		for _, change := range record.Files.Changes {
-			if !includeAgentState && isAgentStateChange(change) {
+			if !includeAgentState && isAgentStateChange(change, agentStateRoots) {
 				skippedAgentState = append(skippedAgentState, change)
 				continue
 			}
@@ -1636,7 +1664,7 @@ func snapshotsCommand(args []string, stdout, stderr io.Writer) int {
 func printRestoreListing(output io.Writer, record audit.Record) {
 	fmt.Fprintf(output, "UNRING FILE CHANGES %s\n", record.ID)
 	printStoredChangeListLimitation(output, record.Files, "  ", true)
-	regular, agentState := groupAgentStateChanges(record.Files.Changes)
+	regular, agentState := groupAgentStateChanges(record.Files.Changes, record.Files.AgentStateRoots)
 	for _, change := range regular {
 		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
 		if change.RestoreSource == localrollback.RestoreSourceVolume {
@@ -1686,6 +1714,9 @@ func loadStoredFileSummary(stateDir string, record audit.Record) localrollback.S
 	// Only the manifest's persisted disclosure fields are needed here.
 	summary.ChangeListScope = manifestSummary.ChangeListScope
 	summary.ChangeListRoots = append([]string(nil), manifestSummary.ChangeListRoots...)
+	if len(summary.AgentStateRoots) == 0 {
+		summary.AgentStateRoots = append([]string(nil), manifestSummary.AgentStateRoots...)
+	}
 	return summary
 }
 

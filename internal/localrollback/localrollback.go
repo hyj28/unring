@@ -52,6 +52,23 @@ func IsUnsupportedFileTypeFailure(failure CaptureFailure) bool {
 	return strings.HasPrefix(failure.Error, "unsupported file type")
 }
 
+// HasOnlyUnsupportedFileTypeFailures reports the one incomplete state that is
+// informational rather than actionable. It is deliberately strict: any scan
+// failure, unexplained error text, or additional persistence/storage error
+// makes the incomplete summary actionable.
+func HasOnlyUnsupportedFileTypeFailures(summary Summary) bool {
+	if summary.Complete || len(summary.Uncaptured) == 0 || len(summary.ScanFailures) != 0 {
+		return false
+	}
+	for _, failure := range summary.Uncaptured {
+		if !IsUnsupportedFileTypeFailure(failure) {
+			return false
+		}
+	}
+	wantError := formatFailures("post-session coverage incomplete", summary.Uncaptured)
+	return summary.Error == wantError
+}
+
 // Change is one created, modified, or deleted path.
 type Change struct {
 	Kind               string          `json:"kind"`
@@ -76,6 +93,7 @@ type RestoreRecord struct {
 // Summary is stored in the session audit record.
 type Summary struct {
 	Watched          []string         `json:"watched_paths"`
+	AgentStateRoots  []string         `json:"agent_state_roots,omitempty"`
 	Uncaptured       []CaptureFailure `json:"uncaptured_paths"`
 	Changes          []Change         `json:"changes"`
 	Complete         bool             `json:"complete"`
@@ -118,6 +136,7 @@ type manifest struct {
 	StartedAt         time.Time        `json:"started_at"`
 	EndedAt           time.Time        `json:"ended_at,omitempty"`
 	Roots             []rootManifest   `json:"roots"`
+	AgentStateRoots   []string         `json:"agent_state_roots,omitempty"`
 	Excluded          []string         `json:"excluded,omitempty"`
 	After             map[string]Entry `json:"after,omitempty"`
 	Changes           []Change         `json:"changes,omitempty"`
@@ -251,13 +270,13 @@ func RetentionCapForState(stateDir string) (int64, error) {
 // platform's recursive fast path, then falls back to per-entry capture so that
 // one unreadable path does not erase coverage for the rest of a tree.
 func Start(stateDir, sessionID string, watched []string, capBytes int64, now time.Time) (*Session, Summary, error) {
-	return start(stateDir, sessionID, watched, nil, nil, ChangeListScopeCloneOnly, watched, "", nil, nil, "", capBytes, now)
+	return start(stateDir, sessionID, watched, nil, nil, nil, ChangeListScopeCloneOnly, watched, "", nil, nil, "", capBytes, now)
 }
 
 // StartWithExclusions captures watched paths while omitting physically resolved
 // config exclusions in addition to unring's own state directory.
 func StartWithExclusions(stateDir, sessionID string, watched, excluded []string, capBytes int64, now time.Time) (*Session, Summary, error) {
-	return start(stateDir, sessionID, watched, excluded, nil, ChangeListScopeCloneOnly, watched, "", nil, nil, "", capBytes, now)
+	return start(stateDir, sessionID, watched, excluded, nil, nil, ChangeListScopeCloneOnly, watched, "", nil, nil, "", capBytes, now)
 }
 
 // StartScope captures a previously resolved scope, including any explicit
@@ -265,6 +284,7 @@ func StartWithExclusions(stateDir, sessionID string, watched, excluded []string,
 func StartScope(stateDir, sessionID string, scope Scope, capBytes int64, now time.Time) (*Session, Summary, error) {
 	return start(
 		stateDir, sessionID, scope.Watched, scope.Excluded, scope.Uncaptured,
+		scope.AgentStateRoots,
 		scope.ChangeListScope, scope.ChangeListRoots,
 		scope.ScanRoot, scope.ScanExcluded, scope.ScanExcludedNames, scope.ScanError,
 		capBytes, now,
@@ -275,6 +295,7 @@ func start(
 	stateDir, sessionID string,
 	watched, excluded []string,
 	preflightFailures []CaptureFailure,
+	agentStateRoots []string,
 	changeListScope string,
 	changeListRoots []string,
 	scanRoot string,
@@ -314,6 +335,7 @@ func start(
 	m := manifest{
 		Version: manifestVersion, SessionID: sessionID, StartedAt: now.UTC(),
 		Complete: false, RetentionCap: capBytes, ScanRoot: scanRoot,
+		AgentStateRoots:   append([]string(nil), agentStateRoots...),
 		ChangeListScope:   changeListScope,
 		ChangeListRoots:   append([]string(nil), changeListRoots...),
 		ScanExcluded:      append([]string(nil), scanExcluded...),
@@ -414,7 +436,8 @@ func start(
 	}
 	summary := Summary{
 		Watched: roots, Uncaptured: failures, Complete: false,
-		Storage: m.Storage, LogicalBytes: m.LogicalBytes, StorageBytes: m.StorageBytes,
+		AgentStateRoots: append([]string(nil), m.AgentStateRoots...),
+		Storage:         m.Storage, LogicalBytes: m.LogicalBytes, StorageBytes: m.StorageBytes,
 		StorageExact: m.StorageExact, CopiedBytes: m.CopiedBytes,
 		RetentionCap: capBytes, Retained: true,
 		ChangeListScope: m.ChangeListScope,
