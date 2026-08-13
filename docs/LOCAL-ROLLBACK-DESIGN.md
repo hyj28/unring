@@ -316,3 +316,25 @@ Continuing the list in §7:
    requested protection was absent. Reporting alone was indistinguishable from routine
    noise. Explicitly named missing paths now refuse startup and leave a `not_started` audit
    record naming the path and reason; missing default roots remain silent.
+
+---
+
+## 9. Storage hygiene and content equality (2026-08-12)
+
+Real use found two metadata-layer failures: audit records accumulated without a bound, and
+`ctime` correctly noticed a rewrite but could not distinguish genuinely new bytes from an
+identical rewrite. APFS also showed why `du` is the wrong reclaim figure: deleting gigabytes
+of apparent clone size can increase free space by zero because clone stores share blocks.
+
+### 9.1 Decisions
+
+| # | Decision |
+|---|---|
+| 19 | Retention uses **one oldest-first age-and-byte plan**: 14 days by default through `config.yaml`'s `retention_days`, the existing persisted 5 GiB measured-allocation cap, and an unconditional newest-session guard. Each session is selected at most once when either limit binds. Automatic expiry is announced and recorded. `unring prune` saves its non-destructive preview under an opaque token for 24 hours; `--confirm <token>` recomputes eligibility under the exclusive retention lock and applies only the saved set when every target is still selected for the same reason. Newest, changed-limit, incomplete-audit, expired, and otherwise stale confirmations fail closed. Later prune invocations collect abandoned tokens. Age expiry removes the audit record and clone; cap-only eviction removes only clone restore data and marks the audit record unretained. A damaged manifest uses the audit record's measured byte charge when available; otherwise the warning says its unknown bytes cannot drive cap eviction and that only age expiry may select it, still subject to the newest-session guard. Reclaim output reports unring's measured snapshot accounting and explicitly does not equate clone references with immediately freed disk space. Human session listings share a 50-row default bound: `log --all` and `snapshots --all` show every applicable record, while `prune --all` names every member of a large retention set before a confirmation token is issued. Structured log JSON remains complete unless the caller selects one session. Current restore and snapshot displays establish clone availability from the sealed store rather than trusting legacy audit retention metadata; audit-only sessions and clone-backed paths whose stores are gone are named as not restorable. |
+| 20 | Metadata remains the **fast change oracle**, including `ctime`, but clone-backed regular files are byte-compared when type, size, mode, and link count agree and the file is at most 8 MiB. The comparison streams data and suppresses a change only after conclusive equality. Larger files, paths without a clone, and read errors keep the safe false-positive result. Explicit clone restore streams the selected equal-size clone regardless of mtime, allowing original bytes restored by hand to return `already restored`; a genuine byte difference still refuses and writes the sidecar. For a volume-only path, the clone is unavailable, so an equal-size conflict is not called changed on metadata alone: the already-announced privileged snapshot mount is required to compare the bytes, after which the same already-restored or refused result is reported. A size difference remains a conclusive pre-mount conflict. |
+
+The 8 MiB bound is deliberately about automatic work multiplied across every changed path.
+A restore is an explicit operation on selected paths, so paying one streaming comparison is
+worth avoiding a false conflict and redundant sidecar. Neither decision changes manifest
+membership: paths and metadata are recorded exactly as before, and human rendering alone
+quotes control characters such as newlines.

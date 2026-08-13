@@ -4,6 +4,8 @@ package cli
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -35,9 +37,10 @@ import (
 )
 
 const (
-	internalErrorExitCode = 1
-	usageExitCode         = 2
-	defaultReviewWidth    = 80
+	internalErrorExitCode   = 1
+	usageExitCode           = 2
+	defaultReviewWidth      = 80
+	defaultSessionListLimit = 50
 
 	quietSessionDisclosure = "unring: nothing intercepted. Outbound is not covered unless --outbound was given. Not visible to unring: SSH/git push, raw sockets, unshimmed CLIs."
 	homeScanExclusions     = "Library, node_modules, .git, .cache, and go/pkg"
@@ -119,6 +122,8 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return logCommand(args[1:], stdout, stderr)
 	case "restore":
 		return restoreCommand(args[1:], stdout, stderr)
+	case "prune":
+		return pruneCommand(args[1:], stdout, stderr)
 	case "snapshots":
 		return snapshotsCommand(args[1:], stdout, stderr)
 	case "--outbound":
@@ -272,13 +277,12 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		fmt.Fprintf(stderr, "unring: record file snapshot: %v\n", err)
 		return internalErrorExitCode
 	}
-	printSnapshotStarted(stderr, fileSummary)
-	for _, evictedID := range fileSummary.Evicted {
-		if evictedRecord, loadErr := auditStore.Load(evictedID); loadErr == nil {
-			evictedRecord.Files.Retained = false
-			_ = auditStore.Save(evictedRecord)
-		}
+	applyAutomaticRetention(auditStore, auditRecord.ID, capBytes, scope.RetentionDays, &fileSummary, stderr)
+	if err := auditSession.Update(func(record *audit.Record) { record.Files = fileSummary }); err != nil {
+		fmt.Fprintf(stderr, "unring: record start-time retention: %v\n", err)
+		return internalErrorExitCode
 	}
+	printSnapshotStarted(stderr, fileSummary)
 
 	var proxy postgresSession
 	var httpsProxy *httpsproxy.Proxy
@@ -572,30 +576,13 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		auditError = joinErrorText(auditError, result.Err)
 	}
 	printScanFinishing(stderr, fileSummary)
+	startEvicted := append([]string(nil), fileSummary.Evicted...)
+	startRetentionEvents := append([]localrollback.RetentionEvent(nil), fileSummary.RetentionEvents...)
 	fileSummary = fileSession.Seal(time.Now())
+	fileSummary.Evicted = append(startEvicted, fileSummary.Evicted...)
+	fileSummary.RetentionEvents = append(startRetentionEvents, fileSummary.RetentionEvents...)
 	printScanFinished(stderr, fileSummary)
-	if evicted, usage, retentionErr := localrollback.EnforceRetention(
-		auditStore.StateDir(), capBytes, auditRecord.ID,
-	); retentionErr != nil {
-		fmt.Fprintf(stderr, "unring: enforce snapshot retention: %v\n", retentionErr)
-	} else {
-		for _, evictedID := range evicted {
-			fileSummary.Evicted = append(fileSummary.Evicted, evictedID)
-			if evictedID == auditRecord.ID {
-				fileSummary.Retained = false
-			}
-			fmt.Fprintf(stderr, "unring: retention evicted oldest snapshot %s.\n", evictedID)
-			if evictedRecord, loadErr := auditStore.Load(evictedID); loadErr == nil {
-				evictedRecord.Files.Retained = false
-				_ = auditStore.Save(evictedRecord)
-			}
-		}
-		if usage.Exact && usage.Bytes > usage.CapBytes {
-			fmt.Fprintf(stderr,
-				"unring: current snapshot remains retained; measured snapshot usage is %d bytes, above the %d-byte cap. It becomes eligible for eviction after this session.\n",
-				usage.Bytes, usage.CapBytes)
-		}
-	}
+	applyAutomaticRetention(auditStore, auditRecord.ID, capBytes, scope.RetentionDays, &fileSummary, stderr)
 	if !fileSummary.Complete {
 		if hasActionableFileCoverageFailure(fileSummary) {
 			fmt.Fprintf(stderr, "unring: FILE COVERAGE INCOMPLETE: %s\n", fileSummary.Error)
@@ -910,7 +897,7 @@ func printSnapshotStarted(output io.Writer, summary localrollback.Summary) {
 	}
 	printChangeListLimitation(output, summary, "unring: ")
 	for _, failure := range summary.Backstop.Excluded {
-		fmt.Fprintf(output, "unring: PATH OUTSIDE WHOLE-VOLUME BACKSTOP: %s: %s\n", failure.Path, failure.Error)
+		fmt.Fprintf(output, "unring: PATH OUTSIDE WHOLE-VOLUME BACKSTOP: %s: %s\n", humanPath(failure.Path), failure.Error)
 	}
 	if strings.Contains(summary.Storage, "full-copy") {
 		fmt.Fprintf(output,
@@ -921,7 +908,7 @@ func printSnapshotStarted(output io.Writer, summary localrollback.Summary) {
 		printCaptureFailure(output, "unring: ", failure)
 	}
 	for _, failure := range summary.ScanFailures {
-		fmt.Fprintf(output, "unring: CHANGE-LIST SCAN INCOMPLETE: %s: %s\n", failure.Path, failure.Error)
+		fmt.Fprintf(output, "unring: CHANGE-LIST SCAN INCOMPLETE: %s: %s\n", humanPath(failure.Path), failure.Error)
 	}
 	for _, evicted := range summary.Evicted {
 		fmt.Fprintf(output, "unring: retention evicted oldest snapshot %s.\n", evicted)
@@ -1039,7 +1026,7 @@ func printFileChanges(output io.Writer, sessionID string, summary localrollback.
 
 func printLiveChanges(output io.Writer, changes []localrollback.Change) {
 	for _, change := range changes {
-		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
+		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, humanPath(change.Path))
 		if change.RestoreSource == localrollback.RestoreSourceVolume {
 			fmt.Fprintln(output, "             SNAPSHOT ONLY: restoring this path requires sudo to mount the APFS snapshot.")
 		} else if change.UnrestorableReason != "" {
@@ -1070,16 +1057,25 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 		fmt.Fprintf(output, "  NO WHOLE-VOLUME BACKSTOP: %s\n", summary.Backstop.Reason)
 	}
 	for _, failure := range summary.Backstop.Excluded {
-		fmt.Fprintf(output, "  OUTSIDE VOLUME BACKSTOP: %s: %s\n", failure.Path, failure.Error)
+		fmt.Fprintf(output, "  OUTSIDE VOLUME BACKSTOP: %s: %s\n", humanPath(failure.Path), failure.Error)
 	}
 	printStoredChangeListLimitation(output, summary, "  ", false)
 	for _, failure := range summary.ScanFailures {
-		fmt.Fprintf(output, "  CHANGE-LIST SCAN INCOMPLETE: %s: %s\n", failure.Path, failure.Error)
+		fmt.Fprintf(output, "  CHANGE-LIST SCAN INCOMPLETE: %s: %s\n", humanPath(failure.Path), failure.Error)
 	}
 	if summary.ScanRoot != "" {
 		fmt.Fprintf(output, "  Change-list scan: %d entries/%d ms before; %d entries/%d ms after\n",
 			summary.ScanBeforeFiles, summary.ScanBeforeMillis,
 			summary.ScanAfterFiles, summary.ScanAfterMillis)
+	}
+	for _, event := range summary.RetentionEvents {
+		removal := localrollback.RetentionRemoval{
+			SessionID: event.SessionID, StorageBytes: event.StorageBytes,
+			StorageExact: event.StorageExact, Expired: event.Expired,
+			CapRequired: event.CapRequired,
+		}
+		fmt.Fprintf(output, "  Retention removed %s: %s; %s.\n",
+			event.SessionID, retentionReason(removal), retentionSpace(removal))
 	}
 	agentStateRoots, inferredAgentStateRoots := agentStateGroupingRoots(summary.AgentStateRoots)
 	if inferredAgentStateRoots {
@@ -1102,10 +1098,10 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 
 func printCaptureFailure(output io.Writer, prefix string, failure localrollback.CaptureFailure) {
 	if localrollback.IsUnsupportedFileTypeFailure(failure) {
-		fmt.Fprintf(output, "%sUNSUPPORTED FILE TYPE (informational): %s: %s\n", prefix, failure.Path, failure.Error)
+		fmt.Fprintf(output, "%sUNSUPPORTED FILE TYPE (informational): %s: %s\n", prefix, humanPath(failure.Path), failure.Error)
 		return
 	}
-	fmt.Fprintf(output, "%sFILE NOT SNAPSHOTTED: %s: %s\n", prefix, failure.Path, failure.Error)
+	fmt.Fprintf(output, "%sFILE NOT SNAPSHOTTED: %s: %s\n", prefix, humanPath(failure.Path), failure.Error)
 }
 
 func hasActionableFileCoverageFailure(summary localrollback.Summary) bool {
@@ -1114,7 +1110,7 @@ func hasActionableFileCoverageFailure(summary localrollback.Summary) bool {
 
 func printStoredChanges(output io.Writer, changes []localrollback.Change) {
 	for _, change := range changes {
-		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
+		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, humanPath(change.Path))
 		if change.RestoreSource == localrollback.RestoreSourceVolume {
 			fmt.Fprintln(output, "             SNAPSHOT ONLY: requires sudo to mount the APFS snapshot")
 		} else if change.UnrestorableReason != "" {
@@ -1390,14 +1386,19 @@ func logCommand(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("unring log", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	asJSON := flags.Bool("json", false, "print structured JSON")
+	showAll := flags.Bool("all", false, "show every recorded session in human-readable output (JSON is always complete)")
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: unring log [--json] [session-id]")
+		fmt.Fprintln(stderr, "Usage: unring log [--json] [--all] [session-id]")
 	}
 	if err := flags.Parse(args); err != nil {
 		return usageExitCode
 	}
 	if flags.NArg() > 1 {
 		flags.Usage()
+		return usageExitCode
+	}
+	if flags.NArg() == 1 && *showAll {
+		fmt.Fprintln(stderr, "unring: --all cannot be combined with a session id")
 		return usageExitCode
 	}
 	store, err := audit.OpenStore()
@@ -1417,6 +1418,11 @@ func logCommand(args []string, stdout, stderr io.Writer) int {
 				err,
 			)
 		}
+		total := len(records)
+		shown, truncated := boundedHumanSessionCount(total, *showAll || *asJSON)
+		if truncated {
+			records = records[:shown]
+		}
 		if *asJSON {
 			return writeJSON(stdout, stderr, records)
 		}
@@ -1428,7 +1434,10 @@ func logCommand(args []string, stdout, stderr io.Writer) int {
 		for _, record := range records {
 			fmt.Fprintf(stdout, "%-43s %-21s %-12s %s\n",
 				record.ID, record.StartedAt.Local().Format("2006-01-02 15:04:05"),
-				record.Outcome, strings.Join(record.Command, " "))
+				record.Outcome, humanCommand(record.Command))
+		}
+		if truncated {
+			fmt.Fprintf(stdout, "Showing the newest %d of %d sessions; use unring log --all to show everything.\n", defaultSessionListLimit, total)
 		}
 		return 0
 	}
@@ -1443,6 +1452,429 @@ func logCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	printAuditRecord(stdout, record)
 	return 0
+}
+
+func pruneCommand(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("unring prune", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	confirm := flags.String("confirm", "", "remove the exact set identified by a prune preview token")
+	showAll := flags.Bool("all", false, "show every session in the retention set")
+	flags.Usage = func() {
+		fmt.Fprintln(stderr, "Usage: unring prune [--all] [--confirm preview-token]")
+		fmt.Fprintln(stderr, "Without --confirm, show the sessions the age and byte limits would remove.")
+	}
+	if err := flags.Parse(args); err != nil {
+		return usageExitCode
+	}
+	if flags.NArg() != 0 {
+		flags.Usage()
+		return usageExitCode
+	}
+	if *confirm != "" && *showAll {
+		fmt.Fprintln(stderr, "unring: --all cannot be combined with --confirm")
+		return usageExitCode
+	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: open state store: %v\n", err)
+		return internalErrorExitCode
+	}
+	if *confirm != "" {
+		now := time.Now()
+		preview, err := loadPrunePreview(store.StateDir(), *confirm, now)
+		if err != nil {
+			_ = cleanupPrunePreviews(store.StateDir(), now, "")
+			fmt.Fprintf(stderr, "unring: load prune preview %q: %v\n", *confirm, err)
+			return usageExitCode
+		}
+		if err := cleanupPrunePreviews(store.StateDir(), now, *confirm); err != nil {
+			fmt.Fprintf(stderr, "unring: clean expired prune previews: %v\n", err)
+			return internalErrorExitCode
+		}
+		if err := applyRetentionRemovals(store, preview.Removals, func() error {
+			return validatePrunePreview(store, preview, time.Now())
+		}, nil, stdout, "removed"); err != nil {
+			printPartialRetentionFailure(stderr, err)
+			fmt.Fprintf(stderr, "unring: prune preview %q was not fully applied: %v; run unring prune again if no removals were reported above.\n", *confirm, err)
+			return internalErrorExitCode
+		}
+		if err := os.Remove(prunePreviewPath(store.StateDir(), *confirm)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(stderr, "unring: remove completed prune preview: %v\n", err)
+			return internalErrorExitCode
+		}
+		fmt.Fprintln(stdout, "Reported bytes are unring's retained-snapshot accounting, not a promise of immediately increased free disk space; copy-on-write clones may only release references to shared blocks.")
+		return 0
+	}
+	if err := cleanupPrunePreviews(store.StateDir(), time.Now(), ""); err != nil {
+		fmt.Fprintf(stderr, "unring: clean expired prune previews: %v\n", err)
+		return internalErrorExitCode
+	}
+	capBytes, err := localrollback.RetentionCapForState(store.StateDir())
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: read snapshot retention cap: %v\n", err)
+		return usageExitCode
+	}
+	retentionDays, err := localrollback.RetentionDaysForState(store.StateDir())
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: read session retention age: %v\n", err)
+		return usageExitCode
+	}
+	records, listErr := store.List()
+	if listErr != nil {
+		if records == nil {
+			fmt.Fprintf(stderr, "unring: inspect stored sessions for retention: %v\n", listErr)
+			return internalErrorExitCode
+		}
+		fmt.Fprintf(stderr, "unring: retention warning: unreadable audit records were skipped: %v\n", listErr)
+	}
+	plan, err := localrollback.PlanRetention(
+		store.StateDir(), storedSessions(records), capBytes,
+		time.Duration(retentionDays)*24*time.Hour, time.Now(),
+	)
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: plan retention: %v\n", err)
+		return internalErrorExitCode
+	}
+	printRetentionWarnings(stderr, plan.Warnings)
+	if len(plan.Removals) == 0 {
+		fmt.Fprintln(stdout, "Nothing to prune; the newest session and all other stored sessions are within the configured limits.")
+		return 0
+	}
+	shownCount, truncated := boundedHumanSessionCount(len(plan.Removals), *showAll)
+	shown := plan.Removals
+	if truncated {
+		shown = shown[:shownCount]
+	}
+	for _, removal := range shown {
+		printRetentionRemoval(stdout, "would remove", removal)
+	}
+	fmt.Fprintln(stdout, "Reported bytes are unring's retained-snapshot accounting, not a promise of immediately increased free disk space; copy-on-write clones may only release references to shared blocks.")
+	if truncated {
+		fmt.Fprintf(stdout, "Showing %d of %d sessions in the retention set; use unring prune --all to name every session before confirming.\n", defaultSessionListLimit, len(plan.Removals))
+		fmt.Fprintln(stdout, "No sessions were removed, and no confirmation token was issued for this truncated listing.")
+		return 0
+	}
+	token, err := savePrunePreview(store.StateDir(), plan.Removals)
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: save prune preview: %v\n", err)
+		return internalErrorExitCode
+	}
+	fmt.Fprintf(stdout, "No sessions were removed. Run unring prune --confirm %s to remove exactly the set shown above.\n", token)
+	return 0
+}
+
+const (
+	prunePreviewVersion  = 1
+	prunePreviewLifetime = 24 * time.Hour
+)
+
+type prunePreview struct {
+	Version  int                              `json:"version"`
+	Created  time.Time                        `json:"created_at"`
+	Removals []localrollback.RetentionRemoval `json:"removals"`
+}
+
+func savePrunePreview(stateDir string, removals []localrollback.RetentionRemoval) (string, error) {
+	var random [12]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(random[:])
+	directory := filepath.Join(stateDir, "prune-previews")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return "", err
+	}
+	data, err := json.MarshalIndent(prunePreview{
+		Version: prunePreviewVersion, Created: time.Now().UTC(),
+		Removals: append([]localrollback.RetentionRemoval(nil), removals...),
+	}, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	data = append(data, '\n')
+	temporary, err := os.CreateTemp(directory, ".prune-preview-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return "", err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return "", err
+	}
+	if err := temporary.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Rename(temporaryPath, prunePreviewPath(stateDir, token)); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func loadPrunePreview(stateDir, token string, now time.Time) (prunePreview, error) {
+	if len(token) != 24 {
+		return prunePreview{}, errors.New("preview token must contain 24 hexadecimal characters")
+	}
+	if _, err := hex.DecodeString(token); err != nil {
+		return prunePreview{}, errors.New("preview token must contain 24 hexadecimal characters")
+	}
+	data, err := os.ReadFile(prunePreviewPath(stateDir, token))
+	if err != nil {
+		return prunePreview{}, err
+	}
+	var preview prunePreview
+	if err := json.Unmarshal(data, &preview); err != nil {
+		return prunePreview{}, err
+	}
+	if preview.Version != prunePreviewVersion || len(preview.Removals) == 0 {
+		return prunePreview{}, errors.New("unsupported or empty prune preview")
+	}
+	if preview.Created.IsZero() || preview.Created.After(now.Add(5*time.Minute)) {
+		return prunePreview{}, errors.New("prune preview has an invalid creation time")
+	}
+	if now.Sub(preview.Created) > prunePreviewLifetime {
+		return prunePreview{}, errors.New("prune preview expired after 24 hours; run unring prune again")
+	}
+	return preview, nil
+}
+
+func prunePreviewPath(stateDir, token string) string {
+	return filepath.Join(stateDir, "prune-previews", token+".json")
+}
+
+func cleanupPrunePreviews(stateDir string, now time.Time, keepToken string) error {
+	directory := filepath.Join(stateDir, "prune-previews")
+	entries, err := os.ReadDir(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Name() == keepToken+".json" {
+			continue
+		}
+		path := filepath.Join(directory, entry.Name())
+		remove := false
+		if strings.HasSuffix(entry.Name(), ".json") {
+			data, readErr := os.ReadFile(path)
+			var preview prunePreview
+			if readErr == nil && json.Unmarshal(data, &preview) == nil && !preview.Created.IsZero() {
+				remove = now.Sub(preview.Created) > prunePreviewLifetime || preview.Created.After(now.Add(5*time.Minute))
+			} else if info, infoErr := entry.Info(); infoErr == nil {
+				remove = now.Sub(info.ModTime()) > prunePreviewLifetime
+			}
+		} else if strings.HasPrefix(entry.Name(), ".prune-preview-") {
+			if info, infoErr := entry.Info(); infoErr == nil {
+				remove = now.Sub(info.ModTime()) > prunePreviewLifetime
+			}
+		}
+		if remove {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validatePrunePreview(store *audit.Store, preview prunePreview, now time.Time) error {
+	if preview.Created.IsZero() || now.Sub(preview.Created) > prunePreviewLifetime || preview.Created.After(now.Add(5*time.Minute)) {
+		return errors.New("prune preview is stale")
+	}
+	records, err := store.List()
+	if err != nil {
+		return fmt.Errorf("cannot verify the current newest session and retention set: %w", err)
+	}
+	newest := ""
+	if len(records) > 0 {
+		newest = records[0].ID
+	}
+	for _, removal := range preview.Removals {
+		if removal.SessionID == newest {
+			return fmt.Errorf("session %s is now the newest stored session", removal.SessionID)
+		}
+	}
+	capBytes, err := localrollback.RetentionCapForState(store.StateDir())
+	if err != nil {
+		return fmt.Errorf("read current snapshot retention cap: %w", err)
+	}
+	retentionDays, err := localrollback.RetentionDaysForState(store.StateDir())
+	if err != nil {
+		return fmt.Errorf("read current session retention age: %w", err)
+	}
+	plan, err := localrollback.PlanRetentionWhileLocked(
+		store.StateDir(), storedSessions(records), capBytes,
+		time.Duration(retentionDays)*24*time.Hour, now,
+	)
+	if err != nil {
+		return fmt.Errorf("recheck current retention set: %w", err)
+	}
+	current := make(map[string]localrollback.RetentionRemoval, len(plan.Removals))
+	for _, removal := range plan.Removals {
+		current[removal.SessionID] = removal
+	}
+	for _, saved := range preview.Removals {
+		updated, ok := current[saved.SessionID]
+		if !ok || updated.Expired != saved.Expired || updated.CapRequired != saved.CapRequired || updated.HasSnapshot != saved.HasSnapshot {
+			return fmt.Errorf("session %s is no longer in the same retention set", saved.SessionID)
+		}
+	}
+	return nil
+}
+
+func storedSessions(records []audit.Record) []localrollback.StoredSession {
+	sessions := make([]localrollback.StoredSession, 0, len(records))
+	for _, record := range records {
+		sessions = append(sessions, localrollback.StoredSession{
+			ID: record.ID, StartedAt: record.StartedAt,
+			StorageBytes: record.Files.StorageBytes,
+			StorageExact: record.Files.StorageExact,
+			StorageKnown: record.Files.Retained,
+		})
+	}
+	return sessions
+}
+
+func retentionReason(removal localrollback.RetentionRemoval) string {
+	switch {
+	case removal.Expired && removal.CapRequired:
+		return "past the configured age and needed to meet the byte cap"
+	case removal.Expired:
+		return "past the configured age"
+	default:
+		return "needed to meet the byte cap"
+	}
+}
+
+func retentionSpace(removal localrollback.RetentionRemoval) string {
+	if removal.StorageExact {
+		return fmt.Sprintf("releases %d measured retained-snapshot bytes/references, not necessarily %d bytes of immediate free disk space", removal.StorageBytes, removal.StorageBytes)
+	}
+	return fmt.Sprintf("releases snapshot references with a %d-byte upper-bound accounting value, not a free-disk-space estimate", removal.StorageBytes)
+}
+
+func printRetentionRemoval(output io.Writer, verb string, removal localrollback.RetentionRemoval) {
+	target := "clone snapshot only"
+	if removal.Expired && removal.HasSnapshot {
+		target = "stored session and clone snapshot"
+	} else if removal.Expired {
+		target = "stored session audit record"
+	}
+	if verb == "retention removed" && !removal.Expired {
+		fmt.Fprintf(output, "unring: retention evicted oldest snapshot %s.\n", removal.SessionID)
+	}
+	space := retentionSpace(removal)
+	if !removal.HasSnapshot {
+		space = "this removes only the audit record; no snapshot data remains"
+	}
+	fmt.Fprintf(output, "%s session %s (%s): %s; %s.\n",
+		verb, removal.SessionID, target, retentionReason(removal), space)
+	if !removal.Expired {
+		fmt.Fprintln(output, "  The audit record remains available; only clone restore data is removed.")
+	}
+}
+
+func printRetentionWarnings(output io.Writer, warnings []localrollback.RetentionWarning) {
+	for _, warning := range warnings {
+		fmt.Fprintf(output, "unring: retention warning for %s: %s.\n", warning.SessionID, warning.Error)
+	}
+}
+
+func applyRetentionRemovals(
+	store *audit.Store,
+	removals []localrollback.RetentionRemoval,
+	validate func() error,
+	summary *localrollback.Summary,
+	output io.Writer,
+	verb string,
+) error {
+	return localrollback.ApplyRetentionRemovals(
+		store.StateDir(), removals, validate,
+		func(removal localrollback.RetentionRemoval) error {
+			if removal.Expired {
+				return store.DeleteWhileSessionLocked(removal.SessionID)
+			}
+			record, err := store.LoadExact(removal.SessionID)
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			record.Files.Retained = false
+			return store.SaveWhileSessionLocked(record)
+		},
+		func(removal localrollback.RetentionRemoval) {
+			if summary != nil {
+				summary.Evicted = append(summary.Evicted, removal.SessionID)
+				summary.RetentionEvents = append(summary.RetentionEvents, localrollback.RetentionEvent{
+					SessionID: removal.SessionID, StorageBytes: removal.StorageBytes,
+					StorageExact: removal.StorageExact, Expired: removal.Expired,
+					CapRequired: removal.CapRequired,
+				})
+			}
+			printRetentionRemoval(output, verb, removal)
+		},
+	)
+}
+
+func applyAutomaticRetention(
+	store *audit.Store,
+	activeSession string,
+	capBytes int64,
+	retentionDays int,
+	summary *localrollback.Summary,
+	output io.Writer,
+) {
+	records, err := store.List()
+	if err != nil {
+		if records == nil {
+			fmt.Fprintf(output, "unring: enforce session retention: cannot inspect stored sessions: %v\n", err)
+			return
+		}
+		fmt.Fprintf(output, "unring: retention warning: unreadable audit records were skipped: %v\n", err)
+	}
+	plan, err := localrollback.PlanRetention(
+		store.StateDir(), storedSessions(records), capBytes,
+		time.Duration(retentionDays)*24*time.Hour, time.Now(),
+	)
+	if err != nil {
+		fmt.Fprintf(output, "unring: enforce session retention: %v\n", err)
+		return
+	}
+	printRetentionWarnings(output, plan.Warnings)
+	removals := make([]localrollback.RetentionRemoval, 0, len(plan.Removals))
+	for _, removal := range plan.Removals {
+		if removal.SessionID != activeSession {
+			removals = append(removals, removal)
+		}
+	}
+	if err := applyRetentionRemovals(store, removals, nil, summary, output, "retention removed"); err != nil {
+		printPartialRetentionFailure(output, err)
+		fmt.Fprintf(output, "unring: enforce session retention: %v\n", err)
+		return
+	}
+	if plan.After.Exact && plan.After.Bytes > plan.After.CapBytes {
+		fmt.Fprintf(output,
+			"unring: newest snapshot remains retained; measured snapshot usage is %d bytes, above the %d-byte cap.\n",
+			plan.After.Bytes, plan.After.CapBytes)
+	}
+}
+
+func printPartialRetentionFailure(output io.Writer, err error) {
+	var applyErr *localrollback.RetentionApplyError
+	if !errors.As(err, &applyErr) || !applyErr.SnapshotRemoved {
+		return
+	}
+	fmt.Fprintf(output,
+		"unring: IMPORTANT: clone snapshot data for %s was removed before its audit record could be updated; the audit record may still claim restore data is retained.\n",
+		applyErr.Removal.SessionID)
 }
 
 func writeJSON(stdout, stderr io.Writer, value any) int {
@@ -1513,6 +1945,17 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "unring: %v\n", err)
 		return internalErrorExitCode
 	}
+	unlockStoredSession, err := localrollback.AcquireSessionReadLock(store.StateDir(), record.ID)
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: lock restore session %s: %v\n", record.ID, err)
+		return internalErrorExitCode
+	}
+	defer unlockStoredSession()
+	record, err = store.LoadExact(record.ID)
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: session %s was pruned before restore began: %v\n", record.ID, err)
+		return internalErrorExitCode
+	}
 	record.Files = loadStoredFileSummary(store.StateDir(), record)
 	if len(record.Files.Changes) == 0 {
 		fmt.Fprintf(stdout, "Session %s changed no watched files.\n", record.ID)
@@ -1544,7 +1987,7 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		if len(skippedAgentState) > 0 {
 			fmt.Fprintln(stdout, "Skipped agent own-state paths; restore --all excludes them by default:")
 			for _, change := range skippedAgentState {
-				fmt.Fprintf(stdout, "  skipped  %s\n", change.Path)
+				fmt.Fprintf(stdout, "  skipped  %s\n", humanPath(change.Path))
 			}
 			fmt.Fprintf(stdout, "Include them with: unring restore --all --include-agent-state %s\n", record.ID)
 		}
@@ -1564,7 +2007,7 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "unring: This path was outside the clone scope. macOS permits only root to mount the recorded read-only APFS snapshot, so sudo will ask for authorization before unring accesses its prior contents.")
 			rootWarningPrinted = true
 		}
-		fmt.Fprintf(stderr, "unring: snapshot-only path: %s\n", change.Path)
+		fmt.Fprintf(stderr, "unring: snapshot-only path: %s\n", humanPath(change.Path))
 	}
 	results, err := localrollback.RestoreRecorded(store.StateDir(), record.ID, record.Files, selections, force)
 	if err != nil {
@@ -1578,19 +2021,19 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		}
 		switch result.Status {
 		case "restored":
-			fmt.Fprintf(stdout, "restored  %s\n", result.Path)
+			fmt.Fprintf(stdout, "restored  %s\n", humanPath(result.Path))
 		case "already-restored":
-			fmt.Fprintf(stdout, "already restored  %s\n", result.Path)
+			fmt.Fprintf(stdout, "already restored  %s\n", humanPath(result.Path))
 		case "refused":
 			exitCode = internalErrorExitCode
 			if result.Err != nil {
 				restoreEvent.Error = result.Err.Error()
-				fmt.Fprintf(stderr, "refused   %s: %v; not restored\n", result.Path, result.Err)
+				fmt.Fprintf(stderr, "refused   %s: %v; not restored\n", humanPath(result.Path), result.Err)
 				break
 			}
-			fmt.Fprintf(stderr, "refused   %s: changed after the session ended; not overwritten\n", result.Path)
+			fmt.Fprintf(stderr, "refused   %s: changed after the session ended; not overwritten\n", humanPath(result.Path))
 			if result.Sidecar != "" {
-				fmt.Fprintf(stderr, "snapshot version written alongside: %s\n", result.Sidecar)
+				fmt.Fprintf(stderr, "snapshot version written alongside: %s\n", humanPath(result.Sidecar))
 			} else {
 				fmt.Fprintln(stderr, "pre-session state was absence, so there is no snapshot file to write alongside")
 			}
@@ -1599,23 +2042,23 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 			exitCode = internalErrorExitCode
 			if result.Err != nil {
 				restoreEvent.Error = result.Err.Error()
-				fmt.Fprintf(stderr, "unavailable %s: %v\n", result.Path, result.Err)
+				fmt.Fprintf(stderr, "unavailable %s: %v\n", humanPath(result.Path), result.Err)
 			} else {
-				fmt.Fprintf(stderr, "unavailable %s: path was outside snapshot coverage\n", result.Path)
+				fmt.Fprintf(stderr, "unavailable %s: path was outside snapshot coverage\n", humanPath(result.Path))
 			}
 		default:
 			exitCode = internalErrorExitCode
 			restoreEvent.Status = "error"
 			if result.Err != nil {
 				restoreEvent.Error = result.Err.Error()
-				fmt.Fprintf(stderr, "error     %s: %v; not restored\n", result.Path, result.Err)
+				fmt.Fprintf(stderr, "error     %s: %v; not restored\n", humanPath(result.Path), result.Err)
 			} else {
-				fmt.Fprintf(stderr, "error     %s; not restored\n", result.Path)
+				fmt.Fprintf(stderr, "error     %s; not restored\n", humanPath(result.Path))
 			}
 		}
 		record.Files.RestoreEvents = append(record.Files.RestoreEvents, restoreEvent)
 	}
-	if err := store.Save(record); err != nil {
+	if err := store.SaveWhileSessionLocked(record); err != nil {
 		fmt.Fprintf(stderr, "unring: record restore outcome: %v\n", err)
 		return internalErrorExitCode
 	}
@@ -1623,8 +2066,17 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 }
 
 func snapshotsCommand(args []string, stdout, stderr io.Writer) int {
-	if len(args) != 0 {
-		fmt.Fprintln(stderr, "Usage: unring snapshots")
+	flags := flag.NewFlagSet("unring snapshots", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	showAll := flags.Bool("all", false, "show every recorded session, including sessions without restore data")
+	flags.Usage = func() {
+		fmt.Fprintln(stderr, "Usage: unring snapshots [--all]")
+	}
+	if err := flags.Parse(args); err != nil {
+		return usageExitCode
+	}
+	if flags.NArg() != 0 {
+		flags.Usage()
 		return usageExitCode
 	}
 	store, err := audit.OpenStore()
@@ -1642,40 +2094,119 @@ func snapshotsCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "unring: inspect snapshot storage: %v\n", err)
 		return internalErrorExitCode
 	}
-	if usage.Exact {
+	for _, warning := range usage.Warnings {
+		fmt.Fprintf(stderr, "unring: snapshot storage warning for %s: %s.\n", warning.SessionID, warning.Error)
+	}
+	if len(usage.Warnings) > 0 {
+		fmt.Fprintf(stdout, "Snapshot storage: at least %d known bytes of %d bytes; %d sessions retained; usage is incomplete.\n",
+			usage.Bytes, usage.CapBytes, usage.Sessions)
+	} else if usage.Exact {
 		fmt.Fprintf(stdout, "Snapshot storage: %d bytes used of %d bytes; %d sessions retained.\n",
 			usage.Bytes, usage.CapBytes, usage.Sessions)
 	} else {
 		fmt.Fprintf(stdout, "Snapshot storage: upper-bound estimate %d bytes of %d bytes; %d sessions retained.\n",
 			usage.Bytes, usage.CapBytes, usage.Sessions)
 	}
+	fmt.Fprintln(stdout, "The retained-session count is the number of clone stores present, not the number of audit records.")
 	records, listErr := store.List()
 	if listErr != nil {
+		if records == nil {
+			fmt.Fprintf(stderr, "unring: inspect recorded sessions: %v\n", listErr)
+			return internalErrorExitCode
+		}
 		fmt.Fprintf(stderr, "unring: inspect session backstops: %v\n", listErr)
 	}
+	statuses := make([]snapshotSessionStatus, 0, len(records))
+	withRestoreData := make([]snapshotSessionStatus, 0, len(records))
 	for _, record := range records {
-		backstop := record.Files.Backstop
-		if !backstop.Available {
-			reason := backstop.Reason
-			if reason == "" {
-				reason = "no backstop was recorded"
-			}
-			fmt.Fprintf(stdout, "%s  NO WHOLE-VOLUME BACKSTOP — %s\n", record.ID, reason)
-			continue
-		}
-		presences := localrollback.InspectBackstop(backstop)
-		for _, presence := range presences {
-			status := "present"
-			if presence.Error != "" {
-				status = "presence unknown: " + presence.Error
-			} else if !presence.Present {
-				status = "PURGED OR DELETED"
-			}
-			fmt.Fprintf(stdout, "%s  %s on %s — %s\n",
-				record.ID, presence.Snapshot.Name, presence.Snapshot.MountPoint, status)
+		status := inspectSnapshotSession(store.StateDir(), record)
+		statuses = append(statuses, status)
+		if status.hasRestoreData {
+			withRestoreData = append(withRestoreData, status)
 		}
 	}
+	shown := withRestoreData
+	if *showAll {
+		shown = statuses
+	}
+	shownCount, truncated := boundedHumanSessionCount(len(shown), *showAll)
+	if truncated {
+		shown = shown[:shownCount]
+	}
+	for _, status := range shown {
+		fmt.Fprintln(stdout, status.line)
+	}
+	withoutRestoreData := len(statuses) - len(withRestoreData)
+	if !*showAll && withoutRestoreData > 0 {
+		fmt.Fprintf(stdout, "%d audit-only sessions with no currently restorable file snapshot data were omitted; use unring snapshots --all to show every recorded session.\n", withoutRestoreData)
+	}
+	if truncated {
+		fmt.Fprintf(stdout, "Showing the newest %d of %d sessions with retained or possibly present restore data; use unring snapshots --all to show everything.\n", defaultSessionListLimit, len(withRestoreData))
+	}
 	return 0
+}
+
+type snapshotSessionStatus struct {
+	line           string
+	hasRestoreData bool
+}
+
+func inspectSnapshotSession(stateDir string, record audit.Record) snapshotSessionStatus {
+	_, cloneErr := localrollback.LoadSealedSummary(stateDir, record.ID)
+	cloneRetained := cloneErr == nil
+	backstop := record.Files.Backstop
+	if !backstop.Available {
+		reason := backstop.Reason
+		if reason == "" {
+			reason = "no backstop was recorded"
+		}
+		if cloneRetained {
+			return snapshotSessionStatus{
+				line:           record.ID + "  CLONE STORE RETAINED; NO WHOLE-VOLUME BACKSTOP — " + reason,
+				hasRestoreData: true,
+			}
+		}
+		return snapshotSessionStatus{
+			line: record.ID + "  NO RESTORABLE FILE SNAPSHOT DATA — clone store absent; no whole-volume backstop: " + reason,
+		}
+	}
+	presences := localrollback.InspectBackstop(backstop)
+	parts := make([]string, 0, len(presences))
+	volumeMayRestore := false
+	for _, presence := range presences {
+		status := "present"
+		if presence.Error != "" {
+			status = "presence unknown: " + presence.Error
+			volumeMayRestore = true
+		} else if !presence.Present {
+			status = "PURGED OR DELETED"
+		} else {
+			volumeMayRestore = true
+		}
+		parts = append(parts, presence.Snapshot.Name+" on "+presence.Snapshot.MountPoint+" — "+status)
+	}
+	prefix := "NO CLONE STORE"
+	if cloneRetained {
+		prefix = "CLONE STORE RETAINED"
+	}
+	line := record.ID + "  " + prefix
+	if len(parts) > 0 {
+		line += "; VOLUME SNAPSHOT: " + strings.Join(parts, "; ")
+	} else {
+		parts = append(parts, "recorded whole-volume backstop contains no snapshots")
+		line += "; VOLUME BACKSTOP: " + parts[0]
+	}
+	if !cloneRetained && !volumeMayRestore {
+		line = record.ID + "  NO RESTORABLE FILE SNAPSHOT DATA — clone store absent; " + strings.Join(parts, "; ")
+	}
+	return snapshotSessionStatus{line: line, hasRestoreData: cloneRetained || volumeMayRestore}
+}
+
+func boundedHumanSessionCount(total int, showAll bool) (int, bool) {
+	if showAll || total <= defaultSessionListLimit {
+		return total, false
+	}
+	return defaultSessionListLimit, true
 }
 
 func printRestoreListing(output io.Writer, record audit.Record) {
@@ -1687,24 +2218,16 @@ func printRestoreListing(output io.Writer, record audit.Record) {
 	}
 	regular, agentState := groupAgentStateChanges(record.Files.Changes, agentStateRoots)
 	for _, change := range regular {
-		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
-		if change.RestoreSource == localrollback.RestoreSourceVolume {
-			fmt.Fprintln(output, "             SNAPSHOT ONLY: restore requires sudo because APFS snapshot mounting is root-only")
-		} else if change.UnrestorableReason != "" {
-			fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
-		}
+		printRestoreListingChange(output, change, record.Files.Retained)
 	}
 	if len(agentState) > 0 {
 		fmt.Fprintln(output, "AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
 		for _, change := range agentState {
-			fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
-			if change.RestoreSource == localrollback.RestoreSourceVolume {
-				fmt.Fprintln(output, "             SNAPSHOT ONLY: restore requires sudo because APFS snapshot mounting is root-only")
-			} else if change.UnrestorableReason != "" {
-				fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
-			}
+			printRestoreListingChange(output, change, record.Files.Retained)
 		}
-		fmt.Fprintf(output, "Include this group with: unring restore --all --include-agent-state %s\n", record.ID)
+		if hasCurrentlyRestorableFileChange(agentState, record.Files.Retained) {
+			fmt.Fprintf(output, "Include this group with: unring restore --all --include-agent-state %s\n", record.ID)
+		}
 	}
 	if !record.Files.Retained {
 		if hasVolumeRestorableFileChange(record.Files.Changes) {
@@ -1715,11 +2238,23 @@ func printRestoreListing(output io.Writer, record audit.Record) {
 		fmt.Fprintln(output, "Clone snapshot data has been evicted; these changes are no longer restorable.")
 		return
 	}
-	if hasRestorableFileChange(record.Files.Changes) {
+	if hasCurrentlyRestorableFileChange(record.Files.Changes, record.Files.Retained) {
 		fmt.Fprintf(output, "Restore selected paths with: unring restore %s <path> [...]\n", record.ID)
 		fmt.Fprintf(output, "Restore every restorable path except agent own-state with: unring restore --all %s\n", record.ID)
 	} else {
 		fmt.Fprintln(output, "No changed path has restorable snapshot data.")
+	}
+}
+
+func printRestoreListingChange(output io.Writer, change localrollback.Change, cloneRetained bool) {
+	fmt.Fprintf(output, "  %-8s %s\n", change.Kind, humanPath(change.Path))
+	switch {
+	case change.UnrestorableReason != "":
+		fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
+	case change.RestoreSource == localrollback.RestoreSourceVolume:
+		fmt.Fprintln(output, "             SNAPSHOT ONLY: restore requires sudo because APFS snapshot mounting is root-only")
+	case !cloneRetained:
+		fmt.Fprintln(output, "             NOT RESTORABLE: clone snapshot data was evicted; this path was not stored in the volume-snapshot restore layer")
 	}
 }
 
@@ -1728,7 +2263,9 @@ func loadStoredFileSummary(stateDir string, record audit.Record) localrollback.S
 	if err != nil {
 		// Clone retention can evict the manifest before the audit record. The
 		// audit copy also remains authoritative when the manifest is unsealed.
-		return record.Files
+		summary := record.Files
+		summary.Retained = false
+		return summary
 	}
 	summary := record.Files
 	// The audit record is the later, more durable copy of changes and errors.
@@ -1750,6 +2287,18 @@ func hasRestorableFileChange(changes []localrollback.Change) bool {
 	return false
 }
 
+func hasCurrentlyRestorableFileChange(changes []localrollback.Change, cloneRetained bool) bool {
+	for _, change := range changes {
+		if change.UnrestorableReason != "" {
+			continue
+		}
+		if change.RestoreSource == localrollback.RestoreSourceVolume || cloneRetained {
+			return true
+		}
+	}
+	return false
+}
+
 func hasVolumeRestorableFileChange(changes []localrollback.Change) bool {
 	for _, change := range changes {
 		if change.UnrestorableReason == "" && change.RestoreSource == localrollback.RestoreSourceVolume {
@@ -1765,7 +2314,7 @@ func printAuditRecord(output io.Writer, record audit.Record) {
 	if !record.EndedAt.IsZero() {
 		fmt.Fprintf(output, "Ended:    %s\n", record.EndedAt.Local().Format(time.RFC3339))
 	}
-	fmt.Fprintf(output, "Command:  %s\n", strings.Join(record.Command, " "))
+	fmt.Fprintf(output, "Command:  %s\n", humanCommand(record.Command))
 	fmt.Fprintf(output, "Decision: %s\n", record.Decision)
 	fmt.Fprintf(output, "Outcome:  %s\n", record.Outcome)
 	fmt.Fprintf(output, "Exit code: %d\n", record.ExitCode)
@@ -2416,6 +2965,23 @@ func isTerminal(reader io.Reader) bool {
 	return ok && term.IsTerminal(int(file.Fd()))
 }
 
+func humanPath(path string) string {
+	for _, character := range path {
+		if character < ' ' || character == 0x7f {
+			return strconv.Quote(path)
+		}
+	}
+	return path
+}
+
+func humanCommand(command []string) string {
+	displayed := make([]string, len(command))
+	for index, argument := range command {
+		displayed[index] = humanPath(argument)
+	}
+	return strings.Join(displayed, " ")
+}
+
 func pastTense(decision pgproxy.Decision) string {
 	if decision == pgproxy.DecisionCommit {
 		return "committed"
@@ -2433,9 +2999,10 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "Usage:")
 	fmt.Fprintln(output, "  unring run [--commit | --discard] [--outbound] [--watch path | --watch-only path] -- <command> [args...]")
-	fmt.Fprintln(output, "  unring log [--json] [session-id]")
+	fmt.Fprintln(output, "  unring log [--json] [--all] [session-id]")
 	fmt.Fprintln(output, "  unring restore [--force] [--all [--include-agent-state]] <session-id> [changed-path ...]")
-	fmt.Fprintln(output, "  unring snapshots")
+	fmt.Fprintln(output, "  unring prune [--all] [--confirm preview-token]")
+	fmt.Fprintln(output, "  unring snapshots [--all]")
 	fmt.Fprintln(output, "  unring <command-on-PATH> [--] [args...]")
 	fmt.Fprintln(output, "  unring claude|codex|opencode [--] [args...]")
 	fmt.Fprintln(output, "  unring --version")

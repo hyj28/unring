@@ -379,7 +379,9 @@ func TestRestoreRefusesIncompleteAndEvictedSnapshots(t *testing.T) {
 		t.Fatalf("restore incomplete error = %v", err)
 	}
 	incomplete.Seal(time.Now())
-	if _, _, err := EnforceRetention(stateDir, 0, ""); err != nil {
+	if err := ApplyRetentionRemovals(stateDir, []RetentionRemoval{{
+		SessionID: "incomplete", HasSnapshot: true,
+	}}, nil, func(RetentionRemoval) error { return nil }, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Restore(stateDir, "incomplete", []string{file}, false); err == nil || !strings.Contains(err.Error(), "evicted") {
@@ -441,8 +443,9 @@ func TestEvictionWaitsForRestoreReaderLock(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := EnforceRetention(stateDir, 0, "")
-		done <- err
+		done <- ApplyRetentionRemovals(stateDir, []RetentionRemoval{{
+			SessionID: "locked", HasSnapshot: true,
+		}}, nil, func(RetentionRemoval) error { return nil }, nil)
 	}()
 	select {
 	case err := <-done:
@@ -480,12 +483,21 @@ func TestRetentionEvictsSnapshotContainingReadOnlyTree(t *testing.T) {
 		}
 	}
 
-	evicted, usage, err := EnforceRetention(stateDir, 0, "")
+	var evicted []string
+	err := ApplyRetentionRemovals(stateDir, []RetentionRemoval{{
+		SessionID: "read-only", HasSnapshot: true, StorageBytes: 100, StorageExact: true,
+	}}, nil, func(RetentionRemoval) error { return nil }, func(removal RetentionRemoval) {
+		evicted = append(evicted, removal.SessionID)
+	})
 	if err != nil {
 		t.Fatalf("evict read-only snapshot: %v", err)
 	}
 	if len(evicted) != 1 || evicted[0] != "read-only" {
 		t.Fatalf("evicted = %#v, want [read-only]", evicted)
+	}
+	usage, err := StorageUsage(stateDir, 0)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if usage.Bytes != 0 || usage.Sessions != 0 {
 		t.Fatalf("usage after eviction = %#v, want zero bytes and sessions", usage)
@@ -513,9 +525,11 @@ func TestRetentionReportsSnapshotItCannotEvict(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(snapshotRoot, 0o700) })
 
-	_, _, err := EnforceRetention(stateDir, 0, "")
-	if err == nil || !strings.Contains(err.Error(), "evict snapshot blocked") {
-		t.Fatalf("retention error = %v, want named eviction failure", err)
+	err := ApplyRetentionRemovals(stateDir, []RetentionRemoval{{
+		SessionID: "blocked", HasSnapshot: true,
+	}}, nil, func(RetentionRemoval) error { return nil }, nil)
+	if err == nil || !strings.Contains(err.Error(), "remove retained snapshot blocked") {
+		t.Fatalf("retention error = %v, want named removal failure", err)
 	}
 }
 

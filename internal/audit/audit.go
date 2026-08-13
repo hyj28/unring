@@ -18,6 +18,7 @@ import (
 	"github.com/hyj28/unring/internal/httpsproxy"
 	"github.com/hyj28/unring/internal/localrollback"
 	"github.com/hyj28/unring/internal/pgproxy"
+	"github.com/hyj28/unring/internal/statelock"
 )
 
 const recordVersion = 1
@@ -157,10 +158,30 @@ func NewRecord(command []string, now time.Time) (Record, error) {
 }
 
 // Save atomically replaces a session record with restrictive permissions.
+// Writers take the session's exclusive state lock so a stale writer cannot
+// race prune and recreate a deleted audit record.
 func (s *Store) Save(record Record) error {
 	if record.ID == "" || strings.ContainsAny(record.ID, `/\`) {
 		return errors.New("save audit record: invalid session id")
 	}
+	unlock, err := statelock.Acquire(s.stateDir, record.ID, statelock.Exclusive)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return s.saveLocked(record)
+}
+
+// SaveWhileSessionLocked persists a record while the caller holds that
+// session's shared or exclusive state lock.
+func (s *Store) SaveWhileSessionLocked(record Record) error {
+	if record.ID == "" || strings.ContainsAny(record.ID, `/\`) {
+		return errors.New("save audit record: invalid session id")
+	}
+	return s.saveLocked(record)
+}
+
+func (s *Store) saveLocked(record Record) error {
 	data, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode audit record: %w", err)
@@ -253,6 +274,46 @@ func (s *Store) Load(id string) (Record, error) {
 		return Record{}, fmt.Errorf("audit session %q not found", id)
 	}
 	return s.loadPath(match)
+}
+
+// LoadExact loads one full session id without prefix matching. Callers that
+// already hold the session lock use this to validate retention state.
+func (s *Store) LoadExact(id string) (Record, error) {
+	if id == "" || strings.ContainsAny(id, `/\\`) {
+		return Record{}, errors.New("load audit record: invalid session id")
+	}
+	return s.loadPath(filepath.Join(s.logDir, id+".json"))
+}
+
+// Delete removes one exact audit record under the same state lock used by
+// restore and snapshot retention.
+func (s *Store) Delete(id string) error {
+	if id == "" || strings.ContainsAny(id, `/\\`) {
+		return errors.New("delete audit record: invalid session id")
+	}
+	unlock, err := statelock.Acquire(s.stateDir, id, statelock.Exclusive)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return s.deleteLocked(id)
+}
+
+// DeleteWhileSessionLocked removes a record while the caller holds that
+// session's exclusive state lock.
+func (s *Store) DeleteWhileSessionLocked(id string) error {
+	if id == "" || strings.ContainsAny(id, `/\\`) {
+		return errors.New("delete audit record: invalid session id")
+	}
+	return s.deleteLocked(id)
+}
+
+func (s *Store) deleteLocked(id string) error {
+	path := filepath.Join(s.logDir, id+".json")
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("delete audit record %s: %w", id, err)
+	}
+	return nil
 }
 
 func (s *Store) loadPath(path string) (Record, error) {
