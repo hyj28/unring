@@ -121,7 +121,9 @@ unring restore --all <session-id>            # restore covered paths except agen
 unring restore --all --include-agent-state <session-id>
 unring restore --force <session-id> path     # explicitly overwrite a conflict
 unring snapshots                             # inspect clone usage and APFS backstop presence
+unring snapshots --all                       # include audit-only sessions with no restore data
 unring prune                                 # show sessions outside retention limits
+unring prune --all                           # name the complete retention set when over 50 sessions
 unring prune --confirm <preview-token>       # remove exactly the previewed sessions
 ```
 
@@ -159,6 +161,12 @@ an upper bound and does not evict snapshots based on that estimate.
 Human-readable `unring log` lists at most the newest 50 sessions by default and says when
 older records were omitted; use `unring log --all` to request every human-readable row.
 `unring log --json` always returns every record so redirected structured output is complete.
+`unring snapshots` uses the same 50-session bound for sessions with retained or possibly
+present restore data, summarises audit-only sessions whose clone and volume snapshots are
+gone, and uses `--all` to show every audit record with an explicit restore-data status.
+`unring prune` also bounds its default per-session listing at 50. When the retention set is
+larger, the bounded listing deliberately issues no confirmation token; `unring prune --all`
+names the complete set before issuing the token.
 
 Change detection keeps metadata as its fast oracle. For a clone-backed regular file whose
 type, size, mode, and link count still agree, unring compares bytes only up to 8 MiB before
