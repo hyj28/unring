@@ -291,6 +291,9 @@ func restoreVolumeMounted(plan volumeRestorePlan, mountPoint string, force bool)
 	if err == nil && plan.possibleRestored {
 		var matches bool
 		matches, err = pathMatchesMountedBefore(snapshotPath, change.Path, change.Before)
+		if err != nil && force {
+			err = nil
+		}
 		if err == nil && matches {
 			result.Status = "already-restored"
 			return result
@@ -328,7 +331,10 @@ func matchesRestoredMetadata(current Entry, exists bool, before *Entry) bool {
 	case "symlink":
 		return current.LinkTarget == before.LinkTarget
 	case "file":
-		return current.Size == before.Size && current.MTime == before.MTime
+		// Equal size means the live file might already contain the original
+		// bytes. Volume-backed restores must mount and compare before claiming
+		// either that it is restored or that it changed.
+		return current.Size == before.Size
 	default:
 		return false
 	}
@@ -344,7 +350,7 @@ func pathMatchesMountedBefore(snapshotPath, currentPath string, before *Entry) (
 	case "file":
 		equal, err := filesEqual(snapshotPath, currentPath)
 		if err != nil {
-			return false, nil
+			return false, fmt.Errorf("compare live path with mounted snapshot: %w", err)
 		}
 		return equal, nil
 	default:

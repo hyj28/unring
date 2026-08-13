@@ -179,12 +179,20 @@ func TestPruneKeepsTheNewestSessionEvenWhenExpired(t *testing.T) {
 	if err := store.Save(records[0]); err != nil {
 		t.Fatal(err)
 	}
-	var stdout, stderr strings.Builder
-	if code := Main([]string{"prune"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
-		t.Fatalf("prune exit = %d: %s", code, stderr.String())
+	token, err := savePrunePreview(stateDir, []localrollback.RetentionRemoval{{
+		SessionID: records[0].ID, StartedAt: records[0].StartedAt,
+		StorageBytes: records[0].Files.StorageBytes, StorageExact: records[0].Files.StorageExact,
+		HasSnapshot: true, Expired: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(stdout.String(), "Nothing to prune") || storedRecordCount(t, store) != 1 {
-		t.Fatalf("newest expired session was not protected:\n%s", stdout.String())
+	var stdout, stderr strings.Builder
+	if code := Main([]string{"prune", "--confirm", token}, strings.NewReader(""), &stdout, &stderr); code != internalErrorExitCode {
+		t.Fatalf("confirmed prune exit = %d, want %d: %s", code, internalErrorExitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "is now the newest stored session") || storedRecordCount(t, store) != 1 || snapshotStoreCount(t, stateDir) != 1 {
+		t.Fatalf("destructive prune did not protect newest expired session:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
 	}
 }
 
@@ -609,6 +617,8 @@ func TestPruneReportsCompletedAndPartialRemovalBeforeError(t *testing.T) {
 			t.Fatal(err)
 		}
 		record.Files.Retained = true
+		record.Files.StorageBytes = 100
+		record.Files.StorageExact = true
 		if err := store.Save(record); err != nil {
 			t.Fatal(err)
 		}
@@ -624,15 +634,27 @@ func TestPruneReportsCompletedAndPartialRemovalBeforeError(t *testing.T) {
 		}
 	}
 	removals := []localrollback.RetentionRemoval{
-		{SessionID: records[0].ID, HasSnapshot: true, CapRequired: true},
-		{SessionID: records[1].ID, HasSnapshot: true, CapRequired: true},
-		{SessionID: records[2].ID, HasSnapshot: true, CapRequired: true},
+		{SessionID: records[0].ID, StorageBytes: 100, StorageExact: true, HasSnapshot: true, CapRequired: true},
+		{SessionID: records[1].ID, StorageBytes: 100, StorageExact: true, HasSnapshot: true, CapRequired: true},
+		{SessionID: records[2].ID, StorageBytes: 100, StorageExact: true, HasSnapshot: true, CapRequired: true},
+	}
+	if err := localrollback.SaveRetentionCap(stateDir, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "config.yaml"), []byte("retention_days: 106751\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	token, err := savePrunePreview(stateDir, removals)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(stateDir, "logs", records[2].ID+".json"), []byte("corrupt\n"), 0o600); err != nil {
+	if err := os.Rename(
+		filepath.Join(stateDir, "logs", records[2].ID+".json"),
+		filepath.Join(stateDir, "logs", "relocated-c.json"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(stateDir, "logs", records[2].ID+".json"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	var stdout, stderr strings.Builder

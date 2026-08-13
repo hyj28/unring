@@ -195,13 +195,17 @@ type Usage struct {
 	CapBytes int64
 	Sessions int
 	Exact    bool
+	Warnings []RetentionWarning
 }
 
 // StoredSession is the audit-layer identity and start time used by the shared
 // age-and-space retention planner.
 type StoredSession struct {
-	ID        string
-	StartedAt time.Time
+	ID           string
+	StartedAt    time.Time
+	StorageBytes int64
+	StorageExact bool
+	StorageKnown bool
 }
 
 // RetentionRemoval is one session selected once by the cooperative age and
@@ -1747,20 +1751,51 @@ func PlanRetention(
 		return RetentionPlan{}, err
 	}
 	defer unlockRetention()
+	return planRetentionWhileLocked(stateDir, sessions, capBytes, maxAge, now)
+}
+
+// PlanRetentionWhileLocked computes a retention plan while the caller holds
+// the retention lock. It exists so ApplyRetentionRemovals can validate a saved
+// destructive plan without dropping its exclusive lock.
+func PlanRetentionWhileLocked(
+	stateDir string,
+	sessions []StoredSession,
+	capBytes int64,
+	maxAge time.Duration,
+	now time.Time,
+) (RetentionPlan, error) {
+	if capBytes < 0 {
+		return RetentionPlan{}, errors.New("snapshot retention cap cannot be negative")
+	}
+	return planRetentionWhileLocked(stateDir, sessions, capBytes, maxAge, now)
+}
+
+func planRetentionWhileLocked(
+	stateDir string,
+	sessions []StoredSession,
+	capBytes int64,
+	maxAge time.Duration,
+	now time.Time,
+) (RetentionPlan, error) {
 	type retained struct {
 		StoredSession
-		bytes       int64
-		exact       bool
-		hasSnapshot bool
-		damaged     bool
-		auditRecord bool
+		bytes           int64
+		exact           bool
+		accountingKnown bool
+		hasSnapshot     bool
+		damaged         bool
+		auditRecord     bool
 	}
 	byID := make(map[string]*retained, len(sessions))
 	for _, session := range sessions {
 		if session.ID == "" || strings.ContainsAny(session.ID, `/\\`) {
 			return RetentionPlan{}, fmt.Errorf("plan retention: invalid session id %q", session.ID)
 		}
-		copy := &retained{StoredSession: session, exact: true, auditRecord: true}
+		copy := &retained{
+			StoredSession: session, bytes: session.StorageBytes,
+			exact: session.StorageExact, accountingKnown: session.StorageKnown,
+			auditRecord: true,
+		}
 		byID[session.ID] = copy
 	}
 	root := filepath.Join(stateDir, "snapshots")
@@ -1790,7 +1825,9 @@ func PlanRetention(
 			}
 			item.hasSnapshot = true
 			item.damaged = true
-			item.exact = false
+			if !item.accountingKnown {
+				item.exact = false
+			}
 			continue
 		}
 		item := byID[entry.Name()]
@@ -1800,6 +1837,7 @@ func PlanRetention(
 		}
 		item.bytes = value.StorageBytes
 		item.exact = value.StorageExact
+		item.accountingKnown = true
 		item.hasSnapshot = true
 	}
 	ordered := make([]*retained, 0, len(byID))
@@ -1821,17 +1859,26 @@ func PlanRetention(
 		if !item.hasSnapshot {
 			continue
 		}
-		plan.Before.Bytes += item.bytes
+		if item.accountingKnown {
+			plan.Before.Bytes += item.bytes
+		}
 		plan.Before.Sessions++
 		if item.damaged {
-			plan.Before.Exact = false
-			plan.Warnings = append(plan.Warnings, RetentionWarning{
-				SessionID: item.ID,
-				Error:     "snapshot manifest is missing or unreadable; byte-cap accounting skipped this store",
-			})
-		} else if item.exact {
+			if item.accountingKnown && item.exact {
+				plan.Warnings = append(plan.Warnings, RetentionWarning{
+					SessionID: item.ID,
+					Error:     "snapshot manifest is missing or unreadable; using measured bytes from its audit record for byte-cap accounting",
+				})
+			} else {
+				plan.Warnings = append(plan.Warnings, RetentionWarning{
+					SessionID: item.ID,
+					Error:     "snapshot manifest is missing or unreadable; its bytes are unknown, so only age expiry can select this store, subject to the newest-session guard",
+				})
+			}
+		}
+		if item.accountingKnown && item.exact {
 			enforcedBytes += item.bytes
-		} else {
+		} else if !item.accountingKnown || !item.exact {
 			plan.Before.Exact = false
 		}
 	}
@@ -1849,20 +1896,22 @@ func PlanRetention(
 	cutoff := now.Add(-maxAge)
 	for _, item := range ordered {
 		expired := maxAge > 0 && item.StartedAt.Before(cutoff)
-		capRequired := item.hasSnapshot && !item.damaged && item.exact && enforcedBytes > capBytes
+		capRequired := item.hasSnapshot && item.accountingKnown && item.exact && enforcedBytes > capBytes
 		if protected[item.ID] || (!expired && !capRequired) {
 			continue
 		}
 		plan.Removals = append(plan.Removals, RetentionRemoval{
 			SessionID: item.ID, StartedAt: item.StartedAt,
-			StorageBytes: item.bytes, StorageExact: item.exact,
+			StorageBytes: item.bytes, StorageExact: item.accountingKnown && item.exact,
 			HasSnapshot: item.hasSnapshot,
 			Expired:     expired, CapRequired: capRequired,
 		})
 		if item.hasSnapshot {
-			plan.After.Bytes -= item.bytes
+			if item.accountingKnown {
+				plan.After.Bytes -= item.bytes
+			}
 			plan.After.Sessions--
-			if item.exact {
+			if item.accountingKnown && item.exact {
 				enforcedBytes -= item.bytes
 			}
 		}
@@ -1982,7 +2031,13 @@ func StorageUsage(stateDir string, capBytes int64) (Usage, error) {
 		}
 		value, readErr := readManifest(filepath.Join(root, entry.Name()))
 		if readErr != nil {
-			return Usage{}, fmt.Errorf("read retained snapshot %s: %w", entry.Name(), readErr)
+			usage.Exact = false
+			usage.Sessions++
+			usage.Warnings = append(usage.Warnings, RetentionWarning{
+				SessionID: entry.Name(),
+				Error:     "snapshot manifest is missing or unreadable; usage excludes its unknown bytes",
+			})
+			continue
 		}
 		usage.Bytes += value.StorageBytes
 		if !value.StorageExact {

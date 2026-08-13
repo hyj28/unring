@@ -5,8 +5,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestSealSuppressesByteIdenticalRewriteWithRestoredMTime(t *testing.T) {
@@ -172,7 +175,7 @@ func TestSealReportsMetadataChangeWhenLiveFileCannotBeRead(t *testing.T) {
 	assertRollbackChange(t, session.Seal(time.Now()).Changes, "modified", path)
 }
 
-func TestVolumeRestoreSameSizeConflictRefusesBeforeMount(t *testing.T) {
+func TestVolumeRestoreSameSizeConflictMountsBeforeRefusing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "volume.txt")
 	writeRollbackTestFile(t, path, "imposter")
 	current, _, err := currentEntry(path)
@@ -183,7 +186,10 @@ func TestVolumeRestoreSameSizeConflictRefusesBeforeMount(t *testing.T) {
 	before.MTime--
 	after := current
 	after.MTime -= 2
-	platform := &fakeVolumeSnapshotPlatform{created: true, present: true, excluded: map[string]bool{}}
+	platform := &fakeVolumeSnapshotPlatform{
+		created: true, present: true, excluded: map[string]bool{},
+		snapshotFiles: map[string]string{path: "original"},
+	}
 	restorePlatform := SetVolumeSnapshotPlatformForTest(platform)
 	defer restorePlatform()
 	results, err := RestoreRecorded(t.TempDir(), "volume-preflight", Summary{Changes: []Change{{
@@ -195,10 +201,85 @@ func TestVolumeRestoreSameSizeConflictRefusesBeforeMount(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(results) != 1 || results[0].Status != "refused" {
-		t.Fatalf("results = %#v, want preflight refusal", results)
+		t.Fatalf("results = %#v, want refusal after comparing bytes", results)
 	}
-	if platform.mountCalls != 0 {
-		t.Fatalf("volume snapshot mounted %d times for guaranteed refusal", platform.mountCalls)
+	if platform.mountCalls != 1 || platform.unmountCalls != 1 {
+		t.Fatalf("mount/unmount calls = %d/%d, want literal 1/1", platform.mountCalls, platform.unmountCalls)
+	}
+}
+
+func TestVolumeRestoreRecognizesOriginalBytesAfterMount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "volume.txt")
+	writeRollbackTestFile(t, path, "original")
+	current, _, err := currentEntry(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := current
+	before.MTime--
+	after := current
+	after.MTime -= 2
+	platform := &fakeVolumeSnapshotPlatform{
+		created: true, present: true, excluded: map[string]bool{},
+		snapshotFiles: map[string]string{path: "original"},
+	}
+	restorePlatform := SetVolumeSnapshotPlatformForTest(platform)
+	defer restorePlatform()
+	results, err := RestoreRecorded(t.TempDir(), "volume-original", Summary{Changes: []Change{{
+		Kind: "modified", Path: path, Before: &before, After: &after,
+		RestoreSource:  RestoreSourceVolume,
+		VolumeSnapshot: &VolumeSnapshot{Name: "com.apple.TimeMachine.2026-08-09-120000.local", VolumeID: "disk-test-apfs", MountPoint: "/"},
+	}}}, []string{path}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Status != "already-restored" {
+		t.Fatalf("results = %#v, want already-restored after comparing bytes", results)
+	}
+	if platform.mountCalls != 1 || platform.unmountCalls != 1 {
+		t.Fatalf("mount/unmount calls = %d/%d, want literal 1/1", platform.mountCalls, platform.unmountCalls)
+	}
+}
+
+func TestVolumeRestoreDoesNotClaimConflictWhenMountedBytesCannotBeCompared(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing-live.txt")
+	snapshotPath := filepath.Join(t.TempDir(), "snapshot.txt")
+	writeRollbackTestFile(t, snapshotPath, "original")
+	before := &Entry{Type: "file", Mode: uint32(0o600), Size: 8}
+	matches, err := pathMatchesMountedBefore(snapshotPath, path, before)
+	if matches || err == nil || !strings.Contains(err.Error(), "compare live path with mounted snapshot") {
+		t.Fatalf("comparison = %v, %v, want an explicit indeterminate error", matches, err)
+	}
+}
+
+func TestVolumeRestoreDifferentSizeConflictRefusesBeforeMount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "volume.txt")
+	writeRollbackTestFile(t, path, "different live bytes")
+	current, _, err := currentEntry(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := current
+	before.Size = 8
+	before.MTime--
+	after := current
+	after.MTime -= 2
+	platform := &fakeVolumeSnapshotPlatform{created: true, present: true, excluded: map[string]bool{}}
+	restorePlatform := SetVolumeSnapshotPlatformForTest(platform)
+	defer restorePlatform()
+	results, err := RestoreRecorded(t.TempDir(), "volume-size-conflict", Summary{Changes: []Change{{
+		Kind: "modified", Path: path, Before: &before, After: &after,
+		RestoreSource:  RestoreSourceVolume,
+		VolumeSnapshot: &VolumeSnapshot{Name: "com.apple.TimeMachine.2026-08-09-120000.local", VolumeID: "disk-test-apfs", MountPoint: "/"},
+	}}}, []string{path}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Status != "refused" {
+		t.Fatalf("results = %#v, want conclusive size-based refusal", results)
+	}
+	if platform.mountCalls != 0 || platform.unmountCalls != 0 {
+		t.Fatalf("mount/unmount calls = %d/%d, want literal 0/0", platform.mountCalls, platform.unmountCalls)
 	}
 }
 
@@ -279,6 +360,138 @@ func TestPlanRetentionSkipsDamagedSnapshotAndContinues(t *testing.T) {
 	}
 	if len(plan.Removals) != 1 || plan.Removals[0].SessionID != "healthy-old" || !plan.Removals[0].CapRequired {
 		t.Fatalf("removals = %#v, want healthy-old cap eviction", plan.Removals)
+	}
+}
+
+func TestPlanRetentionUsesAuditBytesToCapEvictDamagedSnapshot(t *testing.T) {
+	stateDir := t.TempDir()
+	root := filepath.Join(stateDir, "snapshots")
+	if err := os.MkdirAll(filepath.Join(root, "damaged-old"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	newDirectory := filepath.Join(root, "healthy-new")
+	if err := os.MkdirAll(newDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManifest(newDirectory, manifest{
+		Version: manifestVersion, SessionID: "healthy-new", StartedAt: time.Unix(2, 0),
+		StorageBytes: 100, StorageExact: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := PlanRetention(stateDir, []StoredSession{
+		{ID: "damaged-old", StartedAt: time.Unix(1, 0), StorageBytes: 100, StorageExact: true, StorageKnown: true},
+		{ID: "healthy-new", StartedAt: time.Unix(2, 0), StorageBytes: 100, StorageExact: true, StorageKnown: true},
+	}, 150, 365*24*time.Hour, time.Unix(3, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Before.Bytes != 200 || !plan.Before.Exact {
+		t.Fatalf("before usage = %#v, want literal exact 200 bytes", plan.Before)
+	}
+	if len(plan.Removals) != 1 || plan.Removals[0].SessionID != "damaged-old" || !plan.Removals[0].CapRequired {
+		t.Fatalf("removals = %#v, want damaged-old selected by cap", plan.Removals)
+	}
+	if len(plan.Warnings) != 1 || !strings.Contains(plan.Warnings[0].Error, "using measured bytes from its audit record") {
+		t.Fatalf("warnings = %#v, want audit-byte fallback disclosure", plan.Warnings)
+	}
+}
+
+func TestPlanRetentionAgeExpiresDamagedSnapshotWithUnknownBytes(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(stateDir, "snapshots", "damaged-old"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := PlanRetention(stateDir, []StoredSession{
+		{ID: "damaged-old", StartedAt: time.Unix(1, 0)},
+		{ID: "newest", StartedAt: time.Unix(3*24*60*60, 0)},
+	}, 1, 24*time.Hour, time.Unix(4*24*60*60, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Removals) != 1 || plan.Removals[0].SessionID != "damaged-old" || !plan.Removals[0].Expired || plan.Removals[0].CapRequired {
+		t.Fatalf("removals = %#v, want unknown damaged store selected only by age", plan.Removals)
+	}
+	if len(plan.Warnings) != 1 || plan.Warnings[0].Error != "snapshot manifest is missing or unreadable; its bytes are unknown, so only age expiry can select this store, subject to the newest-session guard" {
+		t.Fatalf("warnings = %#v, want literal age-only disclosure", plan.Warnings)
+	}
+}
+
+func TestStorageUsageSkipsDamagedManifestAndReportsHealthyUsage(t *testing.T) {
+	stateDir := t.TempDir()
+	root := filepath.Join(stateDir, "snapshots")
+	for _, id := range []string{"damaged", "healthy"} {
+		if err := os.MkdirAll(filepath.Join(root, id), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writeManifest(filepath.Join(root, "healthy"), manifest{
+		Version: manifestVersion, SessionID: "healthy", StorageBytes: 73, StorageExact: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	usage, err := StorageUsage(stateDir, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.Bytes != 73 || usage.CapBytes != 100 || usage.Sessions != 2 || usage.Exact {
+		t.Fatalf("usage = %#v, want literal 73 known bytes across two sessions with incomplete accounting", usage)
+	}
+	if len(usage.Warnings) != 1 || usage.Warnings[0].SessionID != "damaged" {
+		t.Fatalf("warnings = %#v, want damaged session", usage.Warnings)
+	}
+}
+
+func TestStorageUsageWithOnlyDamagedManifestStillReturnsUsage(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(stateDir, "snapshots", "damaged"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	usage, err := StorageUsage(stateDir, 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.Bytes != 0 || usage.CapBytes != 99 || usage.Sessions != 1 || usage.Exact {
+		t.Fatalf("usage = %#v, want literal zero known bytes across one incomplete session", usage)
+	}
+	if len(usage.Warnings) != 1 || usage.Warnings[0].SessionID != "damaged" {
+		t.Fatalf("warnings = %#v, want damaged session", usage.Warnings)
+	}
+}
+
+func TestPlanRetentionWaitsForSessionLockBeforeReadingManifest(t *testing.T) {
+	stateDir := t.TempDir()
+	directory := filepath.Join(stateDir, "snapshots", "locked")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeManifest(directory, manifest{
+		Version: manifestVersion, SessionID: "locked", StartedAt: time.Unix(1, 0),
+		StorageBytes: 11, StorageExact: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := acquireSnapshotLock(stateDir, "locked", unix.LOCK_EX)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		_, planErr := PlanRetention(stateDir, []StoredSession{{ID: "locked", StartedAt: time.Unix(1, 0)}}, 100, 24*time.Hour, time.Unix(2, 0))
+		done <- planErr
+	}()
+	<-started
+	select {
+	case err := <-done:
+		unlock()
+		t.Fatalf("PlanRetention passed an exclusive session lock: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+	unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 

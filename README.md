@@ -140,8 +140,10 @@ measured snapshot allocation, and stored sessions expire after 14 days unless
 `retention_days` in `config.yaml` selects another positive number. The age and byte limits
 share one oldest-first decision, and the newest session is always kept. Automatic expiry is
 named in the new session's output and audit record. `unring prune` shows the same retention
-set without deleting it; the printed preview token is required to remove exactly that saved
-set, and a stale token is refused rather than recalculated. Reported
+set without deleting it; the printed preview token is valid for 24 hours and is required to
+remove exactly that saved set. Confirmation recomputes current eligibility under the
+retention lock and refuses the token if the newest session, limits, or stored state changed.
+Expired and abandoned tokens are collected by later prune invocations. Reported
 snapshot bytes are unring's retention accounting, not a promise of immediately increased
 free space: APFS clones can release references to shared blocks without changing free space
 until the other references are removed.
@@ -163,8 +165,10 @@ type, size, mode, and link count still agree, unring compares bytes only up to 8
 calling a metadata-only difference a modification. Larger files, files outside clone
 coverage, and comparison errors remain reported because unring could not establish
 equality. An explicit restore is different: when the clone is available, it streams the
-selected equal-size file once regardless of mtime or size, so manually returning to the
-original bytes is recognized as `already restored` without weakening the conflict guard.
+selected equal-size file once regardless of mtime, so manually returning to the original
+bytes is recognized as `already restored` without weakening the conflict guard. A
+volume-only equal-size conflict requires the already-announced privileged snapshot mount
+before unring can truthfully report either `already restored` or a byte-level conflict.
 
 Snapshot-only paths from the same recorded APFS snapshot are restored under one read-only
 mount per command, with one unmount after every selected path has been attempted. The
