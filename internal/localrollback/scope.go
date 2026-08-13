@@ -43,6 +43,7 @@ type Scope struct {
 	ScanExcluded      []string
 	ScanExcludedNames []string
 	ScanError         string
+	RetentionDays     int
 }
 
 type scopeConfigError struct {
@@ -94,8 +95,9 @@ func classifyConfigValidationError(err error) error {
 }
 
 type scopeConfig struct {
-	Watch   []string `yaml:"watch"`
-	Exclude []string `yaml:"exclude"`
+	Watch         []string `yaml:"watch"`
+	Exclude       []string `yaml:"exclude"`
+	RetentionDays *int     `yaml:"retention_days"`
 }
 
 // ScopeConfigPath returns the read-only snapshot-scope configuration filename.
@@ -239,7 +241,25 @@ func ResolveScope(options ScopeOptions) (Scope, error) {
 		ScanRoot: scanRoot, ScanExcluded: scanExcluded,
 		ScanExcludedNames: scanExcludedNames,
 		ScanError:         scanError,
+		RetentionDays:     configuredRetentionDays(config),
 	}, nil
+}
+
+// RetentionDaysForState loads the same config.yaml used by snapshot scope and
+// returns the configured session age, or the 14-day default.
+func RetentionDaysForState(stateDir string) (int, error) {
+	config, err := loadScopeConfig(stateDir, "", false)
+	if err != nil {
+		return 0, err
+	}
+	return configuredRetentionDays(config), nil
+}
+
+func configuredRetentionDays(config scopeConfig) int {
+	if config.RetentionDays == nil {
+		return DefaultRetentionDays
+	}
+	return *config.RetentionDays
 }
 
 func loadScopeConfig(stateDir, homeDirectory string, includeWatch bool) (scopeConfig, error) {
@@ -260,6 +280,11 @@ func loadScopeConfig(stateDir, homeDirectory string, includeWatch bool) (scopeCo
 			return config, nil
 		}
 		return scopeConfig{}, &scopeConfigError{err: fmt.Errorf("load snapshot scope config %s: decode YAML: %w", filename, err)}
+	}
+	if config.RetentionDays != nil && (*config.RetentionDays < 1 || *config.RetentionDays > 106751) {
+		return scopeConfig{}, &scopeConfigError{err: fmt.Errorf(
+			"load snapshot scope config %s: retention_days must be an integer from 1 through 106751", filename,
+		)}
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {

@@ -131,6 +131,19 @@ APFS snapshot costs 180 ms and covers the disk.
 - [x] M10.7 Restore snapshot-only selections under one mount, separate agent own-state in
       listings and default `--all` behavior, and demote unsupported special-file notices
 
+## M11 — Storage hygiene and accurate equality
+
+Design: [docs/LOCAL-ROLLBACK-DESIGN.md §9](docs/LOCAL-ROLLBACK-DESIGN.md). Decisions 19–20.
+
+- [x] M11.1 Add a safe-by-default `unring prune`, combine the existing measured byte cap
+      with configurable 14-day expiry, always keep the newest session, and announce and
+      retain automatic expiry events
+- [x] M11.2 Bound `unring log` to 50 newest sessions by default, disclose truncation, and
+      provide `--all`
+- [x] M11.3 Suppress conclusive clone-backed identical rewrites with bounded automatic byte
+      comparison; recognize explicitly restored original bytes without weakening conflicts
+- [x] M11.4 Quote control characters in human-readable paths without changing stored paths
+
 ---
 
 ## Explicitly out of scope for v1

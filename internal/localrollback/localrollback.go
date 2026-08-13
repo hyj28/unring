@@ -20,13 +20,18 @@ import (
 const (
 	// DefaultRetentionBytes is the default measured-allocation cap for retained snapshots.
 	DefaultRetentionBytes int64 = 5 << 30
-	manifestVersion             = 1
-	RestoreSourceClone          = "clone"
-	RestoreSourceVolume         = "volume-snapshot"
-	RestoreSourceNone           = "none"
+	// DefaultRetentionDays is the default maximum age for stored sessions.
+	DefaultRetentionDays = 14
+	manifestVersion      = 1
+	RestoreSourceClone   = "clone"
+	RestoreSourceVolume  = "volume-snapshot"
+	RestoreSourceNone    = "none"
 	// UnsupportedFileTypeCoverageReason is retained for special files such as
 	// Unix sockets that cannot be restored meaningfully per path.
 	UnsupportedFileTypeCoverageReason = "unsupported file type is outside snapshot coverage"
+	// AutomaticContentComparisonBytes bounds end-of-session byte comparisons.
+	// Larger files retain the metadata oracle's safe false-positive behavior.
+	AutomaticContentComparisonBytes int64 = 8 << 20
 )
 
 // Entry is the metadata used to detect a file change and a later restore conflict.
@@ -90,6 +95,15 @@ type RestoreRecord struct {
 	RestoredAt time.Time `json:"restored_at"`
 }
 
+// RetentionEvent records one automatic retention action announced by a run.
+type RetentionEvent struct {
+	SessionID    string `json:"session_id"`
+	StorageBytes int64  `json:"storage_bytes"`
+	StorageExact bool   `json:"storage_bytes_exact"`
+	Expired      bool   `json:"expired"`
+	CapRequired  bool   `json:"cap_required"`
+}
+
 // Summary is stored in the session audit record.
 type Summary struct {
 	Watched             []string         `json:"watched_paths"`
@@ -107,6 +121,7 @@ type Summary struct {
 	RetentionCap        int64            `json:"retention_cap_bytes"`
 	Retained            bool             `json:"retained"`
 	Evicted             []string         `json:"evicted_sessions,omitempty"`
+	RetentionEvents     []RetentionEvent `json:"retention_events,omitempty"`
 	RestoreEvents       []RestoreRecord  `json:"restores,omitempty"`
 	ChangeListScope     string           `json:"change_list_scope,omitempty"`
 	ChangeListRoots     []string         `json:"change_list_roots,omitempty"`
@@ -180,6 +195,33 @@ type Usage struct {
 	CapBytes int64
 	Sessions int
 	Exact    bool
+}
+
+// StoredSession is the audit-layer identity and start time used by the shared
+// age-and-space retention planner.
+type StoredSession struct {
+	ID        string
+	StartedAt time.Time
+}
+
+// RetentionRemoval is one session selected once by the cooperative age and
+// byte-cap policy. StorageBytes is unring's measured snapshot charge, not a
+// promise that deleting copy-on-write references immediately frees that many
+// filesystem bytes.
+type RetentionRemoval struct {
+	SessionID    string
+	StartedAt    time.Time
+	StorageBytes int64
+	StorageExact bool
+	Expired      bool
+	CapRequired  bool
+}
+
+// RetentionPlan is a stable oldest-first retention decision.
+type RetentionPlan struct {
+	Removals []RetentionRemoval
+	Before   Usage
+	After    Usage
 }
 
 // DefaultWatchPaths returns the deliberately narrow default scope: the project
@@ -460,12 +502,6 @@ func start(
 		dir: finalDir, manifest: m, summary: summary, platform: platform,
 		scanBefore: scanBefore,
 	}
-	evicted, _, err := EnforceRetention(stateDir, capBytes, sessionID)
-	if err != nil {
-		_ = removeSnapshotTree(finalDir)
-		return nil, Summary{}, err
-	}
-	summary.Evicted = evicted
 	session.summary = summary
 	return session, summary, nil
 }
@@ -566,7 +602,7 @@ func (s *Session) Seal(now time.Time) Summary {
 			root.Uncaptured[failure.Path] = failure.Error
 		}
 	}
-	changes := diff(before, after, diffExcluded, s.manifest.Roots)
+	changes := diff(before, after, diffExcluded, s.manifest.Roots, s.dir)
 	coveragePrefixes := failurePrefixes(coverageGaps)
 	coverageMessages := failureMessages(coverageGaps)
 	for index := range changes {
@@ -602,7 +638,7 @@ func (s *Session) Seal(now time.Time) Summary {
 			wideExcluded[failure.Path] = true
 		}
 	}
-	wideChanges := diff(s.scanBefore, wideAfter, wideExcluded, nil)
+	wideChanges := diff(s.scanBefore, wideAfter, wideExcluded, nil, "")
 	changeIndexes := make(map[string]int, len(changes))
 	for index := range changes {
 		changeIndexes[changes[index].Path] = index
@@ -614,7 +650,7 @@ func (s *Session) Seal(now time.Time) Summary {
 		}
 		observedBefore := entriesCoveredBy(root.UncapturedBefore, initialUncaptured[index])
 		observedAfter := entriesCoveredBy(rootAfter[index], initialUncaptured[index])
-		for _, change := range diff(observedBefore, observedAfter, rootDiffExcluded[index], nil) {
+		for _, change := range diff(observedBefore, observedAfter, rootDiffExcluded[index], nil, "") {
 			if _, exists := changeIndexes[change.Path]; exists {
 				continue
 			}
@@ -1345,7 +1381,7 @@ func entryFromInfo(path string, info fs.FileInfo) (Entry, error) {
 	return entry, nil
 }
 
-func diff(before, after map[string]Entry, uncaptured map[string]bool, roots []rootManifest) []Change {
+func diff(before, after map[string]Entry, uncaptured map[string]bool, roots []rootManifest, snapshotRoot string) []Change {
 	changes := make([]Change, 0)
 	for path, oldEntry := range before {
 		if excludedFromDiff(path, uncaptured, roots) {
@@ -1357,7 +1393,8 @@ func diff(before, after map[string]Entry, uncaptured map[string]bool, roots []ro
 			changes = append(changes, Change{Kind: "deleted", Path: path, Before: &beforeCopy})
 			continue
 		}
-		if entriesDiffer(oldEntry, newEntry) {
+		if entriesDiffer(oldEntry, newEntry) &&
+			!cheaplyMatchesSnapshot(path, oldEntry, newEntry, roots, snapshotRoot) {
 			beforeCopy, afterCopy := oldEntry, newEntry
 			changes = append(changes, Change{Kind: "modified", Path: path, Before: &beforeCopy, After: &afterCopy})
 		}
@@ -1371,6 +1408,25 @@ func diff(before, after map[string]Entry, uncaptured map[string]bool, roots []ro
 	}
 	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
 	return changes
+}
+
+// cheaplyMatchesSnapshot suppresses metadata-only false positives only when a
+// clone-backed byte comparison is bounded and conclusive. A missing clone, a
+// read error, or a file above the bound deliberately falls back to reporting
+// the metadata change.
+func cheaplyMatchesSnapshot(path string, before, after Entry, roots []rootManifest, snapshotRoot string) bool {
+	if snapshotRoot == "" || before.Type != "file" || after.Type != "file" ||
+		before.Size != after.Size || before.Size > AutomaticContentComparisonBytes ||
+		before.Mode != after.Mode || before.Links != after.Links {
+		return false
+	}
+	value := manifest{Roots: roots}
+	snapshotPath, err := snapshotPathFor(value, snapshotRoot, path)
+	if err != nil {
+		return false
+	}
+	equal, err := filesEqual(snapshotPath, path)
+	return err == nil && equal
 }
 
 func excludedFromDiff(path string, uncaptured map[string]bool, roots []rootManifest) bool {
@@ -1650,6 +1706,138 @@ func readManifest(directory string) (manifest, error) {
 		return manifest{}, fmt.Errorf("unsupported file snapshot manifest version %d", value.Version)
 	}
 	return value, nil
+}
+
+// PlanRetention applies age and measured-allocation limits in one oldest-first
+// pass. The newest stored session always survives. Unknown/inexact allocation
+// is never used to justify cap eviction, but age expiry can still select it.
+func PlanRetention(
+	stateDir string,
+	sessions []StoredSession,
+	capBytes int64,
+	maxAge time.Duration,
+	now time.Time,
+) (RetentionPlan, error) {
+	if capBytes < 0 {
+		return RetentionPlan{}, errors.New("snapshot retention cap cannot be negative")
+	}
+	type retained struct {
+		StoredSession
+		bytes       int64
+		exact       bool
+		hasSnapshot bool
+	}
+	byID := make(map[string]*retained, len(sessions))
+	for _, session := range sessions {
+		if session.ID == "" || strings.ContainsAny(session.ID, `/\\`) {
+			return RetentionPlan{}, fmt.Errorf("plan retention: invalid session id %q", session.ID)
+		}
+		copy := &retained{StoredSession: session, exact: true}
+		byID[session.ID] = copy
+	}
+	root := filepath.Join(stateDir, "snapshots")
+	entries, err := os.ReadDir(root)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return RetentionPlan{}, fmt.Errorf("inspect retained snapshots: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		value, readErr := readManifest(filepath.Join(root, entry.Name()))
+		if readErr != nil {
+			return RetentionPlan{}, fmt.Errorf("read retained snapshot %s: %w", entry.Name(), readErr)
+		}
+		item := byID[entry.Name()]
+		if item == nil {
+			item = &retained{StoredSession: StoredSession{ID: entry.Name(), StartedAt: value.StartedAt}}
+			byID[entry.Name()] = item
+		}
+		item.bytes = value.StorageBytes
+		item.exact = value.StorageExact
+		item.hasSnapshot = true
+	}
+	ordered := make([]*retained, 0, len(byID))
+	for _, item := range byID {
+		ordered = append(ordered, item)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].StartedAt.Equal(ordered[j].StartedAt) {
+			return ordered[i].ID < ordered[j].ID
+		}
+		return ordered[i].StartedAt.Before(ordered[j].StartedAt)
+	})
+	plan := RetentionPlan{
+		Before: Usage{CapBytes: capBytes, Exact: true},
+		After:  Usage{CapBytes: capBytes, Exact: true},
+	}
+	var enforcedBytes int64
+	for _, item := range ordered {
+		if !item.hasSnapshot {
+			continue
+		}
+		plan.Before.Bytes += item.bytes
+		plan.Before.Sessions++
+		if item.exact {
+			enforcedBytes += item.bytes
+		} else {
+			plan.Before.Exact = false
+		}
+	}
+	plan.After = plan.Before
+	if len(ordered) == 0 {
+		return plan, nil
+	}
+	newestID := ordered[len(ordered)-1].ID
+	cutoff := now.Add(-maxAge)
+	for _, item := range ordered {
+		expired := maxAge > 0 && item.StartedAt.Before(cutoff)
+		capRequired := item.hasSnapshot && item.exact && enforcedBytes > capBytes
+		if item.ID == newestID || (!expired && !capRequired) {
+			continue
+		}
+		plan.Removals = append(plan.Removals, RetentionRemoval{
+			SessionID: item.ID, StartedAt: item.StartedAt,
+			StorageBytes: item.bytes, StorageExact: item.exact,
+			Expired: expired, CapRequired: capRequired,
+		})
+		if item.hasSnapshot {
+			plan.After.Bytes -= item.bytes
+			plan.After.Sessions--
+			if item.exact {
+				enforcedBytes -= item.bytes
+			}
+		}
+	}
+	return plan, nil
+}
+
+// RemoveRetentionSnapshots removes the clone stores selected by PlanRetention.
+// Audit records are owned by the caller and are deliberately untouched here.
+func RemoveRetentionSnapshots(stateDir string, removals []RetentionRemoval) error {
+	for _, removal := range removals {
+		if removal.SessionID == "" || strings.ContainsAny(removal.SessionID, `/\\`) {
+			return fmt.Errorf("remove retained snapshots: invalid session id %q", removal.SessionID)
+		}
+	}
+	unlockRetention, err := acquireSnapshotLock(stateDir, "retention", unix.LOCK_EX)
+	if err != nil {
+		return err
+	}
+	defer unlockRetention()
+	for _, removal := range removals {
+		unlock, lockErr := acquireSnapshotLock(stateDir, removal.SessionID, unix.LOCK_EX)
+		if lockErr != nil {
+			return lockErr
+		}
+		path := filepath.Join(stateDir, "snapshots", removal.SessionID)
+		removeErr := removeSnapshotTree(path)
+		unlock()
+		if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return fmt.Errorf("remove retained snapshot %s: %w", removal.SessionID, removeErr)
+		}
+	}
+	return nil
 }
 
 // EnforceRetention evicts oldest completed snapshots until the measured allocation cap is met.

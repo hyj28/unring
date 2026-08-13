@@ -89,6 +89,7 @@ watch:
   - ~/Pictures
 exclude:
   - ~/Pictures/Lightroom Catalog
+retention_days: 14
 ```
 
 If an exclusion completely covers a path named by `--watch`, `--watch-only`, or the config
@@ -120,6 +121,8 @@ unring restore --all <session-id>            # restore covered paths except agen
 unring restore --all --include-agent-state <session-id>
 unring restore --force <session-id> path     # explicitly overwrite a conflict
 unring snapshots                             # inspect clone usage and APFS backstop presence
+unring prune                                 # show sessions outside retention limits
+unring prune --confirm                       # remove exactly the listed sessions
 ```
 
 The `unring restore` and detailed `unring log <session-id>` output repeat the session's
@@ -133,12 +136,30 @@ Snapshot-only restore announces why root is required before invoking `sudo`; it 
 clearly if Time Machine has already purged the recorded APFS snapshot. Coverage
 gaps created during a session are named in the change list and audit record; they do not
 prevent restoring independently covered paths. Snapshot retention defaults to 5 GiB of
-measured snapshot allocation and evicts oldest sessions.
+measured snapshot allocation, and stored sessions expire after 14 days unless
+`retention_days` in `config.yaml` selects another positive number. The age and byte limits
+share one oldest-first decision, and the newest session is always kept. Automatic expiry is
+named in the new session's output and audit record. `unring prune` shows the same retention
+set without deleting it; `--confirm` is required to remove the listed sessions. Reported
+snapshot bytes are unring's retention accounting, not a promise of immediately increased
+free space: APFS clones can release references to shared blocks without changing free space
+until the other references are removed.
 An explicit `--snapshot-cap-bytes` value is persisted so later runs and `unring snapshots`
 report and enforce the same cap. `UNRING_SNAPSHOT_CAP_BYTES` supplies the initial cap for a
 state directory that has no persisted value; the first run persists that effective value.
 Where a filesystem cannot expose allocation changes cheaply, unring labels the figure as
 an upper bound and does not evict snapshots based on that estimate.
+
+`unring log` lists at most the newest 50 sessions by default and says when older records
+were omitted; use `unring log --all` (or `--all --json`) to request every record.
+
+Change detection keeps metadata as its fast oracle. For a clone-backed regular file whose
+type, size, mode, and link count still agree, unring compares bytes only up to 8 MiB before
+calling a metadata-only difference a modification. Larger files, files outside clone
+coverage, and comparison errors remain reported because unring could not establish
+equality. An explicit restore is different: when the clone is available, it streams the
+selected equal-size file once regardless of mtime or size, so manually returning to the
+original bytes is recognized as `already restored` without weakening the conflict guard.
 
 Snapshot-only paths from the same recorded APFS snapshot are restored under one read-only
 mount per command, with one unmount after every selected path has been attempted. The

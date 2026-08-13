@@ -1,9 +1,10 @@
 package localrollback
 
 import (
-	"bytes"
+	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -327,7 +328,7 @@ func matchesRestoredMetadata(current Entry, exists bool, before *Entry) bool {
 	case "symlink":
 		return current.LinkTarget == before.LinkTarget
 	case "file":
-		return current.Size == before.Size && current.MTime == before.MTime
+		return current.Size == before.Size
 	default:
 		return false
 	}
@@ -341,7 +342,11 @@ func pathMatchesMountedBefore(snapshotPath, currentPath string, before *Entry) (
 	case "directory", "symlink":
 		return true, nil
 	case "file":
-		return filesEqual(snapshotPath, currentPath)
+		equal, err := filesEqual(snapshotPath, currentPath)
+		if err != nil {
+			return false, nil
+		}
+		return equal, nil
 	default:
 		return false, nil
 	}
@@ -886,29 +891,69 @@ func pathMatchesBefore(
 	case "symlink":
 		return current.LinkTarget == change.Before.LinkTarget, nil
 	case "file":
-		if current.Size != change.Before.Size || current.MTime != change.Before.MTime {
+		if current.Size != change.Before.Size {
 			return false, nil
 		}
 		snapshotPath, err := snapshotPathFor(value, snapshotRoot, change.Path)
 		if err != nil {
 			return false, err
 		}
-		return filesEqual(snapshotPath, change.Path)
+		equal, err := filesEqual(snapshotPath, change.Path)
+		if err != nil {
+			return false, nil
+		}
+		return equal, nil
 	default:
 		return false, nil
 	}
 }
 
 func filesEqual(leftPath, rightPath string) (bool, error) {
-	left, err := os.ReadFile(leftPath)
+	left, err := os.Open(leftPath)
 	if err != nil {
 		return false, err
 	}
-	right, err := os.ReadFile(rightPath)
+	defer left.Close()
+	right, err := os.Open(rightPath)
 	if err != nil {
 		return false, err
 	}
-	return bytes.Equal(left, right), nil
+	defer right.Close()
+	leftReader := bufio.NewReaderSize(left, 64<<10)
+	rightReader := bufio.NewReaderSize(right, 64<<10)
+	leftBuffer := make([]byte, 64<<10)
+	rightBuffer := make([]byte, 64<<10)
+	for {
+		leftCount, leftErr := io.ReadFull(leftReader, leftBuffer)
+		rightCount, rightErr := io.ReadFull(rightReader, rightBuffer)
+		if leftCount != rightCount || !equalBytes(leftBuffer[:leftCount], rightBuffer[:rightCount]) {
+			return false, nil
+		}
+		if errors.Is(leftErr, io.EOF) || errors.Is(leftErr, io.ErrUnexpectedEOF) {
+			if errors.Is(rightErr, io.EOF) || errors.Is(rightErr, io.ErrUnexpectedEOF) {
+				return true, nil
+			}
+			return false, rightErr
+		}
+		if leftErr != nil {
+			return false, leftErr
+		}
+		if rightErr != nil {
+			return false, rightErr
+		}
+	}
+}
+
+func equalBytes(left, right []byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func snapshotPathFor(value manifest, snapshotRoot, original string) (string, error) {

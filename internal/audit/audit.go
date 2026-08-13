@@ -255,6 +255,19 @@ func (s *Store) Load(id string) (Record, error) {
 	return s.loadPath(match)
 }
 
+// Delete removes one exact audit record. Snapshot data is managed separately
+// by localrollback so callers can coordinate the two retention layers.
+func (s *Store) Delete(id string) error {
+	if id == "" || strings.ContainsAny(id, `/\\`) {
+		return errors.New("delete audit record: invalid session id")
+	}
+	path := filepath.Join(s.logDir, id+".json")
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("delete audit record %s: %w", id, err)
+	}
+	return nil
+}
+
 func (s *Store) loadPath(path string) (Record, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

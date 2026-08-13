@@ -316,3 +316,25 @@ Continuing the list in §7:
    requested protection was absent. Reporting alone was indistinguishable from routine
    noise. Explicitly named missing paths now refuse startup and leave a `not_started` audit
    record naming the path and reason; missing default roots remain silent.
+
+---
+
+## 9. Storage hygiene and content equality (2026-08-12)
+
+Real use found two metadata-layer failures: audit records accumulated without a bound, and
+`ctime` correctly noticed a rewrite but could not distinguish genuinely new bytes from an
+identical rewrite. APFS also showed why `du` is the wrong reclaim figure: deleting gigabytes
+of apparent clone size can increase free space by zero because clone stores share blocks.
+
+### 9.1 Decisions
+
+| # | Decision |
+|---|---|
+| 19 | Retention uses **one oldest-first age-and-byte plan**: 14 days by default through `config.yaml`'s `retention_days`, the existing persisted 5 GiB measured-allocation cap, and an unconditional newest-session guard. Each session is selected at most once when either limit binds. Automatic expiry is announced and recorded. `unring prune` is a non-destructive preview unless `--confirm` is given. Reclaim output reports unring's measured snapshot accounting and explicitly does not equate clone references with immediately freed disk space. `unring log` shows 50 newest sessions by default, discloses truncation, and accepts `--all`. |
+| 20 | Metadata remains the **fast change oracle**, including `ctime`, but clone-backed regular files are byte-compared when type, size, mode, and link count agree and the file is at most 8 MiB. The comparison streams data and suppresses a change only after conclusive equality. Larger files, paths without a clone, and read errors keep the safe false-positive result. Explicit restore streams the selected equal-size clone regardless of mtime or size, allowing original bytes restored by hand to return `already restored`; a genuine byte difference still refuses and writes the sidecar. |
+
+The 8 MiB bound is deliberately about automatic work multiplied across every changed path.
+A restore is an explicit operation on selected paths, so paying one streaming comparison is
+worth avoiding a false conflict and redundant sidecar. Neither decision changes manifest
+membership: paths and metadata are recorded exactly as before, and human rendering alone
+quotes control characters such as newlines.
