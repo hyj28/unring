@@ -131,6 +131,9 @@ func TestPruneConfirmationRefusesTargetAfterCapIsRaised(t *testing.T) {
 	if !strings.Contains(confirmErr.String(), "no longer in the same retention set") {
 		t.Fatalf("stale cap reason missing:\n%s", confirmErr.String())
 	}
+	if strings.Count(confirmErr.String(), "run unring prune again") != 1 {
+		t.Fatalf("stale cap remedy was not printed exactly once:\n%s", confirmErr.String())
+	}
 	if got := storedRecordCount(t, store); got != 2 {
 		t.Fatalf("records after stale cap confirmation = %d, want literal 2", got)
 	}

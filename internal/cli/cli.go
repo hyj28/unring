@@ -1671,7 +1671,7 @@ func cleanupPrunePreviews(stateDir string, now time.Time, keepToken string) erro
 
 func validatePrunePreview(store *audit.Store, preview prunePreview, now time.Time) error {
 	if preview.Created.IsZero() || now.Sub(preview.Created) > prunePreviewLifetime || preview.Created.After(now.Add(5*time.Minute)) {
-		return errors.New("prune preview is stale; run unring prune again")
+		return errors.New("prune preview is stale")
 	}
 	records, err := store.List()
 	if err != nil {
@@ -1708,7 +1708,7 @@ func validatePrunePreview(store *audit.Store, preview prunePreview, now time.Tim
 	for _, saved := range preview.Removals {
 		updated, ok := current[saved.SessionID]
 		if !ok || updated.Expired != saved.Expired || updated.CapRequired != saved.CapRequired || updated.HasSnapshot != saved.HasSnapshot {
-			return fmt.Errorf("session %s is no longer in the same retention set; run unring prune again", saved.SessionID)
+			return fmt.Errorf("session %s is no longer in the same retention set", saved.SessionID)
 		}
 	}
 	return nil
