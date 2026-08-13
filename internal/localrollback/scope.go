@@ -34,6 +34,7 @@ type ScopeOptions struct {
 // and explicit watches that those exclusions prevent from being captured.
 type Scope struct {
 	Watched           []string
+	AgentStateRoots   []string
 	Excluded          []string
 	Uncaptured        []CaptureFailure
 	ChangeListScope   string
@@ -56,6 +57,25 @@ func (err *scopeConfigError) Unwrap() error { return err.err }
 func IsScopeConfigError(err error) bool {
 	var configErr *scopeConfigError
 	return errors.As(err, &configErr)
+}
+
+type scopePreflightError struct {
+	failures []CaptureFailure
+}
+
+func (err *scopePreflightError) Error() string {
+	return formatFailures("explicitly watched paths are unavailable", err.failures)
+}
+
+// ScopePreflightFailures returns the explicit watched paths that made scope
+// resolution refuse to start. The returned failures are detached from the
+// error and are suitable for the durable audit record.
+func ScopePreflightFailures(err error) []CaptureFailure {
+	var preflightErr *scopePreflightError
+	if !errors.As(err, &preflightErr) {
+		return nil
+	}
+	return append([]CaptureFailure(nil), preflightErr.failures...)
 }
 
 type scopeEnvironmentError struct {
@@ -147,6 +167,17 @@ func ResolveScope(options ScopeOptions) (Scope, error) {
 	if err != nil {
 		return Scope{}, fmt.Errorf("resolve explicitly watched paths: %w", err)
 	}
+	var missingExplicit []CaptureFailure
+	for _, path := range explicit {
+		if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
+			missingExplicit = append(missingExplicit, CaptureFailure{
+				Path: path, Error: "watched path does not exist",
+			})
+		}
+	}
+	if len(missingExplicit) > 0 {
+		return Scope{}, &scopeConfigError{err: &scopePreflightError{failures: missingExplicit}}
+	}
 	var uncaptured []CaptureFailure
 	for _, path := range explicit {
 		resolved, resolveErr := resolvePathAllowMissing(path)
@@ -197,8 +228,13 @@ func ResolveScope(options ScopeOptions) (Scope, error) {
 		changeListScope = ChangeListScopeWatchOnly
 		changeListRoots = append([]string(nil), filtered...)
 	}
+	agentStateRoots := AgentStateRoots(homeDirectory)
+	if len(agentStateRoots) == 0 {
+		return Scope{}, fmt.Errorf("determine declared agent-state roots: home directory is unavailable")
+	}
 	return Scope{
 		Watched: filtered, Excluded: excluded, Uncaptured: uncaptured,
+		AgentStateRoots: agentStateRoots,
 		ChangeListScope: changeListScope, ChangeListRoots: changeListRoots,
 		ScanRoot: scanRoot, ScanExcluded: scanExcluded,
 		ScanExcludedNames: scanExcludedNames,

@@ -126,8 +126,10 @@ APFS snapshot costs 180 ms and covers the disk.
       becomes additive and `--watch-only` takes over the replacing behaviour
 - [x] M10.5 Report backstop coverage honestly: no Time Machine, a path excluded from it
       (`tmutil isexcluded`), or Linux — say so prominently and keep running
-- [x] M10.6 Skip a nonexistent *default* path silently; report a nonexistent path the user
-      named explicitly
+- [x] M10.6 Skip a nonexistent *default* path silently; refuse startup for a nonexistent
+      path the user named explicitly and retain the refusal in a `not_started` audit record
+- [x] M10.7 Restore snapshot-only selections under one mount, separate agent own-state in
+      listings and default `--all` behavior, and demote unsupported special-file notices
 
 ---
 

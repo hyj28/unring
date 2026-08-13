@@ -24,6 +24,9 @@ const (
 	RestoreSourceClone          = "clone"
 	RestoreSourceVolume         = "volume-snapshot"
 	RestoreSourceNone           = "none"
+	// UnsupportedFileTypeCoverageReason is retained for special files such as
+	// Unix sockets that cannot be restored meaningfully per path.
+	UnsupportedFileTypeCoverageReason = "unsupported file type is outside snapshot coverage"
 )
 
 // Entry is the metadata used to detect a file change and a later restore conflict.
@@ -41,6 +44,29 @@ type Entry struct {
 type CaptureFailure struct {
 	Path  string `json:"path"`
 	Error string `json:"error"`
+}
+
+// IsUnsupportedFileTypeFailure identifies the declared informational coverage
+// class for special files that cannot be restored meaningfully per path.
+func IsUnsupportedFileTypeFailure(failure CaptureFailure) bool {
+	return strings.HasPrefix(failure.Error, "unsupported file type")
+}
+
+// HasOnlyUnsupportedFileTypeFailures reports the one incomplete state that is
+// informational rather than actionable. It is deliberately strict: any scan
+// failure, unexplained error text, or additional persistence/storage error
+// makes the incomplete summary actionable.
+func HasOnlyUnsupportedFileTypeFailures(summary Summary) bool {
+	if summary.Complete || len(summary.PostSessionFailures) == 0 || len(summary.ScanFailures) != 0 {
+		return false
+	}
+	for _, failure := range summary.PostSessionFailures {
+		if !IsUnsupportedFileTypeFailure(failure) {
+			return false
+		}
+	}
+	wantError := formatFailures("post-session coverage incomplete", summary.PostSessionFailures)
+	return summary.Error == wantError
 }
 
 // Change is one created, modified, or deleted path.
@@ -66,31 +92,33 @@ type RestoreRecord struct {
 
 // Summary is stored in the session audit record.
 type Summary struct {
-	Watched          []string         `json:"watched_paths"`
-	Uncaptured       []CaptureFailure `json:"uncaptured_paths"`
-	Changes          []Change         `json:"changes"`
-	Complete         bool             `json:"complete"`
-	Error            string           `json:"error,omitempty"`
-	Storage          string           `json:"storage"`
-	LogicalBytes     int64            `json:"logical_bytes"`
-	StorageBytes     int64            `json:"storage_bytes"`
-	StorageExact     bool             `json:"storage_bytes_exact"`
-	CopiedBytes      int64            `json:"copied_bytes"`
-	RetentionCap     int64            `json:"retention_cap_bytes"`
-	Retained         bool             `json:"retained"`
-	Evicted          []string         `json:"evicted_sessions,omitempty"`
-	RestoreEvents    []RestoreRecord  `json:"restores,omitempty"`
-	ChangeListScope  string           `json:"change_list_scope,omitempty"`
-	ChangeListRoots  []string         `json:"change_list_roots,omitempty"`
-	ScanRoot         string           `json:"change_scan_root,omitempty"`
-	ScanExcluded     []string         `json:"change_scan_excluded,omitempty"`
-	ScanFailures     []CaptureFailure `json:"change_scan_failures,omitempty"`
-	ScanBeforeFiles  int              `json:"change_scan_before_files,omitempty"`
-	ScanAfterFiles   int              `json:"change_scan_after_files,omitempty"`
-	ScanBeforeMillis int64            `json:"change_scan_before_ms,omitempty"`
-	ScanAfterMillis  int64            `json:"change_scan_after_ms,omitempty"`
-	Backstop         Backstop         `json:"backstop"`
-	manifestEndedAt  time.Time
+	Watched             []string         `json:"watched_paths"`
+	AgentStateRoots     []string         `json:"agent_state_roots,omitempty"`
+	Uncaptured          []CaptureFailure `json:"uncaptured_paths"`
+	PostSessionFailures []CaptureFailure `json:"post_session_coverage_failures,omitempty"`
+	Changes             []Change         `json:"changes"`
+	Complete            bool             `json:"complete"`
+	Error               string           `json:"error,omitempty"`
+	Storage             string           `json:"storage"`
+	LogicalBytes        int64            `json:"logical_bytes"`
+	StorageBytes        int64            `json:"storage_bytes"`
+	StorageExact        bool             `json:"storage_bytes_exact"`
+	CopiedBytes         int64            `json:"copied_bytes"`
+	RetentionCap        int64            `json:"retention_cap_bytes"`
+	Retained            bool             `json:"retained"`
+	Evicted             []string         `json:"evicted_sessions,omitempty"`
+	RestoreEvents       []RestoreRecord  `json:"restores,omitempty"`
+	ChangeListScope     string           `json:"change_list_scope,omitempty"`
+	ChangeListRoots     []string         `json:"change_list_roots,omitempty"`
+	ScanRoot            string           `json:"change_scan_root,omitempty"`
+	ScanExcluded        []string         `json:"change_scan_excluded,omitempty"`
+	ScanFailures        []CaptureFailure `json:"change_scan_failures,omitempty"`
+	ScanBeforeFiles     int              `json:"change_scan_before_files,omitempty"`
+	ScanAfterFiles      int              `json:"change_scan_after_files,omitempty"`
+	ScanBeforeMillis    int64            `json:"change_scan_before_ms,omitempty"`
+	ScanAfterMillis     int64            `json:"change_scan_after_ms,omitempty"`
+	Backstop            Backstop         `json:"backstop"`
+	manifestEndedAt     time.Time
 }
 
 type rootManifest struct {
@@ -104,33 +132,35 @@ type rootManifest struct {
 }
 
 type manifest struct {
-	Version           int              `json:"version"`
-	SessionID         string           `json:"session_id"`
-	StartedAt         time.Time        `json:"started_at"`
-	EndedAt           time.Time        `json:"ended_at,omitempty"`
-	Roots             []rootManifest   `json:"roots"`
-	Excluded          []string         `json:"excluded,omitempty"`
-	After             map[string]Entry `json:"after,omitempty"`
-	Changes           []Change         `json:"changes,omitempty"`
-	Complete          bool             `json:"complete"`
-	Error             string           `json:"error,omitempty"`
-	Storage           string           `json:"storage"`
-	LogicalBytes      int64            `json:"logical_bytes"`
-	StorageBytes      int64            `json:"storage_bytes"`
-	StorageExact      bool             `json:"storage_bytes_exact"`
-	CopiedBytes       int64            `json:"copied_bytes"`
-	RetentionCap      int64            `json:"retention_cap_bytes"`
-	ChangeListScope   string           `json:"change_list_scope,omitempty"`
-	ChangeListRoots   []string         `json:"change_list_roots,omitempty"`
-	ScanRoot          string           `json:"scan_root,omitempty"`
-	ScanExcluded      []string         `json:"scan_excluded,omitempty"`
-	ScanExcludedNames []string         `json:"scan_excluded_names,omitempty"`
-	ScanFailures      []CaptureFailure `json:"scan_failures,omitempty"`
-	ScanBeforeFiles   int              `json:"scan_before_files,omitempty"`
-	ScanAfterFiles    int              `json:"scan_after_files,omitempty"`
-	ScanBeforeMillis  int64            `json:"scan_before_ms,omitempty"`
-	ScanAfterMillis   int64            `json:"scan_after_ms,omitempty"`
-	Backstop          Backstop         `json:"backstop"`
+	Version             int              `json:"version"`
+	SessionID           string           `json:"session_id"`
+	StartedAt           time.Time        `json:"started_at"`
+	EndedAt             time.Time        `json:"ended_at,omitempty"`
+	Roots               []rootManifest   `json:"roots"`
+	AgentStateRoots     []string         `json:"agent_state_roots,omitempty"`
+	Excluded            []string         `json:"excluded,omitempty"`
+	After               map[string]Entry `json:"after,omitempty"`
+	Changes             []Change         `json:"changes,omitempty"`
+	Complete            bool             `json:"complete"`
+	Error               string           `json:"error,omitempty"`
+	Storage             string           `json:"storage"`
+	LogicalBytes        int64            `json:"logical_bytes"`
+	StorageBytes        int64            `json:"storage_bytes"`
+	StorageExact        bool             `json:"storage_bytes_exact"`
+	CopiedBytes         int64            `json:"copied_bytes"`
+	RetentionCap        int64            `json:"retention_cap_bytes"`
+	ChangeListScope     string           `json:"change_list_scope,omitempty"`
+	ChangeListRoots     []string         `json:"change_list_roots,omitempty"`
+	ScanRoot            string           `json:"scan_root,omitempty"`
+	ScanExcluded        []string         `json:"scan_excluded,omitempty"`
+	ScanExcludedNames   []string         `json:"scan_excluded_names,omitempty"`
+	ScanFailures        []CaptureFailure `json:"scan_failures,omitempty"`
+	PostSessionFailures []CaptureFailure `json:"post_session_coverage_failures,omitempty"`
+	ScanBeforeFiles     int              `json:"scan_before_files,omitempty"`
+	ScanAfterFiles      int              `json:"scan_after_files,omitempty"`
+	ScanBeforeMillis    int64            `json:"scan_before_ms,omitempty"`
+	ScanAfterMillis     int64            `json:"scan_after_ms,omitempty"`
+	Backstop            Backstop         `json:"backstop"`
 }
 
 // Session owns the in-progress snapshot for a wrapped child.
@@ -242,20 +272,25 @@ func RetentionCapForState(stateDir string) (int64, error) {
 // platform's recursive fast path, then falls back to per-entry capture so that
 // one unreadable path does not erase coverage for the rest of a tree.
 func Start(stateDir, sessionID string, watched []string, capBytes int64, now time.Time) (*Session, Summary, error) {
-	return start(stateDir, sessionID, watched, nil, nil, ChangeListScopeCloneOnly, watched, "", nil, nil, "", capBytes, now)
+	return start(stateDir, sessionID, watched, nil, nil, AgentStateRoots(""), ChangeListScopeCloneOnly, watched, "", nil, nil, "", capBytes, now)
 }
 
 // StartWithExclusions captures watched paths while omitting physically resolved
 // config exclusions in addition to unring's own state directory.
 func StartWithExclusions(stateDir, sessionID string, watched, excluded []string, capBytes int64, now time.Time) (*Session, Summary, error) {
-	return start(stateDir, sessionID, watched, excluded, nil, ChangeListScopeCloneOnly, watched, "", nil, nil, "", capBytes, now)
+	return start(stateDir, sessionID, watched, excluded, nil, AgentStateRoots(""), ChangeListScopeCloneOnly, watched, "", nil, nil, "", capBytes, now)
 }
 
 // StartScope captures a previously resolved scope, including any explicit
 // watches that configuration exclusions made uncapturable.
 func StartScope(stateDir, sessionID string, scope Scope, capBytes int64, now time.Time) (*Session, Summary, error) {
+	agentStateRoots := scope.AgentStateRoots
+	if len(agentStateRoots) == 0 {
+		agentStateRoots = AgentStateRoots("")
+	}
 	return start(
 		stateDir, sessionID, scope.Watched, scope.Excluded, scope.Uncaptured,
+		agentStateRoots,
 		scope.ChangeListScope, scope.ChangeListRoots,
 		scope.ScanRoot, scope.ScanExcluded, scope.ScanExcludedNames, scope.ScanError,
 		capBytes, now,
@@ -266,6 +301,7 @@ func start(
 	stateDir, sessionID string,
 	watched, excluded []string,
 	preflightFailures []CaptureFailure,
+	agentStateRoots []string,
 	changeListScope string,
 	changeListRoots []string,
 	scanRoot string,
@@ -276,6 +312,9 @@ func start(
 ) (*Session, Summary, error) {
 	if sessionID == "" || strings.ContainsAny(sessionID, `/\\`) {
 		return nil, Summary{}, errors.New("start file snapshot: invalid session id")
+	}
+	if len(agentStateRoots) == 0 {
+		return nil, Summary{}, errors.New("start file snapshot: declared agent-state roots are unavailable")
 	}
 	roots, err := normalizeRoots(watched)
 	if err != nil {
@@ -305,6 +344,7 @@ func start(
 	m := manifest{
 		Version: manifestVersion, SessionID: sessionID, StartedAt: now.UTC(),
 		Complete: false, RetentionCap: capBytes, ScanRoot: scanRoot,
+		AgentStateRoots:   append([]string(nil), agentStateRoots...),
 		ChangeListScope:   changeListScope,
 		ChangeListRoots:   append([]string(nil), changeListRoots...),
 		ScanExcluded:      append([]string(nil), scanExcluded...),
@@ -405,7 +445,8 @@ func start(
 	}
 	summary := Summary{
 		Watched: roots, Uncaptured: failures, Complete: false,
-		Storage: m.Storage, LogicalBytes: m.LogicalBytes, StorageBytes: m.StorageBytes,
+		AgentStateRoots: append([]string(nil), m.AgentStateRoots...),
+		Storage:         m.Storage, LogicalBytes: m.LogicalBytes, StorageBytes: m.StorageBytes,
 		StorageExact: m.StorageExact, CopiedBytes: m.CopiedBytes,
 		RetentionCap: capBytes, Retained: true,
 		ChangeListScope: m.ChangeListScope,
@@ -598,6 +639,7 @@ func (s *Session) Seal(now time.Time) Summary {
 	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
 	s.manifest.ScanFailures = mergeFailures(wideFailures)
 	allFailures := mergeFailures(scanFailures, coverageGaps, s.manifest.ScanFailures)
+	s.manifest.PostSessionFailures = append([]CaptureFailure(nil), allFailures...)
 	s.manifest.EndedAt = now.UTC()
 	s.manifest.After = after
 	s.manifest.Changes = changes
@@ -641,6 +683,7 @@ func (s *Session) Seal(now time.Time) Summary {
 	}
 	s.summary.Changes = changes
 	s.summary.Uncaptured = manifestFailures(s.manifest)
+	s.summary.PostSessionFailures = append([]CaptureFailure(nil), s.manifest.PostSessionFailures...)
 	s.summary.Complete = s.manifest.Complete
 	s.summary.Error = s.manifest.Error
 	s.summary.StorageBytes = s.manifest.StorageBytes
@@ -810,7 +853,7 @@ func coverageFailures(entries map[string]Entry, alreadyUncaptured map[string]str
 		}
 		switch {
 		case entry.Type == "other":
-			failures = append(failures, CaptureFailure{Path: path, Error: "unsupported file type is outside snapshot coverage"})
+			failures = append(failures, CaptureFailure{Path: path, Error: UnsupportedFileTypeCoverageReason})
 		case entry.Type == "file" && entry.Links > 1:
 			failures = append(failures, CaptureFailure{Path: path, Error: "hard-linked files are outside snapshot coverage; restoring one path could silently break the link group"})
 		case entry.Type == "symlink":
@@ -1028,7 +1071,7 @@ func reconcileCapture(
 		}
 		switch {
 		case beforeEntry.Type == "other":
-			failures = append(failures, CaptureFailure{Path: path, Error: "unsupported file type is outside snapshot coverage"})
+			failures = append(failures, CaptureFailure{Path: path, Error: UnsupportedFileTypeCoverageReason})
 			failed[path] = true
 		case beforeEntry.Type == "file" && beforeEntry.Links > 1:
 			failures = append(failures, CaptureFailure{Path: path, Error: "hard-linked files are outside snapshot coverage; restoring one path could silently break the link group"})
