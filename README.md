@@ -152,6 +152,8 @@ them by default because rolling back an active agent's transcript or session sta
 harmful; restore one explicitly by path or use `--include-agent-state` with `--all`.
 Unsupported special files such as Unix sockets also remain recorded, but render as an
 informational file-type note rather than as an actionable `FILE NOT SNAPSHOTTED` alarm.
+Records created before agent-state roots were stored disclose that their grouping is inferred
+from the current environment whenever that grouping is listed or used by `restore --all`.
 
 If this task needs PostgreSQL coverage, point `DATABASE_URL` at the real development
 database first:

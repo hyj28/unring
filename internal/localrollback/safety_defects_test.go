@@ -107,18 +107,33 @@ func TestCompletenessIsInformationalOnlyForExactUnsupportedFailures(t *testing.T
 	unsupported := CaptureFailure{Path: "/tmp/agent.sock", Error: UnsupportedFileTypeCoverageReason}
 	unsupportedError := "post-session coverage incomplete: /tmp/agent.sock: unsupported file type is outside snapshot coverage"
 	if !HasOnlyUnsupportedFileTypeFailures(Summary{
-		Complete: false, Uncaptured: []CaptureFailure{unsupported}, Error: unsupportedError,
+		Complete: false, Uncaptured: []CaptureFailure{unsupported},
+		PostSessionFailures: []CaptureFailure{unsupported}, Error: unsupportedError,
 	}) {
 		t.Fatal("exact unsupported-only failure was not classified as informational")
 	}
 	for _, summary := range []Summary{
-		{Complete: false, Uncaptured: []CaptureFailure{unsupported}, Error: unsupportedError + "; write manifest: no space left on device"},
+		{Complete: false, Uncaptured: []CaptureFailure{unsupported}, PostSessionFailures: []CaptureFailure{unsupported}, Error: unsupportedError + "; write manifest: no space left on device"},
 		{Complete: false, Error: "measure retained snapshot: input/output error"},
-		{Complete: false, Uncaptured: []CaptureFailure{unsupported}, ScanFailures: []CaptureFailure{{Path: "/tmp", Error: "permission denied"}}, Error: unsupportedError},
+		{Complete: false, Uncaptured: []CaptureFailure{unsupported}, PostSessionFailures: []CaptureFailure{unsupported}, ScanFailures: []CaptureFailure{{Path: "/tmp", Error: "permission denied"}}, Error: unsupportedError},
 	} {
 		if HasOnlyUnsupportedFileTypeFailures(summary) {
 			t.Fatalf("actionable incomplete summary was classified informational: %#v", summary)
 		}
+	}
+}
+
+func TestUnsupportedOnlyComparisonUsesPostSessionFailureSet(t *testing.T) {
+	initial := CaptureFailure{Path: "/tmp/agent.sock", Error: UnsupportedFileTypeCoverageReason}
+	created := CaptureFailure{Path: "/tmp/new.sock", Error: UnsupportedFileTypeCoverageReason}
+	summary := Summary{
+		Complete:            false,
+		Uncaptured:          []CaptureFailure{initial, created},
+		PostSessionFailures: []CaptureFailure{created},
+		Error:               "post-session coverage incomplete: /tmp/new.sock: unsupported file type is outside snapshot coverage",
+	}
+	if !HasOnlyUnsupportedFileTypeFailures(summary) {
+		t.Fatalf("unsupported-only post-session set was classified actionable: %#v", summary)
 	}
 }
 
@@ -145,6 +160,38 @@ func TestAgentStateRootsResolveSymlinkedHome(t *testing.T) {
 	}
 	if !IsAgentStatePathWithin(filepath.Join(want, "settings.json"), roots) {
 		t.Fatal("resolved agent-state path was not recognized")
+	}
+}
+
+func TestLogicalSymlinkIntoAgentStateRemainsOrdinary(t *testing.T) {
+	home := t.TempDir()
+	agentCommands := filepath.Join(home, ".claude", "commands")
+	projectCommands := filepath.Join(home, "project", "commands")
+	if err := os.MkdirAll(agentCommands, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(projectCommands), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(agentCommands, projectCommands); err != nil {
+		t.Fatal(err)
+	}
+	logicalChange := filepath.Join(projectCommands, "deploy.md")
+	if IsAgentStatePathWithin(logicalChange, AgentStateRoots(home)) {
+		t.Fatalf("logical project path was reclassified as agent state: %s", logicalChange)
+	}
+}
+
+func TestRestoreRecordedCloneEvictionRemainsUnavailable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "evicted.txt")
+	change := Change{Kind: "modified", Path: path, RestoreSource: RestoreSourceClone}
+	results, err := RestoreRecorded(t.TempDir(), "evicted-clone", Summary{Changes: []Change{change}}, []string{path}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Status != "unavailable" || results[0].Err == nil ||
+		!strings.Contains(results[0].Err.Error(), "clone snapshot data was evicted") {
+		t.Fatalf("evicted clone result = %#v, want literal unavailable eviction error", results)
 	}
 }
 

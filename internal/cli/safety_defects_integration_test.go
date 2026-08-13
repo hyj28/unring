@@ -9,6 +9,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/hyj28/unring/internal/audit"
+	"github.com/hyj28/unring/internal/localrollback"
 )
 
 func TestAgentOwnStateIsGroupedSkippedByAllAndExplicitlyRestorable(t *testing.T) {
@@ -126,12 +130,16 @@ func TestUnsupportedFileTypeStaysRecordedAndMixedGapStaysLoud(t *testing.T) {
 	if strings.Contains(string(runOutput), "FILE NOT SNAPSHOTTED: "+socketPath) {
 		t.Fatalf("unsupported type retained actionable alarm prefix:\n%s", runOutput)
 	}
+	coverageLine := outputLineContaining(string(runOutput), "FILE COVERAGE INCOMPLETE")
+	if coverageLine == "" {
+		t.Fatalf("mixed actionable gap omitted FILE COVERAGE INCOMPLETE:\n%s", runOutput)
+	}
 	for _, want := range []string{
-		"FILE COVERAGE INCOMPLETE", symlinkPath,
+		symlinkPath,
 		"symlinked directory target is not followed or snapshotted",
 	} {
-		if !strings.Contains(string(runOutput), want) {
-			t.Fatalf("mixed actionable gap omitted %q:\n%s", want, runOutput)
+		if !strings.Contains(coverageLine, want) {
+			t.Fatalf("coverage-incomplete line omitted %q:\n%s", want, coverageLine)
 		}
 	}
 
@@ -159,6 +167,95 @@ func TestUnsupportedFileTypeStaysRecordedAndMixedGapStaysLoud(t *testing.T) {
 	if strings.Contains(string(logOutput), "FILE NOT SNAPSHOTTED: "+socketPath) {
 		t.Fatalf("stored unsupported type retained actionable alarm prefix:\n%s", logOutput)
 	}
+}
+
+func TestManifestPersistenceFailureStaysLoudAtCLISeam(t *testing.T) {
+	stateDir := t.TempDir()
+	watched := t.TempDir()
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	binary := buildTestBinary(t)
+
+	command := exec.Command(binary, "run", "--discard", "--watch-only", watched, "--",
+		"/bin/sh", "-c", `rm -rf "$1"/snapshots/*`, "unring-test", stateDir)
+	command.Env = os.Environ()
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("manifest-persistence run: %v\n%s", err, output)
+	}
+	coverageLine := outputLineContaining(string(output), "FILE COVERAGE INCOMPLETE")
+	if coverageLine == "" {
+		t.Fatalf("manifest failure lost loud coverage header:\n%s", output)
+	}
+	for _, want := range []string{"create file snapshot manifest", "no such file or directory"} {
+		if !strings.Contains(coverageLine, want) {
+			t.Fatalf("manifest-failure coverage line omitted %q:\n%s", want, coverageLine)
+		}
+	}
+	if strings.Contains(string(output), "unsupported file types remain recorded but cannot be restored per path") {
+		t.Fatalf("manifest failure was mislabeled as unsupported-only:\n%s", output)
+	}
+}
+
+func TestMissingRecordedAgentRootsDisclosesCurrentEnvironmentInference(t *testing.T) {
+	stateDir := t.TempDir()
+	home := t.TempDir()
+	agentPath := filepath.Join(home, ".claude", "legacy.json")
+	if err := os.MkdirAll(filepath.Dir(agentPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, agentPath, "legacy agent state")
+	t.Setenv("HOME", home)
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := audit.NewRecord([]string{"legacy-agent"}, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.EndedAt = time.Unix(2, 0)
+	record.Outcome = "discarded"
+	record.Files = localrollback.Summary{
+		Watched: []string{home}, Retained: true, Complete: true,
+		Changes: []localrollback.Change{{
+			Kind: "created", Path: agentPath, RestoreSource: localrollback.RestoreSourceClone,
+		}},
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+
+	var listingStdout, listingStderr bytes.Buffer
+	if exitCode := Main([]string{"restore", record.ID}, strings.NewReader(""), &listingStdout, &listingStderr); exitCode != 0 {
+		t.Fatalf("legacy listing exit = %d; stderr: %s", exitCode, listingStderr.String())
+	}
+	for _, want := range []string{"AGENT-STATE GROUPING INFERRED", "current environment", filepath.Join(home, ".claude")} {
+		if !strings.Contains(listingStdout.String(), want) {
+			t.Fatalf("legacy listing omitted inference disclosure %q:\n%s", want, listingStdout.String())
+		}
+	}
+
+	var allStdout, allStderr bytes.Buffer
+	if exitCode := Main([]string{"restore", "--all", record.ID}, strings.NewReader(""), &allStdout, &allStderr); exitCode != 0 {
+		t.Fatalf("legacy restore --all exit = %d; stderr: %s", exitCode, allStderr.String())
+	}
+	for _, want := range []string{"AGENT-STATE GROUPING INFERRED", "Skipped agent own-state paths", agentPath} {
+		if !strings.Contains(allStdout.String(), want) {
+			t.Fatalf("legacy restore --all omitted %q:\n%s", want, allStdout.String())
+		}
+	}
+	assertTestFile(t, agentPath, "legacy agent state")
+}
+
+func outputLineContaining(output, marker string) string {
+	for _, line := range strings.Split(output, "\n") {
+		if strings.Contains(line, marker) {
+			return line
+		}
+	}
+	return ""
 }
 
 func TestRetentionCapPreflightErrorsLeaveNoPendingAuditRecord(t *testing.T) {

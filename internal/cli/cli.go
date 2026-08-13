@@ -1018,7 +1018,11 @@ func printFileChanges(output io.Writer, sessionID string, summary localrollback.
 	fmt.Fprintf(output,
 		"Files changed: %d created, %d modified, %d deleted. No file decision is needed now.\n",
 		created, modified, deleted)
-	regular, agentState := groupAgentStateChanges(summary.Changes, summary.AgentStateRoots)
+	agentStateRoots, inferredAgentStateRoots := agentStateGroupingRoots(summary.AgentStateRoots)
+	if inferredAgentStateRoots {
+		printAgentStateGroupingInference(output, "", agentStateRoots)
+	}
+	regular, agentState := groupAgentStateChanges(summary.Changes, agentStateRoots)
 	printLiveChanges(output, regular)
 	if len(agentState) > 0 {
 		fmt.Fprintln(output, "AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
@@ -1077,7 +1081,11 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 			summary.ScanBeforeFiles, summary.ScanBeforeMillis,
 			summary.ScanAfterFiles, summary.ScanAfterMillis)
 	}
-	regular, agentState := groupAgentStateChanges(summary.Changes, summary.AgentStateRoots)
+	agentStateRoots, inferredAgentStateRoots := agentStateGroupingRoots(summary.AgentStateRoots)
+	if inferredAgentStateRoots {
+		printAgentStateGroupingInference(output, "  ", agentStateRoots)
+	}
+	regular, agentState := groupAgentStateChanges(summary.Changes, agentStateRoots)
 	printStoredChanges(output, regular)
 	if len(agentState) > 0 {
 		fmt.Fprintln(output, "  AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
@@ -1115,8 +1123,7 @@ func printStoredChanges(output io.Writer, changes []localrollback.Change) {
 	}
 }
 
-func groupAgentStateChanges(changes []localrollback.Change, recordedRoots []string) ([]localrollback.Change, []localrollback.Change) {
-	roots := recordedAgentStateRoots(recordedRoots)
+func groupAgentStateChanges(changes []localrollback.Change, roots []string) ([]localrollback.Change, []localrollback.Change) {
 	regular := make([]localrollback.Change, 0, len(changes))
 	agentState := make([]localrollback.Change, 0)
 	for _, change := range changes {
@@ -1129,13 +1136,20 @@ func groupAgentStateChanges(changes []localrollback.Change, recordedRoots []stri
 	return regular, agentState
 }
 
-func recordedAgentStateRoots(roots []string) []string {
+func agentStateGroupingRoots(roots []string) ([]string, bool) {
 	if len(roots) > 0 {
-		return roots
+		return roots, false
 	}
-	// Records created before agent-state roots were persisted fall back to the
-	// current environment for backward compatibility.
-	return localrollback.AgentStateRoots("")
+	return localrollback.AgentStateRoots(""), true
+}
+
+func printAgentStateGroupingInference(output io.Writer, prefix string, roots []string) {
+	if len(roots) == 0 {
+		fmt.Fprintf(output, "%sAGENT-STATE GROUPING INFERRED: this record has no recorded agent-state roots, and none could be determined from the current environment; no path is classified as agent own-state.\n", prefix)
+		return
+	}
+	fmt.Fprintf(output, "%sAGENT-STATE GROUPING INFERRED: this record has no recorded agent-state roots; grouping uses the current environment: %s\n",
+		prefix, strings.Join(roots, ", "))
 }
 
 func isAgentStateChange(change localrollback.Change, roots []string) bool {
@@ -1516,7 +1530,10 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 			return usageExitCode
 		}
 		var skippedAgentState []localrollback.Change
-		agentStateRoots := recordedAgentStateRoots(record.Files.AgentStateRoots)
+		agentStateRoots, inferredAgentStateRoots := agentStateGroupingRoots(record.Files.AgentStateRoots)
+		if inferredAgentStateRoots {
+			printAgentStateGroupingInference(stdout, "", agentStateRoots)
+		}
 		for _, change := range record.Files.Changes {
 			if !includeAgentState && isAgentStateChange(change, agentStateRoots) {
 				skippedAgentState = append(skippedAgentState, change)
@@ -1664,7 +1681,11 @@ func snapshotsCommand(args []string, stdout, stderr io.Writer) int {
 func printRestoreListing(output io.Writer, record audit.Record) {
 	fmt.Fprintf(output, "UNRING FILE CHANGES %s\n", record.ID)
 	printStoredChangeListLimitation(output, record.Files, "  ", true)
-	regular, agentState := groupAgentStateChanges(record.Files.Changes, record.Files.AgentStateRoots)
+	agentStateRoots, inferredAgentStateRoots := agentStateGroupingRoots(record.Files.AgentStateRoots)
+	if inferredAgentStateRoots {
+		printAgentStateGroupingInference(output, "", agentStateRoots)
+	}
+	regular, agentState := groupAgentStateChanges(record.Files.Changes, agentStateRoots)
 	for _, change := range regular {
 		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, change.Path)
 		if change.RestoreSource == localrollback.RestoreSourceVolume {

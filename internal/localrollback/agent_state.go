@@ -2,6 +2,7 @@ package localrollback
 
 import (
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 )
@@ -24,10 +25,14 @@ func AgentStateRoots(home string) []string {
 		home = os.Getenv("HOME")
 		if home == "" {
 			resolved, err := os.UserHomeDir()
-			if err != nil {
+			if err == nil {
+				home = resolved
+			} else if current, currentErr := user.Current(); currentErr == nil {
+				home = current.HomeDir
+			}
+			if home == "" {
 				return nil
 			}
-			home = resolved
 		}
 	}
 	roots := make([]string, 0, len(agentStateRelativeRoots)*2)
@@ -64,15 +69,6 @@ func IsAgentStatePathWithin(path string, roots []string) bool {
 	for _, root := range roots {
 		if path == root || strings.HasPrefix(path, root+string(os.PathSeparator)) {
 			return true
-		}
-	}
-	// Older records may contain only physical roots, so retain a physical-path
-	// comparison as a compatibility fallback.
-	if resolved, err := resolvePathAllowMissing(path); err == nil && resolved != path {
-		for _, root := range roots {
-			if resolved == root || strings.HasPrefix(resolved, root+string(os.PathSeparator)) {
-				return true
-			}
 		}
 	}
 	return false

@@ -228,9 +228,13 @@ func ResolveScope(options ScopeOptions) (Scope, error) {
 		changeListScope = ChangeListScopeWatchOnly
 		changeListRoots = append([]string(nil), filtered...)
 	}
+	agentStateRoots := AgentStateRoots(homeDirectory)
+	if len(agentStateRoots) == 0 {
+		return Scope{}, fmt.Errorf("determine declared agent-state roots: home directory is unavailable")
+	}
 	return Scope{
 		Watched: filtered, Excluded: excluded, Uncaptured: uncaptured,
-		AgentStateRoots: AgentStateRoots(homeDirectory),
+		AgentStateRoots: agentStateRoots,
 		ChangeListScope: changeListScope, ChangeListRoots: changeListRoots,
 		ScanRoot: scanRoot, ScanExcluded: scanExcluded,
 		ScanExcludedNames: scanExcludedNames,
