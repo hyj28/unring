@@ -4,6 +4,8 @@ package cli
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -275,13 +277,12 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		fmt.Fprintf(stderr, "unring: record file snapshot: %v\n", err)
 		return internalErrorExitCode
 	}
-	printSnapshotStarted(stderr, fileSummary)
-	for _, evictedID := range fileSummary.Evicted {
-		if evictedRecord, loadErr := auditStore.Load(evictedID); loadErr == nil {
-			evictedRecord.Files.Retained = false
-			_ = auditStore.Save(evictedRecord)
-		}
+	applyAutomaticRetention(auditStore, auditRecord.ID, capBytes, scope.RetentionDays, &fileSummary, stderr)
+	if err := auditSession.Update(func(record *audit.Record) { record.Files = fileSummary }); err != nil {
+		fmt.Fprintf(stderr, "unring: record start-time retention: %v\n", err)
+		return internalErrorExitCode
 	}
+	printSnapshotStarted(stderr, fileSummary)
 
 	var proxy postgresSession
 	var httpsProxy *httpsproxy.Proxy
@@ -575,7 +576,11 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		auditError = joinErrorText(auditError, result.Err)
 	}
 	printScanFinishing(stderr, fileSummary)
+	startEvicted := append([]string(nil), fileSummary.Evicted...)
+	startRetentionEvents := append([]localrollback.RetentionEvent(nil), fileSummary.RetentionEvents...)
 	fileSummary = fileSession.Seal(time.Now())
+	fileSummary.Evicted = append(startEvicted, fileSummary.Evicted...)
+	fileSummary.RetentionEvents = append(startRetentionEvents, fileSummary.RetentionEvents...)
 	printScanFinished(stderr, fileSummary)
 	applyAutomaticRetention(auditStore, auditRecord.ID, capBytes, scope.RetentionDays, &fileSummary, stderr)
 	if !fileSummary.Complete {
@@ -1381,7 +1386,7 @@ func logCommand(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("unring log", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	asJSON := flags.Bool("json", false, "print structured JSON")
-	showAll := flags.Bool("all", false, "show every recorded session")
+	showAll := flags.Bool("all", false, "show every recorded session in human-readable output (JSON is always complete)")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: unring log [--json] [--all] [session-id]")
 	}
@@ -1415,14 +1420,11 @@ func logCommand(args []string, stdout, stderr io.Writer) int {
 		}
 		truncated := false
 		total := len(records)
-		if !*showAll && len(records) > defaultLogLimit {
+		if !*asJSON && !*showAll && len(records) > defaultLogLimit {
 			records = records[:defaultLogLimit]
 			truncated = true
 		}
 		if *asJSON {
-			if truncated {
-				fmt.Fprintf(stderr, "unring: showing the newest %d of %d sessions; use unring log --all --json to show everything.\n", defaultLogLimit, total)
-			}
 			return writeJSON(stdout, stderr, records)
 		}
 		if len(records) == 0 {
@@ -1456,9 +1458,9 @@ func logCommand(args []string, stdout, stderr io.Writer) int {
 func pruneCommand(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("unring prune", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	confirm := flags.Bool("confirm", false, "remove the sessions listed by the retention policy")
+	confirm := flags.String("confirm", "", "remove the exact set identified by a prune preview token")
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: unring prune [--confirm]")
+		fmt.Fprintln(stderr, "Usage: unring prune [--confirm preview-token]")
 		fmt.Fprintln(stderr, "Without --confirm, show the sessions the age and byte limits would remove.")
 	}
 	if err := flags.Parse(args); err != nil {
@@ -1473,6 +1475,26 @@ func pruneCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "unring: open state store: %v\n", err)
 		return internalErrorExitCode
 	}
+	if *confirm != "" {
+		preview, err := loadPrunePreview(store.StateDir(), *confirm)
+		if err != nil {
+			fmt.Fprintf(stderr, "unring: load prune preview %q: %v\n", *confirm, err)
+			return usageExitCode
+		}
+		if err := applyRetentionRemovals(store, preview.Removals, func() error {
+			return validatePrunePreview(store, preview)
+		}, nil, stdout, "removed"); err != nil {
+			printPartialRetentionFailure(stderr, err)
+			fmt.Fprintf(stderr, "unring: prune preview %q was not fully applied: %v; run unring prune again if no removals were reported above.\n", *confirm, err)
+			return internalErrorExitCode
+		}
+		if err := os.Remove(prunePreviewPath(store.StateDir(), *confirm)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(stderr, "unring: remove completed prune preview: %v\n", err)
+			return internalErrorExitCode
+		}
+		fmt.Fprintln(stdout, "Reported bytes are unring's retained-snapshot accounting, not a promise of immediately increased free disk space; copy-on-write clones may only release references to shared blocks.")
+		return 0
+	}
 	capBytes, err := localrollback.RetentionCapForState(store.StateDir())
 	if err != nil {
 		fmt.Fprintf(stderr, "unring: read snapshot retention cap: %v\n", err)
@@ -1485,8 +1507,7 @@ func pruneCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	records, listErr := store.List()
 	if listErr != nil {
-		fmt.Fprintf(stderr, "unring: inspect every stored session before pruning: %v\n", listErr)
-		return internalErrorExitCode
+		fmt.Fprintf(stderr, "unring: retention warning: unreadable audit records were skipped: %v\n", listErr)
 	}
 	plan, err := localrollback.PlanRetention(
 		store.StateDir(), storedSessions(records), capBytes,
@@ -1496,33 +1517,119 @@ func pruneCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "unring: plan retention: %v\n", err)
 		return internalErrorExitCode
 	}
+	printRetentionWarnings(stderr, plan.Warnings)
 	if len(plan.Removals) == 0 {
 		fmt.Fprintln(stdout, "Nothing to prune; the newest session and all other stored sessions are within the configured limits.")
 		return 0
 	}
-	verb := "would remove"
-	if *confirm {
-		verb = "removed"
-		if err := localrollback.RemoveRetentionSnapshots(store.StateDir(), plan.Removals); err != nil {
-			fmt.Fprintf(stderr, "unring: prune retained snapshots: %v\n", err)
-			return internalErrorExitCode
-		}
-		for _, removal := range plan.Removals {
-			if err := store.Delete(removal.SessionID); err != nil {
-				fmt.Fprintf(stderr, "unring: prune session %s: %v\n", removal.SessionID, err)
-				return internalErrorExitCode
-			}
-		}
+	token, err := savePrunePreview(store.StateDir(), plan.Removals)
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: save prune preview: %v\n", err)
+		return internalErrorExitCode
 	}
 	for _, removal := range plan.Removals {
-		fmt.Fprintf(stdout, "%s session %s: %s; %s.\n",
-			verb, removal.SessionID, retentionReason(removal), retentionSpace(removal))
+		printRetentionRemoval(stdout, "would remove", removal)
 	}
 	fmt.Fprintln(stdout, "Reported bytes are unring's retained-snapshot accounting, not a promise of immediately increased free disk space; copy-on-write clones may only release references to shared blocks.")
-	if !*confirm {
-		fmt.Fprintln(stdout, "No sessions were removed. Run unring prune --confirm to remove exactly this retention set.")
-	}
+	fmt.Fprintf(stdout, "No sessions were removed. Run unring prune --confirm %s to remove exactly the set shown above.\n", token)
 	return 0
+}
+
+const prunePreviewVersion = 1
+
+type prunePreview struct {
+	Version  int                              `json:"version"`
+	Created  time.Time                        `json:"created_at"`
+	Removals []localrollback.RetentionRemoval `json:"removals"`
+}
+
+func savePrunePreview(stateDir string, removals []localrollback.RetentionRemoval) (string, error) {
+	var random [12]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(random[:])
+	directory := filepath.Join(stateDir, "prune-previews")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return "", err
+	}
+	data, err := json.MarshalIndent(prunePreview{
+		Version: prunePreviewVersion, Created: time.Now().UTC(),
+		Removals: append([]localrollback.RetentionRemoval(nil), removals...),
+	}, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	data = append(data, '\n')
+	temporary, err := os.CreateTemp(directory, ".prune-preview-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return "", err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return "", err
+	}
+	if err := temporary.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Rename(temporaryPath, prunePreviewPath(stateDir, token)); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func loadPrunePreview(stateDir, token string) (prunePreview, error) {
+	if len(token) != 24 {
+		return prunePreview{}, errors.New("preview token must contain 24 hexadecimal characters")
+	}
+	if _, err := hex.DecodeString(token); err != nil {
+		return prunePreview{}, errors.New("preview token must contain 24 hexadecimal characters")
+	}
+	data, err := os.ReadFile(prunePreviewPath(stateDir, token))
+	if err != nil {
+		return prunePreview{}, err
+	}
+	var preview prunePreview
+	if err := json.Unmarshal(data, &preview); err != nil {
+		return prunePreview{}, err
+	}
+	if preview.Version != prunePreviewVersion || len(preview.Removals) == 0 {
+		return prunePreview{}, errors.New("unsupported or empty prune preview")
+	}
+	return preview, nil
+}
+
+func prunePreviewPath(stateDir, token string) string {
+	return filepath.Join(stateDir, "prune-previews", token+".json")
+}
+
+func validatePrunePreview(store *audit.Store, preview prunePreview) error {
+	records, _ := store.List()
+	newest := ""
+	if len(records) > 0 {
+		newest = records[0].ID
+	}
+	for _, removal := range preview.Removals {
+		if removal.SessionID == newest {
+			return fmt.Errorf("session %s is now the newest stored session", removal.SessionID)
+		}
+		if removal.Expired {
+			if _, err := store.LoadExact(removal.SessionID); err != nil {
+				return fmt.Errorf("expired session %s changed since the preview: %w", removal.SessionID, err)
+			}
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(store.StateDir(), "snapshots", removal.SessionID)); err != nil {
+			return fmt.Errorf("snapshot %s changed since the preview: %w", removal.SessionID, err)
+		}
+	}
+	return nil
 }
 
 func storedSessions(records []audit.Record) []localrollback.StoredSession {
@@ -1551,6 +1658,67 @@ func retentionSpace(removal localrollback.RetentionRemoval) string {
 	return fmt.Sprintf("releases snapshot references with a %d-byte upper-bound accounting value, not a free-disk-space estimate", removal.StorageBytes)
 }
 
+func printRetentionRemoval(output io.Writer, verb string, removal localrollback.RetentionRemoval) {
+	target := "clone snapshot only"
+	if removal.Expired && removal.HasSnapshot {
+		target = "stored session and clone snapshot"
+	} else if removal.Expired {
+		target = "stored session audit record"
+	}
+	if verb == "retention removed" && !removal.Expired {
+		fmt.Fprintf(output, "unring: retention evicted oldest snapshot %s.\n", removal.SessionID)
+	}
+	fmt.Fprintf(output, "%s session %s (%s): %s; %s.\n",
+		verb, removal.SessionID, target, retentionReason(removal), retentionSpace(removal))
+	if !removal.Expired {
+		fmt.Fprintln(output, "  The audit record remains available; only clone restore data is removed.")
+	}
+}
+
+func printRetentionWarnings(output io.Writer, warnings []localrollback.RetentionWarning) {
+	for _, warning := range warnings {
+		fmt.Fprintf(output, "unring: retention warning for %s: %s.\n", warning.SessionID, warning.Error)
+	}
+}
+
+func applyRetentionRemovals(
+	store *audit.Store,
+	removals []localrollback.RetentionRemoval,
+	validate func() error,
+	summary *localrollback.Summary,
+	output io.Writer,
+	verb string,
+) error {
+	return localrollback.ApplyRetentionRemovals(
+		store.StateDir(), removals, validate,
+		func(removal localrollback.RetentionRemoval) error {
+			if removal.Expired {
+				return store.DeleteWhileSessionLocked(removal.SessionID)
+			}
+			record, err := store.LoadExact(removal.SessionID)
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			record.Files.Retained = false
+			return store.SaveWhileSessionLocked(record)
+		},
+		func(removal localrollback.RetentionRemoval) {
+			if summary != nil {
+				summary.Evicted = append(summary.Evicted, removal.SessionID)
+				summary.RetentionEvents = append(summary.RetentionEvents, localrollback.RetentionEvent{
+					SessionID: removal.SessionID, StorageBytes: removal.StorageBytes,
+					StorageExact: removal.StorageExact, Expired: removal.Expired,
+					CapRequired: removal.CapRequired,
+				})
+			}
+			printRetentionRemoval(output, verb, removal)
+		},
+	)
+}
+
 func applyAutomaticRetention(
 	store *audit.Store,
 	activeSession string,
@@ -1561,8 +1729,7 @@ func applyAutomaticRetention(
 ) {
 	records, err := store.List()
 	if err != nil {
-		fmt.Fprintf(output, "unring: enforce session retention: %v\n", err)
-		return
+		fmt.Fprintf(output, "unring: retention warning: unreadable audit records were skipped: %v\n", err)
 	}
 	plan, err := localrollback.PlanRetention(
 		store.StateDir(), storedSessions(records), capBytes,
@@ -1572,42 +1739,33 @@ func applyAutomaticRetention(
 		fmt.Fprintf(output, "unring: enforce session retention: %v\n", err)
 		return
 	}
+	printRetentionWarnings(output, plan.Warnings)
 	removals := make([]localrollback.RetentionRemoval, 0, len(plan.Removals))
 	for _, removal := range plan.Removals {
 		if removal.SessionID != activeSession {
 			removals = append(removals, removal)
 		}
 	}
-	if err := localrollback.RemoveRetentionSnapshots(store.StateDir(), removals); err != nil {
+	if err := applyRetentionRemovals(store, removals, nil, summary, output, "retention removed"); err != nil {
+		printPartialRetentionFailure(output, err)
 		fmt.Fprintf(output, "unring: enforce session retention: %v\n", err)
 		return
-	}
-	for _, removal := range removals {
-		summary.Evicted = append(summary.Evicted, removal.SessionID)
-		summary.RetentionEvents = append(summary.RetentionEvents, localrollback.RetentionEvent{
-			SessionID: removal.SessionID, StorageBytes: removal.StorageBytes,
-			StorageExact: removal.StorageExact, Expired: removal.Expired,
-			CapRequired: removal.CapRequired,
-		})
-		if removal.Expired {
-			fmt.Fprintf(output, "unring: retention expired session %s: %s; %s.\n",
-				removal.SessionID, retentionReason(removal), retentionSpace(removal))
-			if err := store.Delete(removal.SessionID); err != nil {
-				fmt.Fprintf(output, "unring: remove expired audit record %s: %v\n", removal.SessionID, err)
-			}
-			continue
-		}
-		fmt.Fprintf(output, "unring: retention evicted oldest snapshot %s.\n", removal.SessionID)
-		if evictedRecord, loadErr := store.Load(removal.SessionID); loadErr == nil {
-			evictedRecord.Files.Retained = false
-			_ = store.Save(evictedRecord)
-		}
 	}
 	if plan.After.Exact && plan.After.Bytes > plan.After.CapBytes {
 		fmt.Fprintf(output,
 			"unring: newest snapshot remains retained; measured snapshot usage is %d bytes, above the %d-byte cap.\n",
 			plan.After.Bytes, plan.After.CapBytes)
 	}
+}
+
+func printPartialRetentionFailure(output io.Writer, err error) {
+	var applyErr *localrollback.RetentionApplyError
+	if !errors.As(err, &applyErr) || !applyErr.SnapshotRemoved {
+		return
+	}
+	fmt.Fprintf(output,
+		"unring: IMPORTANT: clone snapshot data for %s was removed before its audit record could be updated; the audit record may still claim restore data is retained.\n",
+		applyErr.Removal.SessionID)
 }
 
 func writeJSON(stdout, stderr io.Writer, value any) int {
@@ -1676,6 +1834,17 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 	record, err := store.Load(sessionID)
 	if err != nil {
 		fmt.Fprintf(stderr, "unring: %v\n", err)
+		return internalErrorExitCode
+	}
+	unlockStoredSession, err := localrollback.AcquireSessionReadLock(store.StateDir(), record.ID)
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: lock restore session %s: %v\n", record.ID, err)
+		return internalErrorExitCode
+	}
+	defer unlockStoredSession()
+	record, err = store.LoadExact(record.ID)
+	if err != nil {
+		fmt.Fprintf(stderr, "unring: session %s was pruned before restore began: %v\n", record.ID, err)
 		return internalErrorExitCode
 	}
 	record.Files = loadStoredFileSummary(store.StateDir(), record)
@@ -1780,7 +1949,7 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		}
 		record.Files.RestoreEvents = append(record.Files.RestoreEvents, restoreEvent)
 	}
-	if err := store.Save(record); err != nil {
+	if err := store.SaveWhileSessionLocked(record); err != nil {
 		fmt.Fprintf(stderr, "unring: record restore outcome: %v\n", err)
 		return internalErrorExitCode
 	}
@@ -2617,7 +2786,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  unring run [--commit | --discard] [--outbound] [--watch path | --watch-only path] -- <command> [args...]")
 	fmt.Fprintln(output, "  unring log [--json] [--all] [session-id]")
 	fmt.Fprintln(output, "  unring restore [--force] [--all [--include-agent-state]] <session-id> [changed-path ...]")
-	fmt.Fprintln(output, "  unring prune [--confirm]")
+	fmt.Fprintln(output, "  unring prune [--confirm preview-token]")
 	fmt.Fprintln(output, "  unring snapshots")
 	fmt.Fprintln(output, "  unring <command-on-PATH> [--] [args...]")
 	fmt.Fprintln(output, "  unring claude|codex|opencode [--] [args...]")

@@ -328,7 +328,7 @@ func matchesRestoredMetadata(current Entry, exists bool, before *Entry) bool {
 	case "symlink":
 		return current.LinkTarget == before.LinkTarget
 	case "file":
-		return current.Size == before.Size
+		return current.Size == before.Size && current.MTime == before.MTime
 	default:
 		return false
 	}

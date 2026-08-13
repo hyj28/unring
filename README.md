@@ -122,7 +122,7 @@ unring restore --all --include-agent-state <session-id>
 unring restore --force <session-id> path     # explicitly overwrite a conflict
 unring snapshots                             # inspect clone usage and APFS backstop presence
 unring prune                                 # show sessions outside retention limits
-unring prune --confirm                       # remove exactly the listed sessions
+unring prune --confirm <preview-token>       # remove exactly the previewed sessions
 ```
 
 The `unring restore` and detailed `unring log <session-id>` output repeat the session's
@@ -140,18 +140,23 @@ measured snapshot allocation, and stored sessions expire after 14 days unless
 `retention_days` in `config.yaml` selects another positive number. The age and byte limits
 share one oldest-first decision, and the newest session is always kept. Automatic expiry is
 named in the new session's output and audit record. `unring prune` shows the same retention
-set without deleting it; `--confirm` is required to remove the listed sessions. Reported
+set without deleting it; the printed preview token is required to remove exactly that saved
+set, and a stale token is refused rather than recalculated. Reported
 snapshot bytes are unring's retention accounting, not a promise of immediately increased
 free space: APFS clones can release references to shared blocks without changing free space
 until the other references are removed.
+Age expiry removes both the stored session record and clone restore data. When only the byte
+cap binds, unring removes the clone data but keeps the audit record of database, outbound,
+and file activity, marking that record as no longer retained for clone restore.
 An explicit `--snapshot-cap-bytes` value is persisted so later runs and `unring snapshots`
 report and enforce the same cap. `UNRING_SNAPSHOT_CAP_BYTES` supplies the initial cap for a
 state directory that has no persisted value; the first run persists that effective value.
 Where a filesystem cannot expose allocation changes cheaply, unring labels the figure as
 an upper bound and does not evict snapshots based on that estimate.
 
-`unring log` lists at most the newest 50 sessions by default and says when older records
-were omitted; use `unring log --all` (or `--all --json`) to request every record.
+Human-readable `unring log` lists at most the newest 50 sessions by default and says when
+older records were omitted; use `unring log --all` to request every human-readable row.
+`unring log --json` always returns every record so redirected structured output is complete.
 
 Change detection keeps metadata as its fast oracle. For a clone-backed regular file whose
 type, size, mode, and link count still agree, unring compares bytes only up to 8 MiB before
