@@ -1,6 +1,7 @@
 package localrollback
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -46,6 +47,7 @@ type VolumeSnapshotPlatform interface {
 	Supported() (bool, string)
 	VolumeForPath(path string) (Volume, error)
 	IsExcluded(path string) (bool, error)
+	IsExcludedBatch(ctx context.Context, paths []string) ([]bool, error)
 	ListSnapshots(volume Volume) ([]string, error)
 	CreateSnapshots() (string, error)
 	MountSnapshot(snapshot VolumeSnapshot, mountPoint string) error
@@ -99,6 +101,10 @@ func (unavailableSnapshotPlatform) VolumeForPath(string) (Volume, error) {
 
 func (unavailableSnapshotPlatform) IsExcluded(string) (bool, error) {
 	return false, errors.New("volume snapshots are unavailable")
+}
+
+func (unavailableSnapshotPlatform) IsExcludedBatch(context.Context, []string) ([]bool, error) {
+	return nil, errors.New("volume snapshots are unavailable")
 }
 
 func (unavailableSnapshotPlatform) ListSnapshots(Volume) ([]string, error) {

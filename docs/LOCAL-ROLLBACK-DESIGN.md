@@ -338,3 +338,24 @@ A restore is an explicit operation on selected paths, so paying one streaming co
 worth avoiding a false conflict and redundant sidecar. Neither decision changes manifest
 membership: paths and metadata are recorded exactly as before, and human rendering alone
 quotes control characters such as newlines.
+
+---
+
+## 10. Survivable session finalization (2026-08-14)
+
+The first long interactive run exposed three end-of-session scaling failures: one
+`tmutil` process per changed path, signal handlers left installed without a reader after
+the child exited, and complete unbounded rendering of retention and background tool-state
+churn. Coverage was correct throughout; finalization speed and presentation were not.
+
+### 10.1 Decisions
+
+| # | Decision |
+|---|---|
+| 21 | Check Time Machine inclusion in **explicit path batches** of at most 256. A batch result is usable only when it has exactly one recognized status line per input and every line names the input at the same index. Short, reordered, malformed, and otherwise unattributable output fails closed. An excluded ancestor may still short-circuit its descendants; an included ancestor never substitutes for checking a child. |
+| 22 | The entire post-child seal is **interruptible by `SIGINT` and `SIGTERM`**. Filesystem walks and active `tmutil` commands receive cancellation, the manifest is still written with an end time and an explicit incomplete reason, the database and staged effects take the discard path, and the audit outcome becomes `discarded` rather than remaining `pending`. Periodic and batch-count progress keeps the terminal visibly alive while sealing. |
+| 23 | Human output is bounded without reducing the record. Live review and stored `log <session-id>` rendering use the existing 50-item bound independently for ordinary and declared agent-own-state changes, disclose withheld counts, and name `restore <session-id>` as the complete view. `~/.cursor` joins the explicit agent-state root list. Automatic retention names each of at most 50 removals once, reports the total and withheld count, points to the current session log for all details, and stores every retention event. |
+
+These decisions alter process count, cancellation, and rendering only. Diff membership,
+manifest membership, JSON records, and restore selection continue to contain every observed
+change.

@@ -2,6 +2,7 @@
 package localrollback
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -187,6 +188,14 @@ type Session struct {
 	// The widened baseline is needed only by this live process. Persisting it
 	// would serialize and fsync hundreds of thousands of entries repeatedly.
 	scanBefore map[string]Entry
+}
+
+// SealProgress reports bounded progress through the potentially long
+// post-child Time Machine inclusion phase.
+type SealProgress struct {
+	Phase     string
+	Completed int
+	Total     int
 }
 
 // Usage describes retained snapshot storage.
@@ -561,6 +570,12 @@ func attachManifestFailure(value *manifest, failure CaptureFailure) bool {
 
 // Seal scans the watched paths after the child exits and records the diff.
 func (s *Session) Seal(now time.Time) Summary {
+	return s.SealContext(context.Background(), now, nil)
+}
+
+// SealContext seals the durable manifest even when ctx interrupts the scan.
+// The resulting incomplete summary is safe to record as a discarded session.
+func (s *Session) SealContext(ctx context.Context, now time.Time, progress func(SealProgress)) Summary {
 	availableBefore, measuredBefore, measureBeforeErr := filesystemAvailableBytes(s.dir)
 	before := make(map[string]Entry)
 	diffExcluded := make(map[string]bool)
@@ -602,7 +617,7 @@ func (s *Session) Seal(now time.Time) Summary {
 			root.Uncaptured[failure.Path] = failure.Error
 			continue
 		}
-		entries, failures, err := scanMappedRoot(root.Source, root.Path, s.manifest.Excluded)
+		entries, failures, err := scanMappedRootContext(ctx, root.Source, root.Path, s.manifest.Excluded)
 		if err != nil {
 			failure := CaptureFailure{Path: root.Path, Error: err.Error()}
 			scanFailures = append(scanFailures, failure)
@@ -645,7 +660,7 @@ func (s *Session) Seal(now time.Time) Summary {
 	wideFailures := append([]CaptureFailure(nil), s.manifest.ScanFailures...)
 	if s.manifest.ScanRoot != "" {
 		scanStarted := time.Now()
-		entries, failures, err := scanRootWithNames(
+		entries, failures, err := scanRootWithNamesContext(ctx,
 			s.manifest.ScanRoot, s.manifest.ScanExcluded, s.manifest.ScanExcludedNames,
 		)
 		s.manifest.ScanAfterMillis = time.Since(scanStarted).Milliseconds()
@@ -668,7 +683,7 @@ func (s *Session) Seal(now time.Time) Summary {
 	for index := range changes {
 		changeIndexes[changes[index].Path] = index
 	}
-	exclusionChecks := make(map[string]timeMachineExclusionCheck)
+	var wideChangeIndexes []int
 	for index, root := range s.manifest.Roots {
 		if !rootScanned[index] || len(initialUncaptured[index]) == 0 {
 			continue
@@ -680,9 +695,9 @@ func (s *Session) Seal(now time.Time) Summary {
 				continue
 			}
 			change.VolumeSnapshotPath = physicalPathForRoot(root, change.Path)
-			classifyWideChange(&change, s.platform, &s.manifest.Backstop, exclusionChecks)
 			changeIndexes[change.Path] = len(changes)
 			changes = append(changes, change)
+			wideChangeIndexes = append(wideChangeIndexes, len(changes)-1)
 		}
 	}
 	for _, change := range wideChanges {
@@ -693,13 +708,16 @@ func (s *Session) Seal(now time.Time) Summary {
 		if cloneCovered {
 			continue
 		}
-		classifyWideChange(&change, s.platform, &s.manifest.Backstop, exclusionChecks)
 		changeIndexes[change.Path] = len(changes)
 		changes = append(changes, change)
+		wideChangeIndexes = append(wideChangeIndexes, len(changes)-1)
 	}
+	classificationFailures := classifyWideChanges(
+		ctx, changes, wideChangeIndexes, s.platform, &s.manifest.Backstop, progress,
+	)
 	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
 	s.manifest.ScanFailures = mergeFailures(wideFailures)
-	allFailures := mergeFailures(scanFailures, coverageGaps, s.manifest.ScanFailures)
+	allFailures := mergeFailures(scanFailures, coverageGaps, s.manifest.ScanFailures, classificationFailures)
 	s.manifest.PostSessionFailures = append([]CaptureFailure(nil), allFailures...)
 	s.manifest.EndedAt = now.UTC()
 	s.manifest.After = after
@@ -712,8 +730,18 @@ func (s *Session) Seal(now time.Time) Summary {
 		s.manifest.Complete = false
 		s.manifest.Error = joinText(s.manifest.Error, err.Error())
 	}
-	availableAfter, measuredAfter, measureAfterErr := filesystemAvailableBytes(s.dir)
-	if measureBeforeErr != nil || measureAfterErr != nil {
+	availableAfter, measuredAfter, measureAfterErr := int64(0), false, error(nil)
+	if ctx.Err() == nil {
+		availableAfter, measuredAfter, measureAfterErr = filesystemAvailableBytes(s.dir)
+	}
+	if ctx.Err() != nil {
+		s.manifest.Complete = false
+		s.manifest.StorageExact = false
+		s.manifest.Error = joinText(s.manifest.Error, "measure retained snapshot after interrupted seal: "+ctx.Err().Error())
+		if err := writeManifest(s.dir, s.manifest); err != nil {
+			s.manifest.Error = joinText(s.manifest.Error, err.Error())
+		}
+	} else if measureBeforeErr != nil || measureAfterErr != nil {
 		measureErr := errors.Join(measureBeforeErr, measureAfterErr)
 		s.manifest.Complete = false
 		s.manifest.Error = joinText(s.manifest.Error, "measure retained snapshot: "+measureErr.Error())
@@ -799,6 +827,118 @@ type timeMachineExclusionCheck struct {
 	err      error
 }
 
+const timeMachineExclusionBatchSize = 256
+
+func classifyWideChanges(
+	ctx context.Context,
+	changes []Change,
+	indexes []int,
+	platform VolumeSnapshotPlatform,
+	backstop *Backstop,
+	progress func(SealProgress),
+) []CaptureFailure {
+	checks := make(map[string]timeMachineExclusionCheck)
+	pending := make(map[string]bool)
+	for _, index := range indexes {
+		if path, ok := exclusionCheckPath(changes[index], backstop); ok {
+			pending[path] = true
+		}
+	}
+	total := len(pending)
+	completed := 0
+	report := func() {
+		if progress != nil {
+			progress(SealProgress{Phase: "time-machine-inclusion", Completed: completed, Total: total})
+		}
+	}
+	if total > 0 {
+		report()
+	}
+	var failures []CaptureFailure
+	for len(pending) > 0 {
+		paths := make([]string, 0, len(pending))
+		minimumDepth := -1
+		for path := range pending {
+			if _, _, inherited := inheritedExcludedCheck(path, checks); inherited {
+				delete(pending, path)
+				completed++
+				continue
+			}
+			depth := pathDepth(path)
+			if minimumDepth < 0 || depth < minimumDepth {
+				minimumDepth = depth
+				paths = paths[:0]
+				paths = append(paths, path)
+			} else if depth == minimumDepth {
+				paths = append(paths, path)
+			}
+		}
+		if len(pending) == 0 {
+			report()
+			break
+		}
+		sort.Strings(paths)
+		for start := 0; start < len(paths); start += timeMachineExclusionBatchSize {
+			end := start + timeMachineExclusionBatchSize
+			if end > len(paths) {
+				end = len(paths)
+			}
+			batch := paths[start:end]
+			results, err := platform.IsExcludedBatch(ctx, batch)
+			if err == nil && len(results) != len(batch) {
+				err = fmt.Errorf("Time Machine inclusion batch returned %d results for %d paths", len(results), len(batch))
+			}
+			for index, path := range batch {
+				check := timeMachineExclusionCheck{err: err}
+				if err == nil {
+					check.excluded = results[index]
+				}
+				checks[path] = check
+				delete(pending, path)
+				completed++
+			}
+			if err != nil {
+				failures = append(failures, CaptureFailure{
+					Path: batch[0], Error: "batched Time Machine inclusion check failed without attributing results: " + err.Error(),
+				})
+			}
+			report()
+		}
+	}
+	for _, index := range indexes {
+		classifyWideChange(&changes[index], platform, backstop, checks)
+	}
+	return mergeFailures(failures)
+}
+
+func exclusionCheckPath(change Change, backstop *Backstop) (string, bool) {
+	entry := change.Before
+	if entry == nil {
+		entry = change.After
+	}
+	if entry != nil && (entry.Type == "other" || entry.Type == "file" && entry.Links > 1) {
+		return "", false
+	}
+	if !backstop.Available {
+		return "", false
+	}
+	if change.After == nil {
+		return nearestExistingAncestor(filepath.Dir(change.Path)), true
+	}
+	return change.Path, true
+}
+
+func pathDepth(path string) int {
+	depth := 0
+	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
+		depth++
+		parent := filepath.Dir(current)
+		if parent == current {
+			return depth
+		}
+	}
+}
+
 func classifyWideChange(change *Change, platform VolumeSnapshotPlatform, backstop *Backstop, checks map[string]timeMachineExclusionCheck) {
 	change.RestoreSource = RestoreSourceNone
 	entry := change.Before
@@ -823,7 +963,11 @@ func classifyWideChange(change *Change, platform VolumeSnapshotPlatform, backsto
 	if change.After == nil {
 		checkPath = nearestExistingAncestor(filepath.Dir(change.Path))
 	}
-	check, checkedPath, ok := inheritedExcludedCheck(checkPath, checks)
+	check, ok := checks[checkPath]
+	checkedPath := checkPath
+	if !ok {
+		check, checkedPath, ok = inheritedExcludedCheck(checkPath, checks)
+	}
 	if !ok {
 		check.excluded, check.err = platform.IsExcluded(checkPath)
 		checks[checkPath] = check
@@ -1036,7 +1180,11 @@ func stableObservedEntries(before, after map[string]Entry) map[string]Entry {
 }
 
 func scanMappedRoot(sourceRoot, reportedRoot string, excluded []string) (map[string]Entry, []CaptureFailure, error) {
-	entries, failures, err := scanRoot(sourceRoot, excluded)
+	return scanMappedRootContext(context.Background(), sourceRoot, reportedRoot, excluded)
+}
+
+func scanMappedRootContext(ctx context.Context, sourceRoot, reportedRoot string, excluded []string) (map[string]Entry, []CaptureFailure, error) {
+	entries, failures, err := scanRootWithNamesContext(ctx, sourceRoot, excluded, nil)
 	translated := make(map[string]Entry, len(entries))
 	for path, entry := range entries {
 		relative, relErr := filepath.Rel(sourceRoot, path)
@@ -1306,10 +1454,14 @@ func captureOne(source, destination string, info fs.FileInfo) (string, bool, err
 }
 
 func scanRoot(root string, excluded []string) (map[string]Entry, []CaptureFailure, error) {
-	return scanRootWithNames(root, excluded, nil)
+	return scanRootWithNamesContext(context.Background(), root, excluded, nil)
 }
 
 func scanRootWithNames(root string, excluded, excludedNames []string) (map[string]Entry, []CaptureFailure, error) {
+	return scanRootWithNamesContext(context.Background(), root, excluded, excludedNames)
+}
+
+func scanRootWithNamesContext(ctx context.Context, root string, excluded, excludedNames []string) (map[string]Entry, []CaptureFailure, error) {
 	entries := make(map[string]Entry)
 	excludedNameSet := make(map[string]bool, len(excludedNames))
 	for _, name := range excludedNames {
@@ -1332,6 +1484,9 @@ func scanRootWithNames(root string, excluded, excludedNames []string) (map[strin
 	}
 	var failures []CaptureFailure
 	err = filepath.WalkDir(root, func(path string, directoryEntry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			failures = append(failures, CaptureFailure{Path: path, Error: walkErr.Error()})
 			if directoryEntry != nil && directoryEntry.IsDir() {

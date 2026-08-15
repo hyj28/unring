@@ -144,6 +144,17 @@ Design: [docs/LOCAL-ROLLBACK-DESIGN.md §9](docs/LOCAL-ROLLBACK-DESIGN.md). Deci
       comparison; recognize explicitly restored original bytes without weakening conflicts
 - [x] M11.4 Quote control characters in human-readable paths without changing stored paths
 
+## M12 — Survivable session finalization
+
+Design: [docs/LOCAL-ROLLBACK-DESIGN.md §10](docs/LOCAL-ROLLBACK-DESIGN.md). Decisions 21–23.
+
+- [x] M12.1 Batch and order-validate post-session `tmutil isexcluded` checks while preserving
+      excluded-ancestor-only short-circuiting and reporting progress
+- [x] M12.2 Keep `SIGINT` and `SIGTERM` effective after the child exits, cancel sealing work,
+      and durably finish the session as discarded
+- [x] M12.3 Bound automatic retention and per-group change rendering with complete stored
+      records and explicit commands for viewing withheld detail
+
 ---
 
 ## Explicitly out of scope for v1

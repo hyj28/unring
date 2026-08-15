@@ -1,6 +1,7 @@
 package localrollback
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -34,6 +35,18 @@ func (platform *reviewRound2Platform) IsExcluded(path string) (bool, error) {
 		}
 	}
 	return platform.excluded[path], nil
+}
+
+func (platform *reviewRound2Platform) IsExcludedBatch(_ context.Context, paths []string) ([]bool, error) {
+	results := make([]bool, len(paths))
+	for index, path := range paths {
+		var err error
+		results[index], err = platform.IsExcluded(path)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return results, nil
 }
 
 func (platform *reviewRound2Platform) ListSnapshots(Volume) ([]string, error) {

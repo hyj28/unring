@@ -4,6 +4,7 @@ package localrollback
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
@@ -18,12 +19,17 @@ import (
 
 type commandOutputRunner interface {
 	Run(name string, args ...string) ([]byte, error)
+	RunContext(ctx context.Context, name string, args ...string) ([]byte, error)
 }
 
 type execOutputRunner struct{}
 
 func (execOutputRunner) Run(name string, args ...string) ([]byte, error) {
-	command := exec.Command(name, args...)
+	return execOutputRunner{}.RunContext(context.Background(), name, args...)
+}
+
+func (execOutputRunner) RunContext(ctx context.Context, name string, args ...string) ([]byte, error) {
+	command := exec.CommandContext(ctx, name, args...)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		message := strings.TrimSpace(string(output))
@@ -64,19 +70,60 @@ func (*darwinVolumeSnapshotPlatform) VolumeForPath(path string) (Volume, error) 
 }
 
 func (platform *darwinVolumeSnapshotPlatform) IsExcluded(path string) (bool, error) {
-	output, err := platform.runner.Run("/usr/bin/tmutil", "isexcluded", path)
+	results, err := platform.IsExcludedBatch(context.Background(), []string{path})
 	if err != nil {
 		return false, err
 	}
-	line := strings.TrimSpace(string(output))
-	switch {
-	case strings.HasPrefix(line, "[Excluded]"):
-		return true, nil
-	case strings.HasPrefix(line, "[Included]"):
-		return false, nil
-	default:
-		return false, fmt.Errorf("unexpected tmutil isexcluded output: %q", line)
+	return results[0], nil
+
+}
+
+func (platform *darwinVolumeSnapshotPlatform) IsExcludedBatch(ctx context.Context, paths []string) ([]bool, error) {
+	if len(paths) == 0 {
+		return nil, nil
 	}
+	for _, path := range paths {
+		if strings.ContainsAny(path, "\r\n") {
+			return nil, fmt.Errorf("cannot safely parse tmutil isexcluded output for path containing a line break: %q", path)
+		}
+	}
+	arguments := append([]string{"isexcluded"}, paths...)
+	output, err := platform.runner.RunContext(ctx, "/usr/bin/tmutil", arguments...)
+	if err != nil {
+		return nil, err
+	}
+	return parseExcludedBatch(paths, output)
+}
+
+func parseExcludedBatch(paths []string, output []byte) ([]bool, error) {
+	trimmed := strings.TrimSpace(string(output))
+	lines := []string(nil)
+	if trimmed != "" {
+		lines = strings.Split(trimmed, "\n")
+	}
+	if len(lines) != len(paths) {
+		return nil, fmt.Errorf("unexpected tmutil isexcluded output: got %d result lines for %d paths", len(lines), len(paths))
+	}
+	results := make([]bool, len(paths))
+	for index, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		var excluded bool
+		var reported string
+		switch {
+		case strings.HasPrefix(line, "[Excluded]"):
+			excluded = true
+			reported = strings.TrimSpace(strings.TrimPrefix(line, "[Excluded]"))
+		case strings.HasPrefix(line, "[Included]"):
+			reported = strings.TrimSpace(strings.TrimPrefix(line, "[Included]"))
+		default:
+			return nil, fmt.Errorf("unexpected tmutil isexcluded output line %d: %q", index+1, line)
+		}
+		if reported != paths[index] {
+			return nil, fmt.Errorf("unexpected tmutil isexcluded output line %d: reported path %q for requested path %q", index+1, reported, paths[index])
+		}
+		results[index] = excluded
+	}
+	return results, nil
 }
 
 func (platform *darwinVolumeSnapshotPlatform) ListSnapshots(volume Volume) ([]string, error) {

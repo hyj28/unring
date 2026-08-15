@@ -112,6 +112,14 @@ is not macOS, unring prints a prominent coverage warning and still runs. The clo
 change list continue to work. Local snapshots are purgeable under disk pressure; `unring
 snapshots` reports whether each recorded backstop still exists.
 
+The post-child Time Machine inclusion check passes changed paths to `tmutil isexcluded` in
+validated batches instead of starting one process per path. Every returned line must name
+the corresponding requested path in the same order; short, reordered, or malformed output
+is rejected rather than attributed to the wrong file. The terminal reports scan and batch
+progress. `SIGINT` and `SIGTERM` remain active after the child exits: either signal cancels
+the remaining scan, seals an incomplete manifest, discards the session, and records a final
+outcome that later `log` and `restore` commands can inspect.
+
 After the child exits, inspect and restore file changes at any later time:
 
 ```sh
@@ -180,7 +188,7 @@ before unring can truthfully report either `already restored` or a byte-level co
 
 Snapshot-only paths from the same recorded APFS snapshot are restored under one read-only
 mount per command, with one unmount after every selected path has been attempted. The
-declared agent-own-state roots are `~/.claude`, `~/.codex`, `~/.config/opencode`,
+declared agent-own-state roots are `~/.claude`, `~/.codex`, `~/.cursor`, `~/.config/opencode`,
 `~/.local/share/opencode`, and `~/.cache/opencode`. Their changes remain in live output,
 the manifest, and stored listings under a separate label. Their logical and physically
 resolved roots are persisted
@@ -192,6 +200,11 @@ Unsupported special files such as Unix sockets also remain recorded, but render 
 informational file-type note rather than as an actionable `FILE NOT SNAPSHOTTED` alarm.
 Records created before agent-state roots were stored disclose that their grouping is inferred
 from the current environment whenever that grouping is listed or used by `restore --all`.
+Live and stored session reviews show at most 50 ordinary changes and 50 agent-own-state
+changes, disclose each group's withheld count, and point to `unring restore <session-id>`
+for the complete recorded list. Automatic retention uses the same 50-item human-output
+bound, announces the total and withheld count, and records every removal in the current
+session even when its detail is not printed.
 
 If this task needs PostgreSQL coverage, point `DATABASE_URL` at the real development
 database first:

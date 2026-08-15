@@ -1,7 +1,9 @@
 package localrollback
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,6 +14,7 @@ type reviewRoundPlatform struct {
 	created         bool
 	present         bool
 	isExcludedCalls []string
+	batchCalls      int
 }
 
 func (*reviewRoundPlatform) Supported() (bool, string) { return true, "" }
@@ -23,6 +26,41 @@ func (*reviewRoundPlatform) VolumeForPath(string) (Volume, error) {
 func (platform *reviewRoundPlatform) IsExcluded(path string) (bool, error) {
 	platform.isExcludedCalls = append(platform.isExcludedCalls, filepath.Clean(path))
 	return false, nil
+}
+
+func (platform *reviewRoundPlatform) IsExcludedBatch(_ context.Context, paths []string) ([]bool, error) {
+	platform.batchCalls++
+	results := make([]bool, len(paths))
+	for index, path := range paths {
+		results[index], _ = platform.IsExcluded(path)
+	}
+	return results, nil
+}
+
+func TestWideInclusionChecksUseFarFewerBatchesThanPaths(t *testing.T) {
+	platform := &reviewRoundPlatform{}
+	backstop := Backstop{Available: true, Snapshots: []VolumeSnapshot{{
+		Name: "literal-snapshot", VolumeID: "review-disk", MountPoint: "/",
+	}}}
+	changes := make([]Change, 600)
+	indexes := make([]int, 600)
+	for index := range changes {
+		changes[index] = Change{
+			Kind: "created", Path: filepath.Join("/literal/work", fmt.Sprintf("artifact-%03d", index)),
+			After: &Entry{Type: "file"},
+		}
+		indexes[index] = index
+	}
+	failures := classifyWideChanges(context.Background(), changes, indexes, platform, &backstop, nil)
+	if len(failures) != 0 {
+		t.Fatalf("classification failures = %#v", failures)
+	}
+	if platform.batchCalls != 3 {
+		t.Fatalf("batch calls = %d, want literal 3 for 600 paths", platform.batchCalls)
+	}
+	if len(platform.isExcludedCalls) != 600 {
+		t.Fatalf("mapped per-path statuses = %d, want literal 600", len(platform.isExcludedCalls))
+	}
 }
 
 func (platform *reviewRoundPlatform) ListSnapshots(Volume) ([]string, error) {
