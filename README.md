@@ -115,12 +115,18 @@ snapshots` reports whether each recorded backstop still exists.
 The post-child Time Machine inclusion check passes changed paths to `tmutil isexcluded` in
 validated batches instead of starting one process per path. Every returned line must name
 the corresponding requested path in the same order; short, reordered, or malformed output
-is rejected rather than attributed to the wrong file. The terminal reports scan and batch
-progress. `SIGINT` and `SIGTERM` remain active after the child exits: either signal cancels
-the remaining scan, seals an incomplete manifest, discards the session, and records a final
-outcome that later `log` and `restore` commands can inspect. A second signal is acknowledged
-but does not bypass that durable discard finalization; the first signal determines the exit
-status. Interrupted human-readable listings say that coverage is incomplete, while `log
+is rejected rather than attributed to the wrong file. Echoed paths are compared after Unicode
+normalization because macOS may return decomposed filenames. Paths whose whitespace or line
+breaks make a multi-path response unsafe are checked alone; any unusable batch falls back to
+one check and one independently attributed result per path. The terminal reports scan and
+batch progress.
+
+`SIGINT` and `SIGTERM` remain active from child exit through scanning, automatic retention,
+interceptor sealing, and finalization. Either signal cancels the active phase, selects discard,
+and records an abnormal outcome that later `log` and `restore` commands can inspect. A second
+signal is acknowledged but does not bypass durable discard finalization; the first signal
+determines the exit status. Interrupted human-readable listings say that coverage is
+incomplete without calling a canceled post-session walk a snapshot failure, while `log
 --json` retains the exact diagnostic cause.
 
 After the child exits, inspect and restore file changes at any later time:
@@ -142,10 +148,11 @@ The `unring restore` and detailed `unring log <session-id>` output repeat the se
 recorded change-list scope. A clean stored change list therefore does not hide whether
 `--watch-only`, a failed widened scan, or the normal home-and-clone boundary left changes
 elsewhere unreported. A completed no-change scan prints an explicit zero. Human change rows
-are bounded independently for each watched root and for declared agent own-state, so a noisy
-root cannot hide another explicitly watched root; `restore <session-id>` remains the complete
-recorded listing. The history outcome labels distinguish a successful file-only session that
-needed no decision from an explicit discard and an abnormal interrupted end.
+are bounded independently for each watched root, each declared agent-state root, and each
+top-level outside-watch presentation root, so one noisy root cannot hide another;
+`restore <session-id>` remains the complete recorded listing. The history outcome labels
+distinguish a successful file-only session that needed no decision from an explicit discard
+and an abnormal interrupted end.
 
 A clone-covered path changed after the session is refused by default. Its pre-session
 snapshot is written alongside the current file, and only `--force` permits replacement.

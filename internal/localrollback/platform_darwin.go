@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+	"golang.org/x/text/unicode/norm"
 )
 
 type commandOutputRunner interface {
@@ -82,21 +83,19 @@ func (platform *darwinVolumeSnapshotPlatform) IsExcludedBatch(ctx context.Contex
 	if len(paths) == 0 {
 		return nil, nil
 	}
-	for _, path := range paths {
-		if strings.ContainsAny(path, "\r\n") {
-			return nil, fmt.Errorf("cannot safely parse tmutil isexcluded output for path containing a line break: %q", path)
-		}
-	}
 	arguments := append([]string{"isexcluded"}, paths...)
 	output, err := platform.runner.RunContext(ctx, "/usr/bin/tmutil", arguments...)
 	if err != nil {
 		return nil, err
 	}
+	if len(paths) == 1 {
+		return parseExcludedSingle(paths[0], output)
+	}
 	return parseExcludedBatch(paths, output)
 }
 
 func parseExcludedBatch(paths []string, output []byte) ([]bool, error) {
-	trimmed := strings.TrimSpace(string(output))
+	trimmed := strings.TrimSuffix(string(output), "\n")
 	lines := []string(nil)
 	if trimmed != "" {
 		lines = strings.Split(trimmed, "\n")
@@ -106,24 +105,40 @@ func parseExcludedBatch(paths []string, output []byte) ([]bool, error) {
 	}
 	results := make([]bool, len(paths))
 	for index, rawLine := range lines {
-		line := strings.TrimSpace(rawLine)
-		var excluded bool
-		var reported string
-		switch {
-		case strings.HasPrefix(line, "[Excluded]"):
-			excluded = true
-			reported = strings.TrimSpace(strings.TrimPrefix(line, "[Excluded]"))
-		case strings.HasPrefix(line, "[Included]"):
-			reported = strings.TrimSpace(strings.TrimPrefix(line, "[Included]"))
-		default:
-			return nil, fmt.Errorf("unexpected tmutil isexcluded output line %d: %q", index+1, line)
+		excluded, reported, ok := parseExcludedLine(rawLine)
+		if !ok {
+			return nil, fmt.Errorf("unexpected tmutil isexcluded output line %d: %q", index+1, rawLine)
 		}
-		if reported != paths[index] {
+		if !equivalentTMUtilPath(reported, paths[index]) {
 			return nil, fmt.Errorf("unexpected tmutil isexcluded output line %d: reported path %q for requested path %q", index+1, reported, paths[index])
 		}
 		results[index] = excluded
 	}
 	return results, nil
+}
+
+func parseExcludedSingle(path string, output []byte) ([]bool, error) {
+	line := strings.TrimSuffix(string(output), "\n")
+	excluded, reported, ok := parseExcludedLine(line)
+	if !ok || !equivalentTMUtilPath(reported, path) {
+		return nil, fmt.Errorf("unexpected tmutil isexcluded output for requested path %q: %q", path, line)
+	}
+	return []bool{excluded}, nil
+}
+
+func parseExcludedLine(line string) (bool, string, bool) {
+	switch {
+	case strings.HasPrefix(line, "[Excluded] "):
+		return true, strings.TrimPrefix(line, "[Excluded] "), true
+	case strings.HasPrefix(line, "[Included] "):
+		return false, strings.TrimPrefix(line, "[Included] "), true
+	default:
+		return false, "", false
+	}
+}
+
+func equivalentTMUtilPath(reported, requested string) bool {
+	return norm.NFC.String(reported) == norm.NFC.String(requested)
 }
 
 func (platform *darwinVolumeSnapshotPlatform) ListSnapshots(volume Volume) ([]string, error) {

@@ -15,21 +15,35 @@ import (
 
 	"github.com/hyj28/unring/internal/audit"
 	"github.com/hyj28/unring/internal/localrollback"
+	"github.com/hyj28/unring/internal/pgproxy"
 )
 
 type cancelableBatchPlatform struct {
 	cliBackstopPlatform
-	started  chan struct{}
-	canceled chan struct{}
-	release  chan struct{}
-	once     sync.Once
+	started    chan struct{}
+	canceled   chan struct{}
+	release    chan struct{}
+	once       sync.Once
+	cancelOnce sync.Once
+}
+
+type cancelableFinalizeSession struct {
+	*unconfiguredPostgresSession
+	started chan struct{}
+	once    sync.Once
+}
+
+func (session *cancelableFinalizeSession) Finalize(ctx context.Context, _ pgproxy.Decision) error {
+	session.once.Do(func() { close(session.started) })
+	<-ctx.Done()
+	return nil
 }
 
 func (platform *cancelableBatchPlatform) IsExcludedBatch(ctx context.Context, _ []string) ([]bool, error) {
 	platform.once.Do(func() { close(platform.started) })
 	<-ctx.Done()
 	if platform.canceled != nil {
-		close(platform.canceled)
+		platform.cancelOnce.Do(func() { close(platform.canceled) })
 	}
 	if platform.release != nil {
 		<-platform.release
@@ -132,6 +146,13 @@ func TestPostChildSignalsCancelSealAndRecordDiscard(t *testing.T) {
 			if line := outputLineContaining(logOut.String(), record.ID); !strings.Contains(line, "interrupted") {
 				t.Fatalf("abnormal session display = %q, want interrupted", line)
 			}
+			logOut.Reset()
+			if code := Main([]string{"log", record.ID}, strings.NewReader(""), &logOut, &logErr); code != 0 {
+				t.Fatalf("log detail exit = %d: %s", code, logErr.String())
+			}
+			if strings.Contains(logOut.String(), "context canceled") || strings.Contains(logOut.String(), "FILE NOT SNAPSHOTTED") {
+				t.Fatalf("log detail mislabeled interrupted scan with internal vocabulary:\n%s", logOut.String())
+			}
 			var jsonOut, jsonErr strings.Builder
 			if code := Main([]string{"log", "--json", record.ID}, strings.NewReader(""), &jsonOut, &jsonErr); code != 0 {
 				t.Fatalf("JSON log exit = %d: %s", code, jsonErr.String())
@@ -140,6 +161,79 @@ func TestPostChildSignalsCancelSealAndRecordDiscard(t *testing.T) {
 				t.Fatalf("structured record omitted precise cancellation cause:\n%s", jsonOut.String())
 			}
 		})
+	}
+}
+
+func TestSignalDuringFilesystemWalkDoesNotClaimSnapshotFailure(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "literal.txt"), []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	var once sync.Once
+	restoreHook := localrollback.SetScanPathHookForTest(func(ctx context.Context, _ string) {
+		if ctx.Done() == nil {
+			return
+		}
+		once.Do(func() { close(started) })
+		<-ctx.Done()
+	})
+	defer restoreHook()
+	var stdout, stderr strings.Builder
+	exited := make(chan int, 1)
+	go func() {
+		exited <- Main([]string{
+			"run", "--watch-only", root, "--", "/usr/bin/true",
+		}, strings.NewReader(""), &stdout, &stderr)
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("post-child filesystem walk did not start")
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-exited:
+		if code != 128+int(syscall.SIGINT) {
+			t.Fatalf("exit = %d, want independent signal literal %d", code, 128+int(syscall.SIGINT))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("signal did not cancel filesystem walk")
+	}
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %#v, %v, want independent literal one", records, err)
+	}
+	record := records[0]
+	if !record.Files.Interrupted || record.Outcome != "discarded" {
+		t.Fatalf("walk interruption record = %#v, want interrupted discard", record)
+	}
+	for _, failure := range record.Files.Uncaptured {
+		if strings.Contains(failure.Error, context.Canceled.Error()) {
+			t.Fatalf("walk cancellation was stored as uncaptured snapshot: %#v", record.Files.Uncaptured)
+		}
+	}
+	var logOut, logErr strings.Builder
+	if code := Main([]string{"log", record.ID}, strings.NewReader(""), &logOut, &logErr); code != 0 {
+		t.Fatalf("log detail exit = %d: %s", code, logErr.String())
+	}
+	if strings.Contains(logOut.String(), "context canceled") || strings.Contains(logOut.String(), "FILE NOT SNAPSHOTTED") {
+		t.Fatalf("walk cancellation leaked internal or false snapshot wording:\n%s", logOut.String())
+	}
+	var jsonOut, jsonErr strings.Builder
+	if code := Main([]string{"log", "--json", record.ID}, strings.NewReader(""), &jsonOut, &jsonErr); code != 0 {
+		t.Fatalf("JSON log exit = %d: %s", code, jsonErr.String())
+	}
+	if !strings.Contains(jsonOut.String(), context.Canceled.Error()) {
+		t.Fatalf("structured record omitted precise walk cancellation:\n%s", jsonOut.String())
 	}
 }
 
@@ -204,6 +298,114 @@ func TestSecondPostChildSignalKeepsDurableDiscardInProgress(t *testing.T) {
 	records, err := store.List()
 	if err != nil || len(records) != 1 || records[0].Outcome != "discarded" || records[0].EndedAt.IsZero() {
 		t.Fatalf("second-signal record = %#v, %v, want ended discard", records, err)
+	}
+}
+
+func TestSignalDuringAutomaticRetentionIsRecordedAsInterruptedDiscard(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	started := make(chan struct{})
+	var calls int
+	previousHook := automaticRetentionTestHook
+	automaticRetentionTestHook = func(ctx context.Context) {
+		calls++
+		if calls != 2 {
+			return
+		}
+		close(started)
+		<-ctx.Done()
+	}
+	defer func() { automaticRetentionTestHook = previousHook }()
+
+	var stdout, stderr strings.Builder
+	exited := make(chan int, 1)
+	go func() {
+		exited <- Main([]string{
+			"run", "--watch-only", t.TempDir(), "--", "/usr/bin/true",
+		}, strings.NewReader(""), &stdout, &stderr)
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("post-child automatic retention did not start")
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-exited:
+		if code != 128+int(syscall.SIGINT) {
+			t.Fatalf("exit = %d, want independent signal literal %d", code, 128+int(syscall.SIGINT))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("signal did not cancel automatic retention")
+	}
+	if !strings.Contains(stderr.String(), "interrupt received during automatic retention") {
+		t.Fatalf("retention signal was not acknowledged:\n%s", stderr.String())
+	}
+	assertLatestSessionInterruptedDiscard(t, stateDir)
+}
+
+func TestSignalDuringFinalizeIsRecordedAsInterruptedDiscard(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	session := &cancelableFinalizeSession{
+		unconfiguredPostgresSession: newUnconfiguredPostgresSession(),
+		started:                     make(chan struct{}),
+	}
+	previousFactory := unconfiguredPostgresSessionFactory
+	unconfiguredPostgresSessionFactory = func() postgresSession { return session }
+	defer func() { unconfiguredPostgresSessionFactory = previousFactory }()
+
+	var stdout, stderr strings.Builder
+	exited := make(chan int, 1)
+	go func() {
+		exited <- Main([]string{
+			"run", "--watch-only", t.TempDir(), "--", "/usr/bin/true",
+		}, strings.NewReader(""), &stdout, &stderr)
+	}()
+	select {
+	case <-session.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("discard finalization did not start")
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-exited:
+		if code != 128+int(syscall.SIGTERM) {
+			t.Fatalf("exit = %d, want independent signal literal %d", code, 128+int(syscall.SIGTERM))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("signal did not cancel discard finalization")
+	}
+	if !strings.Contains(stderr.String(), "termination signal received during discard finalization") {
+		t.Fatalf("finalization signal was not acknowledged:\n%s", stderr.String())
+	}
+	assertLatestSessionInterruptedDiscard(t, stateDir)
+}
+
+func assertLatestSessionInterruptedDiscard(t *testing.T, stateDir string) {
+	t.Helper()
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %#v, %v, want independent literal one", records, err)
+	}
+	record := records[0]
+	if record.Outcome != "discarded" || record.CompletionKind != completionKindAbnormalDiscard || record.EndedAt.IsZero() {
+		t.Fatalf("post-child signal record = %#v, want durable abnormal discard", record)
+	}
+	var logOut, logErr strings.Builder
+	if code := Main([]string{"log"}, strings.NewReader(""), &logOut, &logErr); code != 0 {
+		t.Fatalf("log exit = %d: %s", code, logErr.String())
+	}
+	if line := outputLineContaining(logOut.String(), record.ID); !strings.Contains(line, "interrupted") || strings.Contains(line, "no decision") {
+		t.Fatalf("post-child signal display = %q, want interrupted", line)
 	}
 }
 
@@ -444,6 +646,82 @@ func TestEachWatchedRootGetsItsOwnBoundedChangeGroup(t *testing.T) {
 	}
 	if got := countChangeRows(logOut.String(), "/important-"); got != 5 {
 		t.Fatalf("stored important-root changes = %d, want literal 5", got)
+	}
+}
+
+func TestAgentStateAndOutsideChangesAreBoundedPerPresentationRoot(t *testing.T) {
+	home := "/literal/home"
+	summary := localrollback.Summary{
+		Watched:         []string{filepath.Join(home, "project")},
+		ChangeListRoots: []string{home},
+		AgentStateRoots: []string{filepath.Join(home, ".claude"), filepath.Join(home, ".cursor")},
+		Complete:        true,
+		Retained:        true,
+	}
+	appendChanges := func(root, prefix string, count int) {
+		for index := 0; index < count; index++ {
+			summary.Changes = append(summary.Changes, localrollback.Change{
+				Kind: "created", Path: filepath.Join(root, fmt.Sprintf("%s-%04d", prefix, index)),
+				After: &localrollback.Entry{Type: "file"},
+			})
+		}
+	}
+	appendChanges(filepath.Join(home, ".claude"), "claude-noisy", 3000)
+	appendChanges(filepath.Join(home, ".cursor"), "cursor-important", 5)
+	appendChanges(filepath.Join(home, "Downloads"), "download-noisy", 3000)
+	appendChanges(filepath.Join(home, "Documents"), "document-important", 5)
+	before, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var live, stored strings.Builder
+	printFileChanges(&live, "literal-root-fairness", summary, true)
+	printAuditFiles(&stored, "literal-root-fairness", summary)
+	for name, output := range map[string]string{"live": live.String(), "stored": stored.String()} {
+		for fragment, want := range map[string]int{
+			"/home/.claude/claude-noisy-":         50,
+			"/home/.cursor/cursor-important-":     5,
+			"/home/Downloads/download-noisy-":     50,
+			"/home/Documents/document-important-": 5,
+		} {
+			if got := countChangeRows(output, fragment); got != want {
+				t.Fatalf("%s %s rows = %d, want independent literal %d\n%s", name, fragment, got, want, output)
+			}
+		}
+	}
+	after, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) || len(summary.Changes) != 6010 {
+		t.Fatalf("bounded rendering changed complete record: count=%d", len(summary.Changes))
+	}
+}
+
+func TestStoredBackstopWithoutReasonNeverPrintsDanglingColon(t *testing.T) {
+	summary := localrollback.Summary{
+		Watched:  []string{"/literal/watched"},
+		Complete: true,
+		Backstop: localrollback.Backstop{Checked: true},
+	}
+	var output strings.Builder
+	printAuditFiles(&output, "literal-empty-reason", summary)
+	if strings.Contains(output.String(), "NO WHOLE-VOLUME BACKSTOP: \n") {
+		t.Fatalf("empty checked reason printed a dangling colon:\n%s", output.String())
+	}
+	if !strings.Contains(output.String(), "NO WHOLE-VOLUME BACKSTOP: no reason was recorded.") {
+		t.Fatalf("checked empty-reason branch was not exercised:\n%s", output.String())
+	}
+}
+
+func TestSingleAutomaticRetentionRemovalUsesSingularSession(t *testing.T) {
+	var output strings.Builder
+	printAutomaticRetentionRemovals(&output, "active-session", []localrollback.RetentionRemoval{{
+		SessionID: "literal-removed-session", Expired: true,
+	}})
+	if !strings.Contains(output.String(), "automatic retention removed 1 session.") ||
+		strings.Contains(output.String(), "removed 1 sessions") {
+		t.Fatalf("single automatic retention wording is not singular:\n%s", output.String())
 	}
 }
 

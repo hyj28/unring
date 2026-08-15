@@ -2,6 +2,7 @@ package localrollback
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -11,6 +12,30 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+func TestRetentionCancellationStopsBeforeRemovingSnapshotTree(t *testing.T) {
+	stateDir := t.TempDir()
+	sessionID := "literal-retention-cancel"
+	snapshot := filepath.Join(stateDir, "snapshots", sessionID)
+	if err := os.MkdirAll(snapshot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	kept := filepath.Join(snapshot, "kept.txt")
+	if err := os.WriteFile(kept, []byte("still present"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := ApplyRetentionRemovalsContext(ctx, stateDir, []RetentionRemoval{{
+		SessionID: sessionID, HasSnapshot: true,
+	}}, nil, func(RetentionRemoval) error { return nil }, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled retention error = %v, want context cancellation", err)
+	}
+	if contents, readErr := os.ReadFile(kept); readErr != nil || string(contents) != "still present" {
+		t.Fatalf("canceled retention altered snapshot: %q, %v", contents, readErr)
+	}
+}
 
 func TestSealSuppressesByteIdenticalRewriteWithRestoredMTime(t *testing.T) {
 	stateDir := t.TempDir()

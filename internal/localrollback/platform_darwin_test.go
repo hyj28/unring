@@ -76,6 +76,47 @@ func TestDarwinExcludedBatchMapsIndependentLiteralStatusesInOrder(t *testing.T) 
 	}
 }
 
+func TestDarwinExcludedBatchMatchesNFDOutputToNFCRequests(t *testing.T) {
+	runner := &literalOutputRunner{output: []byte(
+		"[Included] /literal/cafe\u0301.txt\n" +
+			"[Excluded] /literal/Mu\u0308ller.txt\n" +
+			"[Included] /literal/\u1112\u1161\u11ab\u1100\u1173\u11af.txt\n",
+	)}
+	platform := &darwinVolumeSnapshotPlatform{runner: runner}
+	statuses, err := platform.IsExcludedBatch(context.Background(), []string{
+		"/literal/café.txt", "/literal/Müller.txt", "/literal/한글.txt",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []bool{false, true, false}
+	if !reflect.DeepEqual(statuses, want) {
+		t.Fatalf("normalized statuses = %#v, want independent literal %#v", statuses, want)
+	}
+}
+
+func TestDarwinSingleExcludedCheckPreservesWhitespaceAndLineBreaks(t *testing.T) {
+	paths := []string{
+		"/literal/draft .txt",
+		"/literal/ leading.txt",
+		"/literal/line\nbreak.txt",
+	}
+	for _, path := range paths {
+		t.Run(strings.ReplaceAll(path, "\n", "-newline-"), func(t *testing.T) {
+			platform := &darwinVolumeSnapshotPlatform{
+				runner: &literalOutputRunner{output: []byte("[Excluded] " + path + "\n")},
+			}
+			statuses, err := platform.IsExcludedBatch(context.Background(), []string{path})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(statuses, []bool{true}) {
+				t.Fatalf("single-path status = %#v, want independent literal [true]", statuses)
+			}
+		})
+	}
+}
+
 func TestDarwinExcludedBatchRejectsUnattributableOutput(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -84,6 +125,7 @@ func TestDarwinExcludedBatchRejectsUnattributableOutput(t *testing.T) {
 		{name: "short", output: "[Included] /literal/first\n"},
 		{name: "reordered", output: "[Excluded] /literal/second\n[Included] /literal/first\n"},
 		{name: "malformed", output: "[Included] /literal/first\n[Unknown] /literal/second\n"},
+		{name: "diagnostic", output: "tmutil: diagnostic\n[Included] /literal/first\n[Excluded] /literal/second\n"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

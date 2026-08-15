@@ -146,7 +146,7 @@ Design: [docs/LOCAL-ROLLBACK-DESIGN.md §9](docs/LOCAL-ROLLBACK-DESIGN.md). Deci
 
 ## M12 — Survivable session finalization
 
-Design: [docs/LOCAL-ROLLBACK-DESIGN.md §10](docs/LOCAL-ROLLBACK-DESIGN.md). Decisions 21–24.
+Design: [docs/LOCAL-ROLLBACK-DESIGN.md §10](docs/LOCAL-ROLLBACK-DESIGN.md). Decisions 21–25.
 
 - [x] M12.1 Batch and order-validate post-session `tmutil isexcluded` checks while preserving
       excluded-ancestor-only short-circuiting and reporting progress
@@ -157,6 +157,9 @@ Design: [docs/LOCAL-ROLLBACK-DESIGN.md §10](docs/LOCAL-ROLLBACK-DESIGN.md). Dec
 - [x] M12.4 Make incomplete and empty scans unambiguous in `run`, `log`, and `restore`, bound
       change rendering per watched root, compact retention accounting, define repeated-signal
       behavior, and distinguish displayed no-decision, explicit-discard, and abnormal outcomes
+- [x] M12.5 Keep signal handling continuous through retention and finalization, make retention
+      cancellation-aware, normalize and isolate `tmutil` paths with per-path fallback, publish
+      interruption before completeness, and bound agent/outside presentation roots fairly
 
 ---
 

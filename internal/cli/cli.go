@@ -20,6 +20,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -52,6 +53,17 @@ const (
 
 type stringListFlag []string
 
+type synchronizedWriter struct {
+	mu     sync.Mutex
+	writer io.Writer
+}
+
+func (writer *synchronizedWriter) Write(data []byte) (int, error) {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	return writer.writer.Write(data)
+}
+
 func (values *stringListFlag) String() string { return strings.Join(*values, ",") }
 
 func (values *stringListFlag) Set(value string) error {
@@ -79,6 +91,12 @@ type unconfiguredPostgresSession struct {
 func newUnconfiguredPostgresSession() *unconfiguredPostgresSession {
 	return &unconfiguredPostgresSession{done: make(chan struct{})}
 }
+
+var unconfiguredPostgresSessionFactory = func() postgresSession {
+	return newUnconfiguredPostgresSession()
+}
+
+var automaticRetentionTestHook func(context.Context)
 
 func (session *unconfiguredPostgresSession) Address() string {
 	return ""
@@ -155,6 +173,7 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 }
 
 func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitCode int) {
+	stderr = &synchronizedWriter{writer: stderr}
 	flags := flag.NewFlagSet("unring run", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	forceCommit := flags.Bool("commit", false, "commit without prompting")
@@ -281,7 +300,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		fmt.Fprintf(stderr, "unring: record file snapshot: %v\n", err)
 		return internalErrorExitCode
 	}
-	applyAutomaticRetention(auditStore, auditRecord.ID, capBytes, scope.RetentionDays, &fileSummary, stderr)
+	applyAutomaticRetention(context.Background(), auditStore, auditRecord.ID, capBytes, scope.RetentionDays, &fileSummary, stderr)
 	if err := auditSession.Update(func(record *audit.Record) { record.Files = fileSummary }); err != nil {
 		fmt.Fprintf(stderr, "unring: record start-time retention: %v\n", err)
 		return internalErrorExitCode
@@ -293,9 +312,17 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	var ghSession *ghshim.Session
 	var finalized bool
 	var auditError string
+	var postChildSignals *postChildSignalHandler
 	requestedDecision := "discard"
 	completionKind := ""
 	defer func() {
+		if postChildSignals != nil {
+			if received := postChildSignals.Stop(); received != nil {
+				completionKind = completionKindAbnormalDiscard
+				requestedDecision = "discard"
+				exitCode = exitCodeForSignal(received)
+			}
+		}
 		recovered := recover()
 		outcome := ""
 		if proxy != nil && !finalized {
@@ -569,7 +596,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		// Assign the no-op database session only when every startup step has
 		// succeeded and the child is about to run. Earlier failures must retain
 		// the audit record's not_started outcome.
-		proxy = newUnconfiguredPostgresSession()
+		proxy = unconfiguredPostgresSessionFactory()
 	}
 	result := runner.Run(runner.Options{
 		Command:   command,
@@ -581,23 +608,37 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		Abort:     proxy.Done(),
 		Approvals: approvalRequests,
 	})
-	interrupted := result.Interrupted || pendingSignal(signalChannel)
+	postChildSignals = startPostChildSignalHandler(signalChannel, stderr)
+	interrupted := result.Interrupted
+	observePostChildSignal := func() {
+		if received := postChildSignals.First(); received != nil {
+			interrupted = true
+			result.ExitCode = exitCodeForSignal(received)
+			completionKind = completionKindAbnormalDiscard
+			requestedDecision = "discard"
+		}
+	}
+	postChildPhaseParent := func() context.Context {
+		if interrupted {
+			return context.Background()
+		}
+		return postChildSignals.Context()
+	}
 	if result.Err != nil {
 		auditError = joinErrorText(auditError, result.Err)
 	}
 	printScanFinishing(stderr, fileSummary)
 	startEvicted := append([]string(nil), fileSummary.Evicted...)
 	startRetentionEvents := append([]localrollback.RetentionEvent(nil), fileSummary.RetentionEvents...)
-	var postChildSignal os.Signal
-	fileSummary, postChildSignal = sealFileSession(fileSession, signalChannel, stderr)
-	if postChildSignal != nil {
-		interrupted = true
-		result.ExitCode = exitCodeForSignal(postChildSignal)
-	}
+	postChildSignals.SetPhase("post-session scan")
+	fileSummary = sealFileSession(postChildSignals.Context(), fileSession, stderr)
+	observePostChildSignal()
 	fileSummary.Evicted = append(startEvicted, fileSummary.Evicted...)
 	fileSummary.RetentionEvents = append(startRetentionEvents, fileSummary.RetentionEvents...)
 	printScanFinished(stderr, fileSummary)
-	applyAutomaticRetention(auditStore, auditRecord.ID, capBytes, scope.RetentionDays, &fileSummary, stderr)
+	postChildSignals.SetPhase("automatic retention")
+	applyAutomaticRetention(postChildSignals.Context(), auditStore, auditRecord.ID, capBytes, scope.RetentionDays, &fileSummary, stderr)
+	observePostChildSignal()
 	if !fileSummary.Complete {
 		if fileSummary.Interrupted {
 			fmt.Fprintf(stderr, "unring: FILE CHANGE LIST INCOMPLETE: the post-session scan was interrupted; the recorded list may omit file changes. Run unring log --json %s for precise diagnostic details.\n", auditRecord.ID)
@@ -618,20 +659,41 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	var ghSealErr error
 	var httpsSealErr error
 	if *outboundEnabled {
-		ghSealContext, ghSealCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		postChildSignals.SetPhase("gh sealing")
+		ghSealContext, ghSealCancel := context.WithTimeout(postChildPhaseParent(), 10*time.Second)
 		ghSealErr = ghSession.Seal(ghSealContext)
 		ghSealCancel()
+		observePostChildSignal()
+		if interrupted && errors.Is(ghSealErr, context.Canceled) {
+			ghSealContext, ghSealCancel = context.WithTimeout(context.Background(), 10*time.Second)
+			ghSealErr = ghSession.Seal(ghSealContext)
+			ghSealCancel()
+		}
 		ghSummary = ghSession.Summary()
 
-		httpsSealContext, httpsSealCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		postChildSignals.SetPhase("HTTPS sealing")
+		httpsSealContext, httpsSealCancel := context.WithTimeout(postChildPhaseParent(), 10*time.Second)
 		httpsSealErr = httpsProxy.Seal(httpsSealContext)
 		httpsSealCancel()
+		observePostChildSignal()
+		if interrupted && errors.Is(httpsSealErr, context.Canceled) {
+			httpsSealContext, httpsSealCancel = context.WithTimeout(context.Background(), 10*time.Second)
+			httpsSealErr = httpsProxy.Seal(httpsSealContext)
+			httpsSealCancel()
+		}
 		httpsSummary = httpsProxy.Summary()
 	}
 
-	sealContext, sealCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	postChildSignals.SetPhase("Postgres sealing")
+	sealContext, sealCancel := context.WithTimeout(postChildPhaseParent(), 10*time.Second)
 	sealErr := proxy.Seal(sealContext)
 	sealCancel()
+	observePostChildSignal()
+	if interrupted && errors.Is(sealErr, context.Canceled) {
+		sealContext, sealCancel = context.WithTimeout(context.Background(), 10*time.Second)
+		sealErr = proxy.Seal(sealContext)
+		sealCancel()
+	}
 	summary := proxy.Summary()
 
 	postgresInterceptionErr := sealErr
@@ -689,7 +751,8 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			}
 			fmt.Fprintln(stderr, disclosure)
 		}
-		finalizeContext, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		postChildSignals.SetPhase("discard finalization")
+		finalizeContext, finalizeCancel := context.WithTimeout(postChildPhaseParent(), 10*time.Second)
 		var ghFinalizeErr error
 		var httpsFinalizeErr error
 		if *outboundEnabled {
@@ -701,6 +764,22 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			proxy.Finalize(finalizeContext, pgproxy.DecisionRollback),
 		)
 		finalizeCancel()
+		observePostChildSignal()
+		if interrupted && errors.Is(finalizeErr, context.Canceled) {
+			postChildSignals.SetPhase("safe discard finalization")
+			finalizeContext, finalizeCancel = context.WithTimeout(context.Background(), 10*time.Second)
+			ghFinalizeErr = nil
+			httpsFinalizeErr = nil
+			if *outboundEnabled {
+				ghFinalizeErr = ghSession.Finalize(finalizeContext, false)
+				httpsFinalizeErr = httpsProxy.Finalize(finalizeContext, false)
+			}
+			finalizeErr = errors.Join(
+				ghFinalizeErr, httpsFinalizeErr,
+				proxy.Finalize(finalizeContext, pgproxy.DecisionRollback),
+			)
+			finalizeCancel()
+		}
 		if finalizeErr != nil {
 			finalized = true
 			auditError = finalizeErr.Error()
@@ -745,6 +824,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	}
 
 	decision := pgproxy.DecisionRollback
+	postChildSignals.SetPhase("the final decision")
 	switch {
 	case interceptionErr != nil:
 		// Rollback remains the only safe request, but Finalize will report
@@ -764,7 +844,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		if useTUI {
 			var reviewErr error
 			decision, interrupted, reviewErr = reviewDecisionWithSignal(
-				stdin, stdout, signalChannel, summary, httpsSummary, ghSummary,
+				stdin, stdout, postChildSignals.Context(), summary, httpsSummary, ghSummary,
 			)
 			if reviewErr != nil {
 				fmt.Fprintf(stderr, "unring: %v; defaulting to discard\n", reviewErr)
@@ -772,14 +852,12 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			}
 		} else {
 			var promptInterrupted bool
-			decision, promptInterrupted = promptDecisionWithSignal(stdin, stdout, signalChannel)
+			decision, promptInterrupted = promptDecisionWithSignal(stdin, stdout, postChildSignals.Context().Done())
 			interrupted = interrupted || promptInterrupted
 		}
 	}
 
-	if pendingSignal(signalChannel) {
-		interrupted = true
-	}
+	observePostChildSignal()
 	if interrupted {
 		decision = pgproxy.DecisionRollback
 	}
@@ -804,9 +882,16 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	commitExternal := decision == pgproxy.DecisionCommit
 	var ghFinalizeErr error
 	if *outboundEnabled {
-		ghFinalizeContext, ghFinalizeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		postChildSignals.SetPhase("gh finalization")
+		ghFinalizeContext, ghFinalizeCancel := context.WithTimeout(postChildPhaseParent(), 30*time.Second)
 		ghFinalizeErr = ghSession.Finalize(ghFinalizeContext, commitExternal)
 		ghFinalizeCancel()
+		observePostChildSignal()
+		if interrupted && errors.Is(ghFinalizeErr, context.Canceled) {
+			ghFinalizeContext, ghFinalizeCancel = context.WithTimeout(context.Background(), 30*time.Second)
+			ghFinalizeErr = ghSession.Finalize(ghFinalizeContext, false)
+			ghFinalizeCancel()
+		}
 	}
 	if ghFinalizeErr != nil {
 		auditError = joinErrorText(auditError, ghFinalizeErr)
@@ -814,9 +899,16 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	commitHTTPS := commitExternal && ghFinalizeErr == nil
 	var httpsFinalizeErr error
 	if *outboundEnabled {
-		httpsFinalizeContext, httpsFinalizeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		postChildSignals.SetPhase("HTTPS finalization")
+		httpsFinalizeContext, httpsFinalizeCancel := context.WithTimeout(postChildPhaseParent(), 30*time.Second)
 		httpsFinalizeErr = httpsProxy.Finalize(httpsFinalizeContext, commitHTTPS)
 		httpsFinalizeCancel()
+		observePostChildSignal()
+		if interrupted && errors.Is(httpsFinalizeErr, context.Canceled) {
+			httpsFinalizeContext, httpsFinalizeCancel = context.WithTimeout(context.Background(), 30*time.Second)
+			httpsFinalizeErr = httpsProxy.Finalize(httpsFinalizeContext, false)
+			httpsFinalizeCancel()
+		}
 	}
 	postgresDecision := decision
 	if httpsFinalizeErr != nil || ghFinalizeErr != nil {
@@ -825,9 +917,16 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		postgresDecision = pgproxy.DecisionRollback
 		auditError = joinErrorText(auditError, httpsFinalizeErr)
 	}
-	finalizeContext, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	postChildSignals.SetPhase("Postgres finalization")
+	finalizeContext, finalizeCancel := context.WithTimeout(postChildPhaseParent(), 10*time.Second)
 	postgresFinalizeErr := proxy.Finalize(finalizeContext, postgresDecision)
 	finalizeCancel()
+	observePostChildSignal()
+	if interrupted && errors.Is(postgresFinalizeErr, context.Canceled) {
+		finalizeContext, finalizeCancel = context.WithTimeout(context.Background(), 10*time.Second)
+		postgresFinalizeErr = proxy.Finalize(finalizeContext, pgproxy.DecisionRollback)
+		finalizeCancel()
+	}
 	finalizeErr := errors.Join(ghFinalizeErr, httpsFinalizeErr, postgresFinalizeErr)
 	finalized = true
 	if finalizeErr != nil {
@@ -1018,13 +1117,101 @@ func printScanFinished(output io.Writer, summary localrollback.Summary) {
 		summary.ScanAfterFiles, summary.ScanAfterMillis)
 }
 
-func sealFileSession(
-	session *localrollback.Session,
-	signals <-chan os.Signal,
-	output io.Writer,
-) (localrollback.Summary, os.Signal) {
+type postChildSignalHandler struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	input  <-chan os.Signal
+	output io.Writer
+	stop   chan struct{}
+	done   chan struct{}
+	once   sync.Once
+
+	mu          sync.Mutex
+	phase       string
+	first       os.Signal
+	secondNamed bool
+}
+
+func startPostChildSignalHandler(input <-chan os.Signal, output io.Writer) *postChildSignalHandler {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	handler := &postChildSignalHandler{
+		ctx: ctx, cancel: cancel, input: input, output: output,
+		stop: make(chan struct{}), done: make(chan struct{}), phase: "post-session scan",
+	}
+	go handler.run()
+	return handler
+}
+
+func (handler *postChildSignalHandler) run() {
+	defer close(handler.done)
+	for {
+		select {
+		case received := <-handler.input:
+			handler.record(received)
+		case <-handler.stop:
+			for {
+				select {
+				case received := <-handler.input:
+					handler.record(received)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (handler *postChildSignalHandler) record(received os.Signal) {
+	handler.mu.Lock()
+	if handler.first == nil {
+		handler.first = received
+		phase := handler.phase
+		handler.cancel()
+		handler.mu.Unlock()
+		if phase == "post-session scan" {
+			fmt.Fprintf(handler.output, "unring: %s received during the post-session scan; stopping the scan and discarding the session.\n", postChildSignalName(received))
+			return
+		}
+		fmt.Fprintf(handler.output, "unring: %s received during %s; stopping that phase and discarding the session.\n", postChildSignalName(received), phase)
+		return
+	}
+	if !handler.secondNamed {
+		handler.secondNamed = true
+		handler.mu.Unlock()
+		fmt.Fprintf(handler.output, "unring: second signal received (%s); safe discard finalization is already in progress and will not be skipped.\n", postChildSignalName(received))
+		return
+	}
+	handler.mu.Unlock()
+}
+
+func (handler *postChildSignalHandler) Context() context.Context {
+	return handler.ctx
+}
+
+func (handler *postChildSignalHandler) SetPhase(phase string) {
+	handler.mu.Lock()
+	handler.phase = phase
+	handler.mu.Unlock()
+}
+
+func (handler *postChildSignalHandler) First() os.Signal {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	return handler.first
+}
+
+func (handler *postChildSignalHandler) Stop() os.Signal {
+	handler.once.Do(func() { close(handler.stop) })
+	<-handler.done
+	handler.cancel()
+	return handler.First()
+}
+
+func sealFileSession(
+	ctx context.Context,
+	session *localrollback.Session,
+	output io.Writer,
+) localrollback.Summary {
 	type sealResult struct {
 		summary localrollback.Summary
 	}
@@ -1042,29 +1229,12 @@ func sealFileSession(
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	started := time.Now()
-	var interrupted os.Signal
-	additionalSignals := 0
 	var latest localrollback.SealProgress
 	nextProgress := 0
 	for {
 		select {
 		case result := <-results:
-			if interrupted == nil {
-				select {
-				case interrupted = <-signals:
-				default:
-				}
-			}
-			return result.summary, interrupted
-		case signal := <-signals:
-			if interrupted == nil {
-				interrupted = signal
-				cancel()
-				fmt.Fprintf(output, "unring: %s received during the post-session scan; stopping the scan and discarding the session.\n", postChildSignalName(signal))
-			} else if additionalSignals == 0 {
-				additionalSignals++
-				fmt.Fprintf(output, "unring: second signal received (%s); safe discard finalization is already in progress and will not be skipped.\n", postChildSignalName(signal))
-			}
+			return result.summary
 		case update := <-progress:
 			latest = update
 			if update.Total == 0 {
@@ -1152,10 +1322,10 @@ func printFileChanges(output io.Writer, sessionID string, summary localrollback.
 	printChange := func(output io.Writer, change localrollback.Change) {
 		printLiveChange(output, change, summary.Interrupted)
 	}
-	printWatchedRootChangeGroups(output, regular, summary.Watched, sessionID, printChange)
+	printWatchedRootChangeGroups(output, regular, summary.Watched, summary.ChangeListRoots, sessionID, printChange)
 	if len(agentState) > 0 {
 		fmt.Fprintln(output, "AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
-		printBoundedChanges(output, agentState, sessionID, "agent own-state changes", printChange)
+		printDeclaredRootChangeGroups(output, agentState, agentStateRoots, sessionID, "agent own-state changes", "AGENT-STATE ROOT CHANGES", printChange)
 	}
 	if summary.Retained && hasRestorableFileChange(summary.Changes) {
 		fmt.Fprintf(output, "Restore later with: unring restore %s\n", sessionID)
@@ -1197,6 +1367,9 @@ func printAuditFiles(output io.Writer, sessionID string, summary localrollback.S
 	fmt.Fprintf(output, "  Snapshot: %s; %d %s (%d logical); retained: %t\n",
 		summary.Storage, summary.StorageBytes, storageLabel, summary.LogicalBytes, summary.Retained)
 	for _, failure := range summary.Uncaptured {
+		if summary.Interrupted && isInternalCancellationFailure(failure.Error) {
+			continue
+		}
 		printCaptureFailure(output, "  ", failure)
 	}
 	if summary.Backstop.Available {
@@ -1241,10 +1414,10 @@ func printAuditFiles(output io.Writer, sessionID string, summary localrollback.S
 	printChange := func(output io.Writer, change localrollback.Change) {
 		printStoredChange(output, change, summary.Interrupted)
 	}
-	printWatchedRootChangeGroups(output, regular, summary.Watched, sessionID, printChange)
+	printWatchedRootChangeGroups(output, regular, summary.Watched, summary.ChangeListRoots, sessionID, printChange)
 	if len(agentState) > 0 {
 		fmt.Fprintln(output, "  AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
-		printBoundedChanges(output, agentState, sessionID, "agent own-state changes", printChange)
+		printDeclaredRootChangeGroups(output, agentState, agentStateRoots, sessionID, "agent own-state changes", "  AGENT-STATE ROOT CHANGES", printChange)
 	}
 	if summary.Interrupted {
 		fmt.Fprintf(output, "  INCOMPLETE: the post-session scan was interrupted; the recorded change list may omit file changes. Run unring log --json %s for precise diagnostic details.\n", sessionID)
@@ -1279,10 +1452,14 @@ func printStoredChange(output io.Writer, change localrollback.Change, interrupte
 }
 
 func humanUnrestorableReason(reason string, interrupted bool) string {
-	if interrupted && strings.Contains(reason, context.Canceled.Error()) {
+	if interrupted && isInternalCancellationFailure(reason) {
 		return "the post-session scan was interrupted before this path's restore coverage could be verified"
 	}
 	return reason
+}
+
+func isInternalCancellationFailure(reason string) bool {
+	return strings.Contains(reason, context.Canceled.Error()) || strings.Contains(reason, context.DeadlineExceeded.Error())
 }
 
 func printBoundedChanges(
@@ -1313,6 +1490,7 @@ func printWatchedRootChangeGroups(
 	output io.Writer,
 	changes []localrollback.Change,
 	watched []string,
+	changeListRoots []string,
 	sessionID string,
 	printChange func(io.Writer, localrollback.Change),
 ) {
@@ -1329,7 +1507,7 @@ func printWatchedRootChangeGroups(
 		rootIndexes[root] = len(groups)
 		groups = append(groups, watchedRootChangeGroup{root: root})
 	}
-	outsideIndex := -1
+	outsideIndexes := make(map[string]int)
 	for _, change := range changes {
 		matchedRoot := ""
 		matchedIndex := -1
@@ -1340,11 +1518,14 @@ func printWatchedRootChangeGroups(
 			}
 		}
 		if matchedIndex < 0 {
-			if outsideIndex < 0 {
-				outsideIndex = len(groups)
-				groups = append(groups, watchedRootChangeGroup{})
+			outsideRoot := outsidePresentationRoot(change.Path, changeListRoots)
+			var exists bool
+			matchedIndex, exists = outsideIndexes[outsideRoot]
+			if !exists {
+				matchedIndex = len(groups)
+				outsideIndexes[outsideRoot] = matchedIndex
+				groups = append(groups, watchedRootChangeGroup{root: outsideRoot})
 			}
-			matchedIndex = outsideIndex
 		}
 		groups[matchedIndex].changes = append(groups[matchedIndex].changes, change)
 	}
@@ -1354,21 +1535,101 @@ func printWatchedRootChangeGroups(
 			nonempty++
 		}
 	}
-	showHeadings := len(watched) > 1 || outsideIndex >= 0 || nonempty > 1
+	showHeadings := len(watched) > 1 || len(outsideIndexes) > 0 || nonempty > 1
 	for _, group := range groups {
 		if len(group.changes) == 0 {
 			continue
 		}
+		_, outside := outsideIndexes[group.root]
 		label := "changes outside watched roots"
-		if group.root != "" {
+		if !outside && group.root != "" {
 			label = "changes under watched root " + humanPath(group.root)
+		} else if outside && len(outsideIndexes) > 1 {
+			label = "changes outside watched roots under " + humanPath(group.root)
 		}
 		if showHeadings {
-			if group.root == "" {
-				fmt.Fprintln(output, "CHANGES OUTSIDE WATCHED ROOTS")
+			if outside {
+				fmt.Fprintf(output, "CHANGES OUTSIDE WATCHED ROOTS — %s\n", humanPath(group.root))
 			} else {
 				fmt.Fprintf(output, "WATCHED ROOT CHANGES — %s\n", humanPath(group.root))
 			}
+		}
+		printBoundedChanges(output, group.changes, sessionID, label, printChange)
+	}
+}
+
+func outsidePresentationRoot(path string, changeListRoots []string) string {
+	path = filepath.Clean(path)
+	base := ""
+	for _, candidate := range changeListRoots {
+		candidate = filepath.Clean(candidate)
+		if pathWithinRoot(path, candidate) && len(candidate) > len(base) {
+			base = candidate
+		}
+	}
+	if base == "" {
+		base = filepath.VolumeName(path) + string(os.PathSeparator)
+	}
+	relative, err := filepath.Rel(base, path)
+	if err != nil || relative == "." {
+		return base
+	}
+	first := strings.Split(relative, string(os.PathSeparator))[0]
+	return filepath.Join(base, first)
+}
+
+func printDeclaredRootChangeGroups(
+	output io.Writer,
+	changes []localrollback.Change,
+	roots []string,
+	sessionID string,
+	groupLabel string,
+	heading string,
+	printChange func(io.Writer, localrollback.Change),
+) {
+	groups := make([]watchedRootChangeGroup, 0, len(roots)+1)
+	rootIndexes := make(map[string]int)
+	for _, root := range roots {
+		root = filepath.Clean(root)
+		if _, exists := rootIndexes[root]; exists {
+			continue
+		}
+		rootIndexes[root] = len(groups)
+		groups = append(groups, watchedRootChangeGroup{root: root})
+	}
+	unmatched := -1
+	for _, change := range changes {
+		matchedRoot := ""
+		matchedIndex := -1
+		for root, index := range rootIndexes {
+			if pathWithinRoot(change.Path, root) && len(root) > len(matchedRoot) {
+				matchedRoot = root
+				matchedIndex = index
+			}
+		}
+		if matchedIndex < 0 {
+			if unmatched < 0 {
+				unmatched = len(groups)
+				groups = append(groups, watchedRootChangeGroup{})
+			}
+			matchedIndex = unmatched
+		}
+		groups[matchedIndex].changes = append(groups[matchedIndex].changes, change)
+	}
+	nonempty := 0
+	for _, group := range groups {
+		if len(group.changes) > 0 {
+			nonempty++
+		}
+	}
+	for _, group := range groups {
+		if len(group.changes) == 0 {
+			continue
+		}
+		label := groupLabel
+		if nonempty > 1 && group.root != "" {
+			fmt.Fprintf(output, "%s — %s\n", heading, humanPath(group.root))
+			label += " under " + humanPath(group.root)
 		}
 		printBoundedChanges(output, group.changes, sessionID, label, printChange)
 	}
@@ -1751,7 +2012,7 @@ func pruneCommand(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "unring: clean expired prune previews: %v\n", err)
 			return internalErrorExitCode
 		}
-		if _, err := applyRetentionRemovals(store, preview.Removals, func() error {
+		if _, err := applyRetentionRemovals(context.Background(), store, preview.Removals, func() error {
 			return validatePrunePreview(store, preview, time.Now())
 		}, nil, stdout, "removed"); err != nil {
 			printPartialRetentionFailure(stderr, err)
@@ -2053,6 +2314,7 @@ func printRetentionWarnings(output io.Writer, warnings []localrollback.Retention
 }
 
 func applyRetentionRemovals(
+	ctx context.Context,
 	store *audit.Store,
 	removals []localrollback.RetentionRemoval,
 	validate func() error,
@@ -2061,7 +2323,8 @@ func applyRetentionRemovals(
 	verb string,
 ) ([]localrollback.RetentionRemoval, error) {
 	var applied []localrollback.RetentionRemoval
-	err := localrollback.ApplyRetentionRemovals(
+	err := localrollback.ApplyRetentionRemovalsContext(
+		ctx,
 		store.StateDir(), removals, validate,
 		func(removal localrollback.RetentionRemoval) error {
 			if removal.Expired {
@@ -2096,6 +2359,7 @@ func applyRetentionRemovals(
 }
 
 func applyAutomaticRetention(
+	ctx context.Context,
 	store *audit.Store,
 	activeSession string,
 	capBytes int64,
@@ -2103,19 +2367,32 @@ func applyAutomaticRetention(
 	summary *localrollback.Summary,
 	output io.Writer,
 ) {
-	records, err := store.List()
+	if automaticRetentionTestHook != nil {
+		automaticRetentionTestHook(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	records, err := store.ListContext(ctx)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		if records == nil {
 			fmt.Fprintf(output, "unring: enforce session retention: cannot inspect stored sessions: %v\n", err)
 			return
 		}
 		fmt.Fprintf(output, "unring: retention warning: unreadable audit records were skipped: %v\n", err)
 	}
-	plan, err := localrollback.PlanRetention(
+	plan, err := localrollback.PlanRetentionContext(
+		ctx,
 		store.StateDir(), storedSessions(records), capBytes,
 		time.Duration(retentionDays)*24*time.Hour, time.Now(),
 	)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		fmt.Fprintf(output, "unring: enforce session retention: %v\n", err)
 		return
 	}
@@ -2126,9 +2403,12 @@ func applyAutomaticRetention(
 			removals = append(removals, removal)
 		}
 	}
-	applied, err := applyRetentionRemovals(store, removals, nil, summary, nil, "retention removed")
+	applied, err := applyRetentionRemovals(ctx, store, removals, nil, summary, nil, "retention removed")
 	printAutomaticRetentionRemovals(output, activeSession, applied)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		printPartialRetentionFailure(output, err)
 		fmt.Fprintf(output, "unring: enforce session retention: %v\n", err)
 		return
@@ -2144,7 +2424,11 @@ func printAutomaticRetentionRemovals(output io.Writer, activeSession string, rem
 	if len(removals) == 0 {
 		return
 	}
-	fmt.Fprintf(output, "unring: automatic retention removed %d sessions.\n", len(removals))
+	noun := "sessions"
+	if len(removals) == 1 {
+		noun = "session"
+	}
+	fmt.Fprintf(output, "unring: automatic retention removed %d %s.\n", len(removals), noun)
 	shown, truncated := boundedHumanSessionCount(len(removals), false)
 	shownRemovals := removals[:shown]
 	if len(shownRemovals) == 1 {
@@ -2693,6 +2977,13 @@ func printAuditRecord(output io.Writer, record audit.Record) {
 }
 
 func displayedOutcome(record audit.Record) string {
+	if record.CompletionKind == completionKindAbnormalDiscard &&
+		(record.ExitCode == 128+int(syscall.SIGINT) || record.ExitCode == 128+int(syscall.SIGTERM)) {
+		if record.Outcome == "unknown" {
+			return "interrupted (unconfirmed)"
+		}
+		return "interrupted"
+	}
 	if record.Outcome != "discarded" {
 		return record.Outcome
 	}
@@ -2715,6 +3006,8 @@ func displayedOutcomeDetail(record audit.Record) string {
 		return "no decision needed"
 	case "interrupted":
 		return "interrupted; reversible effects were discarded"
+	case "interrupted (unconfirmed)":
+		return "interrupted; final discard could not be confirmed"
 	case "abnormal end":
 		return "abnormal end; reversible effects were discarded"
 	default:
@@ -2907,7 +3200,7 @@ func readOnePromptLine(input io.Reader) (string, error) {
 func promptDecisionWithSignal(
 	input io.Reader,
 	output io.Writer,
-	signals <-chan os.Signal,
+	interrupted <-chan struct{},
 ) (pgproxy.Decision, bool) {
 	if !isTerminal(input) || !isTerminalWriter(output) {
 		fmt.Fprintln(output, "No interactive terminal; defaulting to discard. Use --commit to commit.")
@@ -2921,18 +3214,9 @@ func promptDecisionWithSignal(
 	select {
 	case chosen := <-decision:
 		return chosen, false
-	case <-signals:
+	case <-interrupted:
 		fmt.Fprintln(output, "\nSignal received: discarding the session.")
 		return pgproxy.DecisionRollback, true
-	}
-}
-
-func pendingSignal(signals <-chan os.Signal) bool {
-	select {
-	case <-signals:
-		return true
-	default:
-		return false
 	}
 }
 

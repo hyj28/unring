@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"golang.org/x/sys/unix"
 )
@@ -624,7 +625,9 @@ func (s *Session) SealContext(ctx context.Context, now time.Time, progress func(
 			failure := CaptureFailure{Path: root.Path, Error: err.Error()}
 			scanFailures = append(scanFailures, failure)
 			diffExcluded[failure.Path] = true
-			root.Uncaptured[failure.Path] = failure.Error
+			if ctx.Err() == nil {
+				root.Uncaptured[failure.Path] = failure.Error
+			}
 			continue
 		}
 		rootAfter[index] = entries
@@ -728,22 +731,22 @@ func (s *Session) SealContext(ctx context.Context, now time.Time, progress func(
 	if len(allFailures) > 0 {
 		s.manifest.Error = formatFailures("post-session coverage incomplete", allFailures)
 	}
-	if err := writeManifest(s.dir, s.manifest); err != nil {
-		s.manifest.Complete = false
-		s.manifest.Error = joinText(s.manifest.Error, err.Error())
-	}
-	availableAfter, measuredAfter, measureAfterErr := int64(0), false, error(nil)
-	if ctx.Err() == nil {
-		availableAfter, measuredAfter, measureAfterErr = filesystemAvailableBytes(s.dir)
-	}
 	if ctx.Err() != nil {
 		s.manifest.Complete = false
 		s.manifest.Interrupted = true
 		s.manifest.StorageExact = false
 		s.manifest.Error = joinText(s.manifest.Error, "measure retained snapshot after interrupted seal: "+ctx.Err().Error())
-		if err := writeManifest(s.dir, s.manifest); err != nil {
-			s.manifest.Error = joinText(s.manifest.Error, err.Error())
-		}
+	}
+	if err := writeManifest(s.dir, s.manifest); err != nil {
+		s.manifest.Complete = false
+		s.manifest.Error = joinText(s.manifest.Error, err.Error())
+	}
+	availableAfter, measuredAfter, measureAfterErr := int64(0), false, error(nil)
+	if !s.manifest.Interrupted {
+		availableAfter, measuredAfter, measureAfterErr = filesystemAvailableBytes(s.dir)
+	}
+	if s.manifest.Interrupted {
+		// The first published sealed manifest already contains the interruption.
 	} else if measureBeforeErr != nil || measureAfterErr != nil {
 		measureErr := errors.Join(measureBeforeErr, measureAfterErr)
 		s.manifest.Complete = false
@@ -882,29 +885,59 @@ func classifyWideChanges(
 			break
 		}
 		sort.Strings(paths)
-		for start := 0; start < len(paths); start += timeMachineExclusionBatchSize {
-			end := start + timeMachineExclusionBatchSize
-			if end > len(paths) {
-				end = len(paths)
+		var batchable []string
+		for _, path := range paths {
+			if safeForTimeMachineExclusionBatch(path) {
+				batchable = append(batchable, path)
+				continue
 			}
-			batch := paths[start:end]
+			check, failure := checkTimeMachineExclusionPath(ctx, platform, path)
+			checks[path] = check
+			delete(pending, path)
+			completed++
+			if failure != nil {
+				failures = append(failures, *failure)
+			}
+			report()
+		}
+		for start := 0; start < len(batchable); start += timeMachineExclusionBatchSize {
+			end := start + timeMachineExclusionBatchSize
+			if end > len(batchable) {
+				end = len(batchable)
+			}
+			batch := batchable[start:end]
 			results, err := platform.IsExcludedBatch(ctx, batch)
 			if err == nil && len(results) != len(batch) {
 				err = fmt.Errorf("Time Machine inclusion batch returned %d results for %d paths", len(results), len(batch))
 			}
-			for index, path := range batch {
-				check := timeMachineExclusionCheck{err: err}
-				if err == nil {
-					check.excluded = results[index]
+			if err != nil {
+				for _, path := range batch {
+					check := timeMachineExclusionCheck{}
+					var failure *CaptureFailure
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						check.err = ctxErr
+						failure = &CaptureFailure{
+							Path:  path,
+							Error: "Time Machine inclusion check stopped before this path could be verified: " + ctxErr.Error(),
+						}
+					} else {
+						check, failure = checkTimeMachineExclusionPath(ctx, platform, path)
+					}
+					checks[path] = check
+					delete(pending, path)
+					completed++
+					if failure != nil {
+						failures = append(failures, *failure)
+					}
 				}
+				report()
+				continue
+			}
+			for index, path := range batch {
+				check := timeMachineExclusionCheck{excluded: results[index]}
 				checks[path] = check
 				delete(pending, path)
 				completed++
-			}
-			if err != nil {
-				failures = append(failures, CaptureFailure{
-					Path: batch[0], Error: "batched Time Machine inclusion check failed without attributing results: " + err.Error(),
-				})
 			}
 			report()
 		}
@@ -913,6 +946,41 @@ func classifyWideChanges(
 		classifyWideChange(&changes[index], platform, backstop, checks)
 	}
 	return mergeFailures(failures)
+}
+
+func safeForTimeMachineExclusionBatch(path string) bool {
+	if strings.ContainsAny(path, "\r\n") {
+		return false
+	}
+	for _, component := range strings.Split(filepath.Clean(path), string(os.PathSeparator)) {
+		for _, character := range component {
+			if unicode.IsSpace(character) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func checkTimeMachineExclusionPath(
+	ctx context.Context,
+	platform VolumeSnapshotPlatform,
+	path string,
+) (timeMachineExclusionCheck, *CaptureFailure) {
+	results, err := platform.IsExcludedBatch(ctx, []string{path})
+	if err == nil && len(results) != 1 {
+		err = fmt.Errorf("Time Machine inclusion check returned %d results for one path", len(results))
+	}
+	check := timeMachineExclusionCheck{err: err}
+	if err == nil {
+		check.excluded = results[0]
+		return check, nil
+	}
+	failure := &CaptureFailure{
+		Path:  path,
+		Error: "Time Machine inclusion check failed for this path: " + err.Error(),
+	}
+	return check, failure
 }
 
 func exclusionCheckPath(change Change, backstop *Backstop) (string, bool) {
@@ -1001,21 +1069,16 @@ func classifyWideChange(change *Change, platform VolumeSnapshotPlatform, backsto
 }
 
 func inheritedExcludedCheck(path string, checks map[string]timeMachineExclusionCheck) (timeMachineExclusionCheck, string, bool) {
-	matched := ""
-	for checkedPath, check := range checks {
-		if !check.excluded || check.err != nil {
-			continue
+	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
+		if check, ok := checks[current]; ok && check.excluded && check.err == nil {
+			return check, current, true
 		}
-		if path == checkedPath || strings.HasPrefix(path, checkedPath+string(os.PathSeparator)) {
-			if len(checkedPath) > len(matched) {
-				matched = checkedPath
-			}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
 		}
 	}
-	if matched == "" {
-		return timeMachineExclusionCheck{}, "", false
-	}
-	return checks[matched], matched, true
+	return timeMachineExclusionCheck{}, "", false
 }
 
 func nearestExistingAncestor(path string) string {
@@ -1488,6 +1551,7 @@ func scanRootWithNamesContext(ctx context.Context, root string, excluded, exclud
 	}
 	var failures []CaptureFailure
 	err = filepath.WalkDir(root, func(path string, directoryEntry fs.DirEntry, walkErr error) error {
+		observeScanPath(ctx, path)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -1902,15 +1966,28 @@ func PlanRetention(
 	maxAge time.Duration,
 	now time.Time,
 ) (RetentionPlan, error) {
+	return PlanRetentionContext(context.Background(), stateDir, sessions, capBytes, maxAge, now)
+}
+
+// PlanRetentionContext is PlanRetention with cancellation while waiting for
+// retention/session locks and inspecting stored manifests.
+func PlanRetentionContext(
+	ctx context.Context,
+	stateDir string,
+	sessions []StoredSession,
+	capBytes int64,
+	maxAge time.Duration,
+	now time.Time,
+) (RetentionPlan, error) {
 	if capBytes < 0 {
 		return RetentionPlan{}, errors.New("snapshot retention cap cannot be negative")
 	}
-	unlockRetention, err := acquireSnapshotLock(stateDir, "retention", unix.LOCK_SH)
+	unlockRetention, err := acquireSnapshotLockContext(ctx, stateDir, "retention", unix.LOCK_SH)
 	if err != nil {
 		return RetentionPlan{}, err
 	}
 	defer unlockRetention()
-	return planRetentionWhileLocked(stateDir, sessions, capBytes, maxAge, now)
+	return planRetentionWhileLockedContext(ctx, stateDir, sessions, capBytes, maxAge, now)
 }
 
 // PlanRetentionWhileLocked computes a retention plan while the caller holds
@@ -1926,10 +2003,21 @@ func PlanRetentionWhileLocked(
 	if capBytes < 0 {
 		return RetentionPlan{}, errors.New("snapshot retention cap cannot be negative")
 	}
-	return planRetentionWhileLocked(stateDir, sessions, capBytes, maxAge, now)
+	return planRetentionWhileLockedContext(context.Background(), stateDir, sessions, capBytes, maxAge, now)
 }
 
 func planRetentionWhileLocked(
+	stateDir string,
+	sessions []StoredSession,
+	capBytes int64,
+	maxAge time.Duration,
+	now time.Time,
+) (RetentionPlan, error) {
+	return planRetentionWhileLockedContext(context.Background(), stateDir, sessions, capBytes, maxAge, now)
+}
+
+func planRetentionWhileLockedContext(
+	ctx context.Context,
 	stateDir string,
 	sessions []StoredSession,
 	capBytes int64,
@@ -1947,6 +2035,9 @@ func planRetentionWhileLocked(
 	}
 	byID := make(map[string]*retained, len(sessions))
 	for _, session := range sessions {
+		if err := ctx.Err(); err != nil {
+			return RetentionPlan{}, err
+		}
 		if session.ID == "" || strings.ContainsAny(session.ID, `/\\`) {
 			return RetentionPlan{}, fmt.Errorf("plan retention: invalid session id %q", session.ID)
 		}
@@ -1963,10 +2054,13 @@ func planRetentionWhileLocked(
 		return RetentionPlan{}, fmt.Errorf("inspect retained snapshots: %w", err)
 	}
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return RetentionPlan{}, err
+		}
 		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
-		unlock, lockErr := acquireSnapshotLock(stateDir, entry.Name(), unix.LOCK_SH)
+		unlock, lockErr := acquireSnapshotLockContext(ctx, stateDir, entry.Name(), unix.LOCK_SH)
 		if lockErr != nil {
 			return RetentionPlan{}, lockErr
 		}
@@ -2001,6 +2095,9 @@ func planRetentionWhileLocked(
 	}
 	ordered := make([]*retained, 0, len(byID))
 	for _, item := range byID {
+		if err := ctx.Err(); err != nil {
+			return RetentionPlan{}, err
+		}
 		ordered = append(ordered, item)
 	}
 	sort.Slice(ordered, func(i, j int) bool {
@@ -2015,6 +2112,9 @@ func planRetentionWhileLocked(
 	}
 	var enforcedBytes int64
 	for _, item := range ordered {
+		if err := ctx.Err(); err != nil {
+			return RetentionPlan{}, err
+		}
 		if !item.hasSnapshot {
 			continue
 		}
@@ -2054,6 +2154,9 @@ func planRetentionWhileLocked(
 	}
 	cutoff := now.Add(-maxAge)
 	for _, item := range ordered {
+		if err := ctx.Err(); err != nil {
+			return RetentionPlan{}, err
+		}
 		expired := maxAge > 0 && item.StartedAt.Before(cutoff)
 		capRequired := item.hasSnapshot && item.accountingKnown && item.exact && enforcedBytes > capBytes
 		if protected[item.ID] || (!expired && !capRequired) {
@@ -2089,12 +2192,25 @@ func ApplyRetentionRemovals(
 	finalize func(RetentionRemoval) error,
 	completed func(RetentionRemoval),
 ) error {
+	return ApplyRetentionRemovalsContext(context.Background(), stateDir, removals, validate, finalize, completed)
+}
+
+// ApplyRetentionRemovalsContext is ApplyRetentionRemovals with cancellation
+// checks while waiting for locks, walking clone trees, and removing entries.
+func ApplyRetentionRemovalsContext(
+	ctx context.Context,
+	stateDir string,
+	removals []RetentionRemoval,
+	validate func() error,
+	finalize func(RetentionRemoval) error,
+	completed func(RetentionRemoval),
+) error {
 	for _, removal := range removals {
 		if removal.SessionID == "" || strings.ContainsAny(removal.SessionID, `/\\`) {
 			return fmt.Errorf("remove retained snapshots: invalid session id %q", removal.SessionID)
 		}
 	}
-	unlockRetention, err := acquireSnapshotLock(stateDir, "retention", unix.LOCK_EX)
+	unlockRetention, err := acquireSnapshotLockContext(ctx, stateDir, "retention", unix.LOCK_EX)
 	if err != nil {
 		return err
 	}
@@ -2105,13 +2221,16 @@ func ApplyRetentionRemovals(
 		}
 	}
 	for _, removal := range removals {
-		unlock, lockErr := acquireSnapshotLock(stateDir, removal.SessionID, unix.LOCK_EX)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		unlock, lockErr := acquireSnapshotLockContext(ctx, stateDir, removal.SessionID, unix.LOCK_EX)
 		if lockErr != nil {
 			return lockErr
 		}
 		if removal.HasSnapshot {
 			path := filepath.Join(stateDir, "snapshots", removal.SessionID)
-			removeErr := removeSnapshotTree(path)
+			removeErr := removeSnapshotTreeContext(ctx, path)
 			if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 				unlock()
 				return &RetentionApplyError{Removal: removal, Err: fmt.Errorf("remove retained snapshot %s: %w", removal.SessionID, removeErr)}
@@ -2139,33 +2258,50 @@ func ApplyRetentionRemovals(
 // before reading a directory, so adding owner access there also handles nested
 // read-only trees without following captured symlinks.
 func removeSnapshotTree(path string) error {
-	err := filepath.WalkDir(path, func(current string, entry fs.DirEntry, walkErr error) error {
-		if errors.Is(walkErr, os.ErrNotExist) {
-			return nil
-		}
-		if walkErr != nil {
-			return walkErr
-		}
-		if !entry.IsDir() {
-			return nil
-		}
-		info, infoErr := entry.Info()
-		if infoErr != nil {
-			return infoErr
-		}
-		mode := info.Mode().Perm()
-		if mode&0o700 == 0o700 {
-			return nil
-		}
-		return os.Chmod(current, mode|0o700)
-	})
-	if err != nil {
-		return fmt.Errorf("make snapshot removable: %w", err)
+	return removeSnapshotTreeContext(context.Background(), path)
+}
+
+func removeSnapshotTreeContext(ctx context.Context, path string) error {
+	err := removeSnapshotEntryContext(ctx, path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	if err := os.RemoveAll(path); err != nil {
+	if err != nil {
 		return fmt.Errorf("remove snapshot tree: %w", err)
 	}
 	return nil
+}
+
+func removeSnapshotEntryContext(ctx context.Context, path string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return os.Remove(path)
+	}
+	mode := info.Mode().Perm()
+	if mode&0o700 != 0o700 {
+		if err := os.Chmod(path, mode|0o700); err != nil {
+			return fmt.Errorf("make snapshot directory removable: %w", err)
+		}
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := removeSnapshotEntryContext(ctx, filepath.Join(path, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return os.Remove(path)
 }
 
 // StorageUsage reports current retained measured bytes and session count.
