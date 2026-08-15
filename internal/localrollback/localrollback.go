@@ -113,6 +113,7 @@ type Summary struct {
 	PostSessionFailures []CaptureFailure `json:"post_session_coverage_failures,omitempty"`
 	Changes             []Change         `json:"changes"`
 	Complete            bool             `json:"complete"`
+	Interrupted         bool             `json:"post_session_scan_interrupted,omitempty"`
 	Error               string           `json:"error,omitempty"`
 	Storage             string           `json:"storage"`
 	LogicalBytes        int64            `json:"logical_bytes"`
@@ -158,6 +159,7 @@ type manifest struct {
 	After               map[string]Entry `json:"after,omitempty"`
 	Changes             []Change         `json:"changes,omitempty"`
 	Complete            bool             `json:"complete"`
+	Interrupted         bool             `json:"post_session_scan_interrupted,omitempty"`
 	Error               string           `json:"error,omitempty"`
 	Storage             string           `json:"storage"`
 	LogicalBytes        int64            `json:"logical_bytes"`
@@ -736,6 +738,7 @@ func (s *Session) SealContext(ctx context.Context, now time.Time, progress func(
 	}
 	if ctx.Err() != nil {
 		s.manifest.Complete = false
+		s.manifest.Interrupted = true
 		s.manifest.StorageExact = false
 		s.manifest.Error = joinText(s.manifest.Error, "measure retained snapshot after interrupted seal: "+ctx.Err().Error())
 		if err := writeManifest(s.dir, s.manifest); err != nil {
@@ -774,6 +777,7 @@ func (s *Session) SealContext(ctx context.Context, now time.Time, progress func(
 	s.summary.Uncaptured = manifestFailures(s.manifest)
 	s.summary.PostSessionFailures = append([]CaptureFailure(nil), s.manifest.PostSessionFailures...)
 	s.summary.Complete = s.manifest.Complete
+	s.summary.Interrupted = s.manifest.Interrupted
 	s.summary.Error = s.manifest.Error
 	s.summary.StorageBytes = s.manifest.StorageBytes
 	s.summary.StorageExact = s.manifest.StorageExact

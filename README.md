@@ -118,7 +118,10 @@ the corresponding requested path in the same order; short, reordered, or malform
 is rejected rather than attributed to the wrong file. The terminal reports scan and batch
 progress. `SIGINT` and `SIGTERM` remain active after the child exits: either signal cancels
 the remaining scan, seals an incomplete manifest, discards the session, and records a final
-outcome that later `log` and `restore` commands can inspect.
+outcome that later `log` and `restore` commands can inspect. A second signal is acknowledged
+but does not bypass that durable discard finalization; the first signal determines the exit
+status. Interrupted human-readable listings say that coverage is incomplete, while `log
+--json` retains the exact diagnostic cause.
 
 After the child exits, inspect and restore file changes at any later time:
 
@@ -138,7 +141,11 @@ unring prune --confirm <preview-token>       # remove exactly the previewed sess
 The `unring restore` and detailed `unring log <session-id>` output repeat the session's
 recorded change-list scope. A clean stored change list therefore does not hide whether
 `--watch-only`, a failed widened scan, or the normal home-and-clone boundary left changes
-elsewhere unreported.
+elsewhere unreported. A completed no-change scan prints an explicit zero. Human change rows
+are bounded independently for each watched root and for declared agent own-state, so a noisy
+root cannot hide another explicitly watched root; `restore <session-id>` remains the complete
+recorded listing. The history outcome labels distinguish a successful file-only session that
+needed no decision from an explicit discard and an abnormal interrupted end.
 
 A clone-covered path changed after the session is refused by default. Its pre-session
 snapshot is written alongside the current file, and only `--force` permits replacement.
@@ -157,6 +164,9 @@ Expired and abandoned tokens are collected by later prune invocations. Reported
 snapshot bytes are unring's retention accounting, not a promise of immediately increased
 free space: APFS clones can release references to shared blocks without changing free space
 until the other references are removed.
+Automatic retention groups removed session IDs by reason and states the accounting caveat
+once for the shown set; its total, withheld count, detail command, and complete recorded
+retention events remain unchanged.
 Age expiry removes both the stored session record and clone restore data. When only the byte
 cap binds, unring removes the clone data but keeps the audit record of database, outbound,
 and file activity, marking that record as no longer retained for clone restore.

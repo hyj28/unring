@@ -37,13 +37,17 @@ import (
 )
 
 const (
-	internalErrorExitCode   = 1
-	usageExitCode           = 2
-	defaultReviewWidth      = 80
-	defaultSessionListLimit = 50
+	internalErrorExitCode         = 1
+	usageExitCode                 = 2
+	defaultReviewWidth            = 80
+	defaultSessionListLimit       = 50
+	completionKindNoDecision      = "no_decision_needed"
+	completionKindExplicitDiscard = "explicit_discard"
+	completionKindAbnormalDiscard = "abnormal_discard"
 
-	quietSessionDisclosure = "unring: nothing intercepted. Outbound is not covered unless --outbound was given. Not visible to unring: SSH/git push, raw sockets, unshimmed CLIs."
-	homeScanExclusions     = "Library, node_modules, .git, .cache, and go/pkg"
+	quietSessionDisclosure         = "unring: Files changed: 0; the post-session scan completed. Nothing intercepted. Outbound is not covered unless --outbound was given. Not visible to unring: SSH/git push, raw sockets, unshimmed CLIs."
+	quietSessionActivityDisclosure = "unring: nothing intercepted. Outbound is not covered unless --outbound was given. Not visible to unring: SSH/git push, raw sockets, unshimmed CLIs."
+	homeScanExclusions             = "Library, node_modules, .git, .cache, and go/pkg"
 )
 
 type stringListFlag []string
@@ -290,6 +294,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	var finalized bool
 	var auditError string
 	requestedDecision := "discard"
+	completionKind := ""
 	defer func() {
 		recovered := recover()
 		outcome := ""
@@ -313,16 +318,21 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			}
 		}
 		if recovered != nil {
+			completionKind = completionKindAbnormalDiscard
 			auditError = fmt.Sprintf("panic: %v", recovered)
 			if exitCode == 0 {
 				exitCode = internalErrorExitCode
 			}
+		}
+		if outcome == "discarded" && completionKind == "" {
+			completionKind = completionKindAbnormalDiscard
 		}
 		saveErr := auditSession.Update(func(record *audit.Record) {
 			record.EndedAt = time.Now().UTC()
 			record.ExitCode = exitCode
 			record.Error = strings.TrimPrefix(auditError, "\n")
 			record.Decision = requestedDecision
+			record.CompletionKind = completionKind
 			record.Outbound = *outboundEnabled
 			record.Files = fileSummary
 			if proxy != nil {
@@ -589,13 +599,15 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	printScanFinished(stderr, fileSummary)
 	applyAutomaticRetention(auditStore, auditRecord.ID, capBytes, scope.RetentionDays, &fileSummary, stderr)
 	if !fileSummary.Complete {
-		if hasActionableFileCoverageFailure(fileSummary) {
+		if fileSummary.Interrupted {
+			fmt.Fprintf(stderr, "unring: FILE CHANGE LIST INCOMPLETE: the post-session scan was interrupted; the recorded list may omit file changes. Run unring log --json %s for precise diagnostic details.\n", auditRecord.ID)
+		} else if hasActionableFileCoverageFailure(fileSummary) {
 			fmt.Fprintf(stderr, "unring: FILE COVERAGE INCOMPLETE: %s\n", fileSummary.Error)
 		} else {
 			fmt.Fprintln(stderr, "unring: FILE COVERAGE NOTE: unsupported file types remain recorded but cannot be restored per path.")
 		}
 	}
-	printFileChanges(stdout, auditRecord.ID, fileSummary)
+	printFileChanges(stdout, auditRecord.ID, fileSummary, !databaseConfigured)
 	if err := auditSession.Update(func(record *audit.Record) { record.Files = fileSummary }); err != nil {
 		auditError = joinErrorText(auditError, err)
 		fmt.Fprintf(stderr, "unring: record file changes: %v\n", err)
@@ -651,6 +663,13 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 
 	if interceptionErr == nil && !summary.HasReviewableActivity() &&
 		!httpsSummary.HasReviewableActivity() && !ghSummary.HasReviewableActivity() {
+		completionKind = completionKindNoDecision
+		if *forceDiscard {
+			completionKind = completionKindExplicitDiscard
+		}
+		if interrupted || result.Err != nil || result.ExitCode != 0 || !fileSummary.Complete {
+			completionKind = completionKindAbnormalDiscard
+		}
 		if result.Err != nil {
 			fmt.Fprintf(stderr, "unring: %v\n", result.Err)
 		}
@@ -664,7 +683,11 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			}
 			printCoverageOnlyReview(stdout, summary)
 		} else {
-			fmt.Fprintln(stderr, quietSessionDisclosure)
+			disclosure := quietSessionDisclosure
+			if !fileSummary.Complete || len(fileSummary.Changes) != 0 {
+				disclosure = quietSessionActivityDisclosure
+			}
+			fmt.Fprintln(stderr, disclosure)
 		}
 		finalizeContext, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		var ghFinalizeErr error
@@ -759,6 +782,12 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	}
 	if interrupted {
 		decision = pgproxy.DecisionRollback
+	}
+	if decision == pgproxy.DecisionRollback {
+		completionKind = completionKindExplicitDiscard
+		if interrupted || result.Err != nil || result.ExitCode != 0 || interceptionErr != nil || !fileSummary.Complete {
+			completionKind = completionKindAbnormalDiscard
+		}
 	}
 
 	if err := auditSession.Update(func(record *audit.Record) {
@@ -1014,6 +1043,7 @@ func sealFileSession(
 	defer ticker.Stop()
 	started := time.Now()
 	var interrupted os.Signal
+	additionalSignals := 0
 	var latest localrollback.SealProgress
 	nextProgress := 0
 	for {
@@ -1030,7 +1060,10 @@ func sealFileSession(
 			if interrupted == nil {
 				interrupted = signal
 				cancel()
-				fmt.Fprintf(output, "unring: %s received during the post-session scan; stopping the scan and discarding the session.\n", signal)
+				fmt.Fprintf(output, "unring: %s received during the post-session scan; stopping the scan and discarding the session.\n", postChildSignalName(signal))
+			} else if additionalSignals == 0 {
+				additionalSignals++
+				fmt.Fprintf(output, "unring: second signal received (%s); safe discard finalization is already in progress and will not be skipped.\n", postChildSignalName(signal))
 			}
 		case update := <-progress:
 			latest = update
@@ -1060,6 +1093,17 @@ func sealFileSession(
 	}
 }
 
+func postChildSignalName(signal os.Signal) string {
+	switch signal {
+	case os.Interrupt:
+		return "interrupt"
+	case syscall.SIGTERM:
+		return "termination signal"
+	default:
+		return signal.String()
+	}
+}
+
 const timeMachineProgressMinimumStep = 256
 
 func exitCodeForSignal(signal os.Signal) int {
@@ -1069,8 +1113,21 @@ func exitCodeForSignal(signal os.Signal) int {
 	return internalErrorExitCode
 }
 
-func printFileChanges(output io.Writer, sessionID string, summary localrollback.Summary) {
+func printFileChanges(output io.Writer, sessionID string, summary localrollback.Summary, announceCompleteZero bool) {
+	if summary.Interrupted {
+		fmt.Fprintf(output, "File change list incomplete: the post-session scan was interrupted, so this session must not be treated as having no file changes. Run unring log --json %s for precise diagnostic details.\n", sessionID)
+		if len(summary.Changes) == 0 {
+			return
+		}
+	}
 	if len(summary.Changes) == 0 {
+		if summary.Complete {
+			if announceCompleteZero {
+				fmt.Fprintln(output, "Files changed: 0 created, 0 modified, 0 deleted. The post-session scan completed.")
+			}
+		} else {
+			fmt.Fprintln(output, "File change list incomplete: the post-session scan did not produce a complete result, so this session must not be treated as having no file changes.")
+		}
 		return
 	}
 	created, modified, deleted := 0, 0, 0
@@ -1092,10 +1149,13 @@ func printFileChanges(output io.Writer, sessionID string, summary localrollback.
 		printAgentStateGroupingInference(output, "", agentStateRoots)
 	}
 	regular, agentState := groupAgentStateChanges(summary.Changes, agentStateRoots)
-	printBoundedChanges(output, regular, sessionID, "other file changes", printLiveChange)
+	printChange := func(output io.Writer, change localrollback.Change) {
+		printLiveChange(output, change, summary.Interrupted)
+	}
+	printWatchedRootChangeGroups(output, regular, summary.Watched, sessionID, printChange)
 	if len(agentState) > 0 {
 		fmt.Fprintln(output, "AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
-		printBoundedChanges(output, agentState, sessionID, "agent own-state changes", printLiveChange)
+		printBoundedChanges(output, agentState, sessionID, "agent own-state changes", printChange)
 	}
 	if summary.Retained && hasRestorableFileChange(summary.Changes) {
 		fmt.Fprintf(output, "Restore later with: unring restore %s\n", sessionID)
@@ -1106,12 +1166,12 @@ func printFileChanges(output io.Writer, sessionID string, summary localrollback.
 	}
 }
 
-func printLiveChange(output io.Writer, change localrollback.Change) {
+func printLiveChange(output io.Writer, change localrollback.Change, interrupted bool) {
 	fmt.Fprintf(output, "  %-8s %s\n", change.Kind, humanPath(change.Path))
 	if change.RestoreSource == localrollback.RestoreSourceVolume {
 		fmt.Fprintln(output, "             SNAPSHOT ONLY: restoring this path requires sudo to mount the APFS snapshot.")
 	} else if change.UnrestorableReason != "" {
-		fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
+		fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", humanUnrestorableReason(change.UnrestorableReason, interrupted))
 	}
 }
 
@@ -1120,6 +1180,16 @@ func printAuditFiles(output io.Writer, sessionID string, summary localrollback.S
 		return
 	}
 	fmt.Fprintln(output, "\nFILES — RESTORE COVERAGE")
+	if len(summary.Changes) == 0 {
+		switch {
+		case summary.Interrupted:
+			fmt.Fprintln(output, "  File change list incomplete: the post-session scan was interrupted; zero changes must not be inferred.")
+		case summary.Complete:
+			fmt.Fprintln(output, "  Files changed: 0 created, 0 modified, 0 deleted. The post-session scan completed.")
+		default:
+			fmt.Fprintln(output, "  File change list incomplete: the post-session scan did not produce a complete result; zero changes must not be inferred.")
+		}
+	}
 	storageLabel := "measured storage bytes"
 	if !summary.StorageExact {
 		storageLabel = "storage-byte upper bound"
@@ -1133,15 +1203,21 @@ func printAuditFiles(output io.Writer, sessionID string, summary localrollback.S
 		for _, snapshot := range summary.Backstop.Snapshots {
 			fmt.Fprintf(output, "  Volume backstop: %s on %s\n", snapshot.Name, snapshot.MountPoint)
 		}
-	} else {
+	} else if summary.Backstop.Reason != "" {
 		fmt.Fprintf(output, "  NO WHOLE-VOLUME BACKSTOP: %s\n", summary.Backstop.Reason)
+	} else if !summary.Backstop.Checked {
+		fmt.Fprintln(output, "  Whole-volume backstop was not checked for this session.")
+	} else {
+		fmt.Fprintln(output, "  NO WHOLE-VOLUME BACKSTOP: no reason was recorded.")
 	}
 	for _, failure := range summary.Backstop.Excluded {
 		fmt.Fprintf(output, "  OUTSIDE VOLUME BACKSTOP: %s: %s\n", humanPath(failure.Path), failure.Error)
 	}
 	printStoredChangeListLimitation(output, summary, "  ", false)
 	for _, failure := range summary.ScanFailures {
-		fmt.Fprintf(output, "  CHANGE-LIST SCAN INCOMPLETE: %s: %s\n", humanPath(failure.Path), failure.Error)
+		if !summary.Interrupted {
+			fmt.Fprintf(output, "  CHANGE-LIST SCAN INCOMPLETE: %s: %s\n", humanPath(failure.Path), failure.Error)
+		}
 	}
 	if summary.ScanRoot != "" {
 		fmt.Fprintf(output, "  Change-list scan: %d entries/%d ms before; %d entries/%d ms after\n",
@@ -1162,12 +1238,17 @@ func printAuditFiles(output io.Writer, sessionID string, summary localrollback.S
 		printAgentStateGroupingInference(output, "  ", agentStateRoots)
 	}
 	regular, agentState := groupAgentStateChanges(summary.Changes, agentStateRoots)
-	printBoundedChanges(output, regular, sessionID, "other file changes", printStoredChange)
+	printChange := func(output io.Writer, change localrollback.Change) {
+		printStoredChange(output, change, summary.Interrupted)
+	}
+	printWatchedRootChangeGroups(output, regular, summary.Watched, sessionID, printChange)
 	if len(agentState) > 0 {
 		fmt.Fprintln(output, "  AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
-		printBoundedChanges(output, agentState, sessionID, "agent own-state changes", printStoredChange)
+		printBoundedChanges(output, agentState, sessionID, "agent own-state changes", printChange)
 	}
-	if summary.Error != "" {
+	if summary.Interrupted {
+		fmt.Fprintf(output, "  INCOMPLETE: the post-session scan was interrupted; the recorded change list may omit file changes. Run unring log --json %s for precise diagnostic details.\n", sessionID)
+	} else if summary.Error != "" {
 		if hasActionableFileCoverageFailure(summary) {
 			fmt.Fprintf(output, "  INCOMPLETE: %s\n", summary.Error)
 		} else {
@@ -1188,13 +1269,20 @@ func hasActionableFileCoverageFailure(summary localrollback.Summary) bool {
 	return !localrollback.HasOnlyUnsupportedFileTypeFailures(summary)
 }
 
-func printStoredChange(output io.Writer, change localrollback.Change) {
+func printStoredChange(output io.Writer, change localrollback.Change, interrupted bool) {
 	fmt.Fprintf(output, "  %-8s %s\n", change.Kind, humanPath(change.Path))
 	if change.RestoreSource == localrollback.RestoreSourceVolume {
 		fmt.Fprintln(output, "             SNAPSHOT ONLY: requires sudo to mount the APFS snapshot")
 	} else if change.UnrestorableReason != "" {
-		fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
+		fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", humanUnrestorableReason(change.UnrestorableReason, interrupted))
 	}
+}
+
+func humanUnrestorableReason(reason string, interrupted bool) string {
+	if interrupted && strings.Contains(reason, context.Canceled.Error()) {
+		return "the post-session scan was interrupted before this path's restore coverage could be verified"
+	}
+	return reason
 }
 
 func printBoundedChanges(
@@ -1214,6 +1302,81 @@ func printBoundedChanges(
 			"Showing %d of %d %s; %d withheld. Run unring restore %s to show every recorded change.\n",
 			shown, len(changes), group, withheld, sessionID)
 	}
+}
+
+type watchedRootChangeGroup struct {
+	root    string
+	changes []localrollback.Change
+}
+
+func printWatchedRootChangeGroups(
+	output io.Writer,
+	changes []localrollback.Change,
+	watched []string,
+	sessionID string,
+	printChange func(io.Writer, localrollback.Change),
+) {
+	if len(changes) == 0 {
+		return
+	}
+	groups := make([]watchedRootChangeGroup, 0, len(watched)+1)
+	rootIndexes := make(map[string]int)
+	for _, root := range watched {
+		root = filepath.Clean(root)
+		if _, exists := rootIndexes[root]; exists {
+			continue
+		}
+		rootIndexes[root] = len(groups)
+		groups = append(groups, watchedRootChangeGroup{root: root})
+	}
+	outsideIndex := -1
+	for _, change := range changes {
+		matchedRoot := ""
+		matchedIndex := -1
+		for root, index := range rootIndexes {
+			if pathWithinRoot(change.Path, root) && len(root) > len(matchedRoot) {
+				matchedRoot = root
+				matchedIndex = index
+			}
+		}
+		if matchedIndex < 0 {
+			if outsideIndex < 0 {
+				outsideIndex = len(groups)
+				groups = append(groups, watchedRootChangeGroup{})
+			}
+			matchedIndex = outsideIndex
+		}
+		groups[matchedIndex].changes = append(groups[matchedIndex].changes, change)
+	}
+	nonempty := 0
+	for _, group := range groups {
+		if len(group.changes) > 0 {
+			nonempty++
+		}
+	}
+	showHeadings := len(watched) > 1 || outsideIndex >= 0 || nonempty > 1
+	for _, group := range groups {
+		if len(group.changes) == 0 {
+			continue
+		}
+		label := "changes outside watched roots"
+		if group.root != "" {
+			label = "changes under watched root " + humanPath(group.root)
+		}
+		if showHeadings {
+			if group.root == "" {
+				fmt.Fprintln(output, "CHANGES OUTSIDE WATCHED ROOTS")
+			} else {
+				fmt.Fprintf(output, "WATCHED ROOT CHANGES — %s\n", humanPath(group.root))
+			}
+		}
+		printBoundedChanges(output, group.changes, sessionID, label, printChange)
+	}
+}
+
+func pathWithinRoot(path, root string) bool {
+	path = filepath.Clean(path)
+	return path == root || strings.HasPrefix(path, root+string(os.PathSeparator))
 }
 
 func groupAgentStateChanges(changes []localrollback.Change, roots []string) ([]localrollback.Change, []localrollback.Change) {
@@ -1527,11 +1690,11 @@ func logCommand(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout, "No unring sessions have been recorded.")
 			return 0
 		}
-		fmt.Fprintln(stdout, "SESSION ID                                  STARTED               OUTCOME      COMMAND")
+		fmt.Fprintln(stdout, "SESSION ID                                  STARTED               OUTCOME          COMMAND")
 		for _, record := range records {
-			fmt.Fprintf(stdout, "%-43s %-21s %-12s %s\n",
+			fmt.Fprintf(stdout, "%-43s %-21s %-16s %s\n",
 				record.ID, record.StartedAt.Local().Format("2006-01-02 15:04:05"),
-				record.Outcome, humanCommand(record.Command))
+				displayedOutcome(record), humanCommand(record.Command))
 		}
 		if truncated {
 			fmt.Fprintf(stdout, "Showing the newest %d of %d sessions; use unring log --all to show everything.\n", defaultSessionListLimit, total)
@@ -1861,12 +2024,7 @@ func printRetentionRemoval(output io.Writer, verb string, removal localrollback.
 		fmt.Fprintf(output, "unring: retention evicted oldest snapshot %s; the audit record remains available.\n", removal.SessionID)
 		return
 	}
-	target := "clone snapshot only"
-	if removal.Expired && removal.HasSnapshot {
-		target = "stored session and clone snapshot"
-	} else if removal.Expired {
-		target = "stored session audit record"
-	}
+	target := retentionTarget(removal)
 	space := retentionSpace(removal)
 	if !removal.HasSnapshot {
 		space = "this removes only the audit record; no snapshot data remains"
@@ -1876,6 +2034,16 @@ func printRetentionRemoval(output io.Writer, verb string, removal localrollback.
 	if !removal.Expired {
 		fmt.Fprintln(output, "  The audit record remains available; only clone restore data is removed.")
 	}
+}
+
+func retentionTarget(removal localrollback.RetentionRemoval) string {
+	if removal.Expired && removal.HasSnapshot {
+		return "stored session and clone snapshot"
+	}
+	if removal.Expired {
+		return "stored session audit record"
+	}
+	return "clone snapshot only"
 }
 
 func printRetentionWarnings(output io.Writer, warnings []localrollback.RetentionWarning) {
@@ -1978,8 +2146,11 @@ func printAutomaticRetentionRemovals(output io.Writer, activeSession string, rem
 	}
 	fmt.Fprintf(output, "unring: automatic retention removed %d sessions.\n", len(removals))
 	shown, truncated := boundedHumanSessionCount(len(removals), false)
-	for _, removal := range removals[:shown] {
-		printRetentionRemoval(output, "retention removed", removal)
+	shownRemovals := removals[:shown]
+	if len(shownRemovals) == 1 {
+		printRetentionRemoval(output, "retention removed", shownRemovals[0])
+	} else {
+		printCompactRetentionRemovals(output, shownRemovals)
 	}
 	if truncated {
 		fmt.Fprintf(output,
@@ -1987,6 +2158,51 @@ func printAutomaticRetentionRemovals(output io.Writer, activeSession string, rem
 			shown, len(removals), len(removals)-shown, activeSession)
 	}
 }
+
+func printCompactRetentionRemovals(output io.Writer, removals []localrollback.RetentionRemoval) {
+	type removalGroup struct {
+		label string
+		ids   []string
+	}
+	var groups []removalGroup
+	groupIndexes := make(map[string]int)
+	var measuredBytes, upperBoundBytes int64
+	for _, removal := range removals {
+		target := retentionTarget(removal)
+		if !removal.Expired {
+			target += "; audit record retained"
+		}
+		label := retentionReason(removal) + "; removed " + target
+		index, exists := groupIndexes[label]
+		if !exists {
+			index = len(groups)
+			groupIndexes[label] = index
+			groups = append(groups, removalGroup{label: label})
+		}
+		groups[index].ids = append(groups[index].ids, removal.SessionID)
+		if removal.StorageExact {
+			measuredBytes += removal.StorageBytes
+		} else {
+			upperBoundBytes += removal.StorageBytes
+		}
+	}
+	for _, group := range groups {
+		fmt.Fprintf(output, "unring: %s (%d sessions):\n", group.label, len(group.ids))
+		for start := 0; start < len(group.ids); start += automaticRetentionIDsPerLine {
+			end := start + automaticRetentionIDsPerLine
+			if end > len(group.ids) {
+				end = len(group.ids)
+			}
+			fmt.Fprintf(output, "  %s\n", strings.Join(group.ids[start:end], ", "))
+		}
+	}
+	fmt.Fprintf(output,
+		"unring: shown-removal accounting: %d measured retained-snapshot bytes/references; %d bytes of upper-bound accounting.\n",
+		measuredBytes, upperBoundBytes)
+	fmt.Fprintln(output, "unring: deleting copy-on-write clone references does not promise the same increase in immediate free disk space.")
+}
+
+const automaticRetentionIDsPerLine = 5
 
 func printPartialRetentionFailure(output io.Writer, err error) {
 	var applyErr *localrollback.RetentionApplyError
@@ -2079,7 +2295,17 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	record.Files = loadStoredFileSummary(store.StateDir(), record)
 	if len(record.Files.Changes) == 0 {
-		fmt.Fprintf(stdout, "Session %s changed no watched files.\n", record.ID)
+		if !record.Files.Complete {
+			fmt.Fprintf(stdout, "UNRING FILE CHANGES %s\n", record.ID)
+			printStoredChangeListLimitation(stdout, record.Files, "  ", true)
+			if record.Files.Interrupted {
+				fmt.Fprintf(stdout, "INCOMPLETE: the post-session scan was interrupted; no complete change list is available, and this session must not be treated as clean. Run unring log --json %s for precise diagnostic details.\n", record.ID)
+			} else {
+				fmt.Fprintln(stdout, "INCOMPLETE: the post-session scan did not produce a complete change list, and this session must not be treated as clean.")
+			}
+			return 0
+		}
+		fmt.Fprintf(stdout, "Session %s changed no watched files; the post-session scan completed.\n", record.ID)
 		printStoredChangeListLimitation(stdout, record.Files, "", true)
 		return 0
 	}
@@ -2333,18 +2559,23 @@ func boundedHumanSessionCount(total int, showAll bool) (int, bool) {
 func printRestoreListing(output io.Writer, record audit.Record) {
 	fmt.Fprintf(output, "UNRING FILE CHANGES %s\n", record.ID)
 	printStoredChangeListLimitation(output, record.Files, "  ", true)
+	if record.Files.Interrupted {
+		fmt.Fprintf(output, "INCOMPLETE: the post-session scan was interrupted; the paths below are only the changes recorded before cancellation, and this session must not be treated as clean. Run unring log --json %s for precise diagnostic details.\n", record.ID)
+	} else if !record.Files.Complete {
+		fmt.Fprintln(output, "INCOMPLETE: the post-session scan did not produce a complete change list; the paths below may omit changes.")
+	}
 	agentStateRoots, inferredAgentStateRoots := agentStateGroupingRoots(record.Files.AgentStateRoots)
 	if inferredAgentStateRoots {
 		printAgentStateGroupingInference(output, "", agentStateRoots)
 	}
 	regular, agentState := groupAgentStateChanges(record.Files.Changes, agentStateRoots)
 	for _, change := range regular {
-		printRestoreListingChange(output, change, record.Files.Retained)
+		printRestoreListingChange(output, change, record.Files.Retained, record.Files.Interrupted)
 	}
 	if len(agentState) > 0 {
 		fmt.Fprintln(output, "AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
 		for _, change := range agentState {
-			printRestoreListingChange(output, change, record.Files.Retained)
+			printRestoreListingChange(output, change, record.Files.Retained, record.Files.Interrupted)
 		}
 		if hasCurrentlyRestorableFileChange(agentState, record.Files.Retained) {
 			fmt.Fprintf(output, "Include this group with: unring restore --all --include-agent-state %s\n", record.ID)
@@ -2367,11 +2598,11 @@ func printRestoreListing(output io.Writer, record audit.Record) {
 	}
 }
 
-func printRestoreListingChange(output io.Writer, change localrollback.Change, cloneRetained bool) {
+func printRestoreListingChange(output io.Writer, change localrollback.Change, cloneRetained, interrupted bool) {
 	fmt.Fprintf(output, "  %-8s %s\n", change.Kind, humanPath(change.Path))
 	switch {
 	case change.UnrestorableReason != "":
-		fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
+		fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", humanUnrestorableReason(change.UnrestorableReason, interrupted))
 	case change.RestoreSource == localrollback.RestoreSourceVolume:
 		fmt.Fprintln(output, "             SNAPSHOT ONLY: restore requires sudo because APFS snapshot mounting is root-only")
 	case !cloneRetained:
@@ -2437,7 +2668,7 @@ func printAuditRecord(output io.Writer, record audit.Record) {
 	}
 	fmt.Fprintf(output, "Command:  %s\n", humanCommand(record.Command))
 	fmt.Fprintf(output, "Decision: %s\n", record.Decision)
-	fmt.Fprintf(output, "Outcome:  %s\n", record.Outcome)
+	fmt.Fprintf(output, "Outcome:  %s\n", displayedOutcomeDetail(record))
 	fmt.Fprintf(output, "Exit code: %d\n", record.ExitCode)
 	fmt.Fprintf(output, "Outbound interception: %t\n", record.Outbound)
 	if record.Error != "" {
@@ -2458,6 +2689,36 @@ func printAuditRecord(output io.Writer, record audit.Record) {
 				fmt.Fprintf(output, "    Error: %s\n", approval.Error)
 			}
 		}
+	}
+}
+
+func displayedOutcome(record audit.Record) string {
+	if record.Outcome != "discarded" {
+		return record.Outcome
+	}
+	switch record.CompletionKind {
+	case completionKindNoDecision:
+		return "no decision"
+	case completionKindAbnormalDiscard:
+		if record.ExitCode == 128+int(syscall.SIGINT) || record.ExitCode == 128+int(syscall.SIGTERM) {
+			return "interrupted"
+		}
+		return "abnormal end"
+	default:
+		return "discarded"
+	}
+}
+
+func displayedOutcomeDetail(record audit.Record) string {
+	switch displayedOutcome(record) {
+	case "no decision":
+		return "no decision needed"
+	case "interrupted":
+		return "interrupted; reversible effects were discarded"
+	case "abnormal end":
+		return "abnormal end; reversible effects were discarded"
+	default:
+		return displayedOutcome(record)
 	}
 }
 
