@@ -128,10 +128,10 @@ func parseExcludedSingle(path string, output []byte) ([]bool, error) {
 
 func parseExcludedLine(line string) (bool, string, bool) {
 	switch {
-	case strings.HasPrefix(line, "[Excluded] "):
-		return true, strings.TrimPrefix(line, "[Excluded] "), true
-	case strings.HasPrefix(line, "[Included] "):
-		return false, strings.TrimPrefix(line, "[Included] "), true
+	case strings.HasPrefix(line, "[Excluded]  "):
+		return true, strings.TrimPrefix(line, "[Excluded]  "), true
+	case strings.HasPrefix(line, "[Included]  "):
+		return false, strings.TrimPrefix(line, "[Included]  "), true
 	default:
 		return false, "", false
 	}

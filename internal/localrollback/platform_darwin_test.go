@@ -4,6 +4,8 @@ package localrollback
 
 import (
 	"context"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -61,7 +63,7 @@ func TestDarwinCreateParsesLiteralSnapshotName(t *testing.T) {
 
 func TestDarwinExcludedBatchMapsIndependentLiteralStatusesInOrder(t *testing.T) {
 	runner := &literalOutputRunner{output: []byte(
-		"[Included] /literal/kept.txt\n[Excluded] /literal/skipped.txt\n",
+		"[Included]  /literal/kept.txt\n[Excluded]  /literal/skipped.txt\n",
 	)}
 	platform := &darwinVolumeSnapshotPlatform{runner: runner}
 	statuses, err := platform.IsExcludedBatch(context.Background(), []string{
@@ -78,9 +80,9 @@ func TestDarwinExcludedBatchMapsIndependentLiteralStatusesInOrder(t *testing.T) 
 
 func TestDarwinExcludedBatchMatchesNFDOutputToNFCRequests(t *testing.T) {
 	runner := &literalOutputRunner{output: []byte(
-		"[Included] /literal/cafe\u0301.txt\n" +
-			"[Excluded] /literal/Mu\u0308ller.txt\n" +
-			"[Included] /literal/\u1112\u1161\u11ab\u1100\u1173\u11af.txt\n",
+		"[Included]  /literal/cafe\u0301.txt\n" +
+			"[Excluded]  /literal/Mu\u0308ller.txt\n" +
+			"[Included]  /literal/\u1112\u1161\u11ab\u1100\u1173\u11af.txt\n",
 	)}
 	platform := &darwinVolumeSnapshotPlatform{runner: runner}
 	statuses, err := platform.IsExcludedBatch(context.Background(), []string{
@@ -99,12 +101,13 @@ func TestDarwinSingleExcludedCheckPreservesWhitespaceAndLineBreaks(t *testing.T)
 	paths := []string{
 		"/literal/draft .txt",
 		"/literal/ leading.txt",
+		"/literal/trailing.txt ",
 		"/literal/line\nbreak.txt",
 	}
 	for _, path := range paths {
 		t.Run(strings.ReplaceAll(path, "\n", "-newline-"), func(t *testing.T) {
 			platform := &darwinVolumeSnapshotPlatform{
-				runner: &literalOutputRunner{output: []byte("[Excluded] " + path + "\n")},
+				runner: &literalOutputRunner{output: []byte("[Excluded]  " + path + "\n")},
 			}
 			statuses, err := platform.IsExcludedBatch(context.Background(), []string{path})
 			if err != nil {
@@ -122,10 +125,10 @@ func TestDarwinExcludedBatchRejectsUnattributableOutput(t *testing.T) {
 		name   string
 		output string
 	}{
-		{name: "short", output: "[Included] /literal/first\n"},
-		{name: "reordered", output: "[Excluded] /literal/second\n[Included] /literal/first\n"},
-		{name: "malformed", output: "[Included] /literal/first\n[Unknown] /literal/second\n"},
-		{name: "diagnostic", output: "tmutil: diagnostic\n[Included] /literal/first\n[Excluded] /literal/second\n"},
+		{name: "short", output: "[Included]  /literal/first\n"},
+		{name: "reordered", output: "[Excluded]  /literal/second\n[Included]  /literal/first\n"},
+		{name: "malformed", output: "[Included]  /literal/first\n[Unknown]  /literal/second\n"},
+		{name: "diagnostic", output: "tmutil: diagnostic\n[Included]  /literal/first\n[Excluded]  /literal/second\n"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -139,6 +142,24 @@ func TestDarwinExcludedBatchRejectsUnattributableOutput(t *testing.T) {
 				t.Fatalf("error = %v, want explicit unattributable-output failure", err)
 			}
 		})
+	}
+}
+
+func TestDarwinExcludedParserAcceptsRealTMUtilOutput(t *testing.T) {
+	path, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := exec.Command("/usr/bin/tmutil", "isexcluded", path).CombinedOutput()
+	if err != nil {
+		t.Skipf("real tmutil isexcluded unavailable: %v: %s", err, output)
+	}
+	statuses, err := parseExcludedSingle(path, output)
+	if err != nil {
+		t.Fatalf("parse real tmutil output %q: %v", output, err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("real tmutil status count = %d, want independent literal 1", len(statuses))
 	}
 }
 

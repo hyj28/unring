@@ -44,6 +44,7 @@ const (
 	defaultReviewWidth            = 80
 	defaultSessionListLimit       = 50
 	completionKindNoDecision      = "no_decision_needed"
+	completionKindDefaultDiscard  = "noninteractive_default_discard"
 	completionKindExplicitDiscard = "explicit_discard"
 	completionKindAbnormalDiscard = "abnormal_discard"
 
@@ -905,6 +906,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	}
 
 	decision := pgproxy.DecisionRollback
+	defaultDiscard := false
 	postChildSignals.SetPhase("the final decision")
 	switch {
 	case interceptionErr != nil:
@@ -933,7 +935,9 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			}
 		} else {
 			var promptInterrupted bool
-			decision, promptInterrupted = promptDecisionWithSignal(stdin, stdout, postChildSignals.Context().Done())
+			decision, promptInterrupted, defaultDiscard = promptDecisionWithSignal(
+				stdin, stdout, postChildSignals.Context().Done(),
+			)
 			interrupted = interrupted || promptInterrupted
 		}
 	}
@@ -944,6 +948,9 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	}
 	if decision == pgproxy.DecisionRollback {
 		completionKind = completionKindExplicitDiscard
+		if defaultDiscard {
+			completionKind = completionKindDefaultDiscard
+		}
 		if interrupted || result.Err != nil || result.ExitCode != 0 || interceptionErr != nil || !fileSummary.Complete {
 			completionKind = completionKindAbnormalDiscard
 		}
@@ -3236,6 +3243,8 @@ func displayedOutcome(record audit.Record) string {
 	switch record.CompletionKind {
 	case completionKindNoDecision:
 		return "no decision"
+	case completionKindDefaultDiscard:
+		return "default discard"
 	case completionKindAbnormalDiscard:
 		if record.ExitCode == 128+int(syscall.SIGINT) || record.ExitCode == 128+int(syscall.SIGTERM) {
 			return "interrupted"
@@ -3250,6 +3259,8 @@ func displayedOutcomeDetail(record audit.Record) string {
 	switch displayedOutcome(record) {
 	case "no decision":
 		return "no decision needed"
+	case "default discard":
+		return "discarded by the non-interactive default"
 	case "interrupted":
 		return "interrupted; reversible effects were discarded"
 	case "interrupted (unconfirmed)":
@@ -3447,10 +3458,10 @@ func promptDecisionWithSignal(
 	input io.Reader,
 	output io.Writer,
 	interrupted <-chan struct{},
-) (pgproxy.Decision, bool) {
+) (pgproxy.Decision, bool, bool) {
 	if !isTerminal(input) || !isTerminalWriter(output) {
 		fmt.Fprintln(output, "No interactive terminal; defaulting to discard. Use --commit to commit.")
-		return pgproxy.DecisionRollback, false
+		return pgproxy.DecisionRollback, false, true
 	}
 
 	decision := make(chan pgproxy.Decision, 1)
@@ -3459,10 +3470,10 @@ func promptDecisionWithSignal(
 	}()
 	select {
 	case chosen := <-decision:
-		return chosen, false
+		return chosen, false, false
 	case <-interrupted:
 		fmt.Fprintln(output, "\nSignal received: discarding the session.")
-		return pgproxy.DecisionRollback, true
+		return pgproxy.DecisionRollback, true, false
 	}
 }
 

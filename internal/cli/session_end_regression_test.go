@@ -36,6 +36,24 @@ type cancelableFinalizeSession struct {
 	once    sync.Once
 }
 
+type reviewablePostgresSession struct {
+	*unconfiguredPostgresSession
+}
+
+func (session *reviewablePostgresSession) Summary() pgproxy.Summary {
+	return pgproxy.Summary{
+		InterceptionStatus: pgproxy.InterceptionActive,
+		FullyReversible:    true,
+		Changes: pgproxy.ChangeSummary{
+			Complete: true,
+			Rows: []pgproxy.RowChange{
+				{Table: "public.literal_rows", Deleted: 13},
+			},
+		},
+		Sealed: true,
+	}
+}
+
 func (session *cancelableFinalizeSession) Finalize(ctx context.Context, _ pgproxy.Decision) error {
 	session.once.Do(func() { close(session.started) })
 	<-ctx.Done()
@@ -1021,6 +1039,61 @@ func TestExplicitDiscardRemainsDistinctFromNoDecision(t *testing.T) {
 	}
 	if line := outputLineContaining(logOut.String(), records[0].ID); !strings.Contains(line, "discarded") || strings.Contains(line, "no decision") {
 		t.Fatalf("explicit discard displayed outcome = %q, want discarded", line)
+	}
+}
+
+func TestNonInteractiveDefaultDiscardWithDatabaseActivityIsNotAbnormal(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	session := &reviewablePostgresSession{
+		unconfiguredPostgresSession: newUnconfiguredPostgresSession(),
+	}
+	previousFactory := unconfiguredPostgresSessionFactory
+	unconfiguredPostgresSessionFactory = func() postgresSession { return session }
+	defer func() { unconfiguredPostgresSessionFactory = previousFactory }()
+
+	root := t.TempDir()
+	var stdout, stderr strings.Builder
+	if code := Main([]string{
+		"run", "--snapshot-cap-bytes", strconv.FormatInt(1<<40, 10),
+		"--watch-only", root, "--", "/usr/bin/true",
+	}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("non-interactive default discard exit = %d\nstdout:\n%s\nstderr:\n%s",
+			code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "No interactive terminal; defaulting to discard.") {
+		t.Fatalf("run output omitted non-interactive default disclosure:\n%s", stdout.String())
+	}
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %#v, %v, want independent literal one", records, err)
+	}
+	record := records[0]
+	if record.Outcome != "discarded" || record.CompletionKind != completionKindDefaultDiscard {
+		t.Fatalf("stored outcome = %q, completion kind = %q, want discarded and %q",
+			record.Outcome, record.CompletionKind, completionKindDefaultDiscard)
+	}
+
+	var logOut, logErr strings.Builder
+	if code := Main([]string{"log"}, strings.NewReader(""), &logOut, &logErr); code != 0 {
+		t.Fatalf("log exit = %d: %s", code, logErr.String())
+	}
+	line := outputLineContaining(logOut.String(), record.ID)
+	if !strings.Contains(line, "default discard") || strings.Contains(line, "abnormal end") {
+		t.Fatalf("non-interactive default displayed outcome = %q, want default discard", line)
+	}
+
+	logOut.Reset()
+	if code := Main([]string{"log", record.ID}, strings.NewReader(""), &logOut, &logErr); code != 0 {
+		t.Fatalf("log detail exit = %d: %s", code, logErr.String())
+	}
+	if !strings.Contains(logOut.String(), "Outcome:  discarded by the non-interactive default") ||
+		strings.Contains(logOut.String(), "abnormal end") {
+		t.Fatalf("non-interactive default detail is misleading:\n%s", logOut.String())
 	}
 }
 

@@ -121,8 +121,9 @@ the corresponding requested path in the same order; short, reordered, or malform
 is rejected rather than attributed to the wrong file. Echoed paths are compared after Unicode
 normalization because macOS may return decomposed filenames. Paths whose whitespace or line
 breaks make a multi-path response unsafe are checked alone; any unusable batch falls back to
-one check and one independently attributed result per path. The terminal reports scan and
-batch progress.
+one check and one independently attributed result per path. The parser consumes tmutil's
+two-space status separator without trimming the echoed path, so a path's own leading or
+trailing spaces remain significant. The terminal reports scan and batch progress.
 
 `SIGINT`, `SIGTERM`, `SIGHUP`, and a closed output pipe remain handled from the pre-session filesystem
 scan and automatic retention, through the child, post-session scanning, interceptor sealing,
@@ -159,7 +160,8 @@ are bounded independently for each watched root, each declared agent-state root,
 top-level outside-watch presentation root, so one noisy root cannot hide another;
 `restore <session-id>` remains the complete recorded listing. The history outcome labels
 distinguish a successful file-only session that needed no decision from an explicit discard
-and an abnormal interrupted end.
+and an abnormal interrupted end. A reviewable session discarded by the documented
+non-interactive default has its own `default discard` label; it is not reported as abnormal.
 
 A clone-covered path changed after the session is refused by default. Its pre-session
 snapshot is written alongside the current file, and only `--force` permits replacement.
