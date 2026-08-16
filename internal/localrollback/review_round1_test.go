@@ -1,9 +1,12 @@
 package localrollback
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -12,6 +15,11 @@ type reviewRoundPlatform struct {
 	created         bool
 	present         bool
 	isExcludedCalls []string
+	batchCalls      int
+	batchPaths      [][]string
+	excluded        map[string]bool
+	batchErr        error
+	singleErr       error
 }
 
 func (*reviewRoundPlatform) Supported() (bool, string) { return true, "" }
@@ -22,7 +30,159 @@ func (*reviewRoundPlatform) VolumeForPath(string) (Volume, error) {
 
 func (platform *reviewRoundPlatform) IsExcluded(path string) (bool, error) {
 	platform.isExcludedCalls = append(platform.isExcludedCalls, filepath.Clean(path))
-	return false, nil
+	return platform.excluded[filepath.Clean(path)], platform.singleErr
+}
+
+func (platform *reviewRoundPlatform) IsExcludedBatch(_ context.Context, paths []string) ([]bool, error) {
+	platform.batchCalls++
+	platform.batchPaths = append(platform.batchPaths, append([]string(nil), paths...))
+	if len(paths) > 1 && platform.batchErr != nil {
+		return nil, platform.batchErr
+	}
+	results := make([]bool, len(paths))
+	for index, path := range paths {
+		if len(paths) == 1 {
+			platform.isExcludedCalls = append(platform.isExcludedCalls, filepath.Clean(path))
+		}
+		results[index] = platform.excluded[filepath.Clean(path)]
+	}
+	if len(paths) == 1 && platform.singleErr != nil {
+		return nil, platform.singleErr
+	}
+	return results, nil
+}
+
+func TestWideInclusionChecksUseFarFewerBatchesThanPaths(t *testing.T) {
+	platform := &reviewRoundPlatform{}
+	backstop := Backstop{Available: true, Snapshots: []VolumeSnapshot{{
+		Name: "literal-snapshot", VolumeID: "review-disk", MountPoint: "/",
+	}}}
+	changes := make([]Change, 600)
+	indexes := make([]int, 600)
+	for index := range changes {
+		changes[index] = Change{
+			Kind: "created", Path: filepath.Join("/literal/work", fmt.Sprintf("artifact-%03d", index)),
+			After: &Entry{Type: "file"},
+		}
+		indexes[index] = index
+	}
+	failures := classifyWideChanges(context.Background(), changes, indexes, platform, &backstop, nil)
+	if len(failures) != 0 {
+		t.Fatalf("classification failures = %#v", failures)
+	}
+	if platform.batchCalls != 3 {
+		t.Fatalf("batch calls = %d, want literal 3 for 600 paths", platform.batchCalls)
+	}
+	if len(platform.isExcludedCalls) != 0 {
+		t.Fatalf("serial fallback calls = %d, want literal 0 after valid batches", len(platform.isExcludedCalls))
+	}
+}
+
+func TestWideInclusionBatchFailureRetriesAndAttributesEachPath(t *testing.T) {
+	paths := []string{"/literal/a.txt", "/literal/b.txt", "/literal/c.txt"}
+	changes := make([]Change, len(paths))
+	indexes := make([]int, len(paths))
+	for index, path := range paths {
+		changes[index] = Change{Kind: "created", Path: path, After: &Entry{Type: "file"}}
+		indexes[index] = index
+	}
+	backstop := Backstop{Available: true, Snapshots: []VolumeSnapshot{{
+		Name: "literal-snapshot", VolumeID: "review-disk", MountPoint: "/",
+	}}}
+	t.Run("single retries succeed", func(t *testing.T) {
+		platform := &reviewRoundPlatform{
+			batchErr: errors.New("literal batch diagnostic"),
+			excluded: map[string]bool{"/literal/b.txt": true},
+		}
+		failures := classifyWideChanges(context.Background(), changes, indexes, platform, &backstop, nil)
+		if len(failures) != 0 {
+			t.Fatalf("fallback failures = %#v, want none", failures)
+		}
+		if platform.batchCalls != 4 || len(platform.isExcludedCalls) != 3 {
+			t.Fatalf("batch calls = %d, single retries = %d, want independent literals 4 and 3", platform.batchCalls, len(platform.isExcludedCalls))
+		}
+	})
+	t.Run("single retries fail independently", func(t *testing.T) {
+		failedChanges := append([]Change(nil), changes...)
+		platform := &reviewRoundPlatform{
+			batchErr:  errors.New("literal batch diagnostic"),
+			singleErr: errors.New("literal single failure"),
+		}
+		failures := classifyWideChanges(context.Background(), failedChanges, indexes, platform, &backstop, nil)
+		if len(failures) != 3 {
+			t.Fatalf("fallback failures = %#v, want independent literal 3", failures)
+		}
+		for index, path := range paths {
+			if failures[index].Path != path || !strings.Contains(failures[index].Error, "literal single failure") {
+				t.Fatalf("failure %d = %#v, want path %q and literal single error", index, failures[index], path)
+			}
+		}
+	})
+}
+
+func TestWideInclusionChecksUnsafePathsIndividually(t *testing.T) {
+	paths := []string{
+		"/literal/normal-a.txt", "/literal/normal-b.txt",
+		"/literal/draft .txt", "/literal/line\nbreak.txt",
+	}
+	changes := make([]Change, len(paths))
+	indexes := make([]int, len(paths))
+	for index, path := range paths {
+		changes[index] = Change{Kind: "created", Path: path, After: &Entry{Type: "file"}}
+		indexes[index] = index
+	}
+	platform := &reviewRoundPlatform{}
+	backstop := Backstop{Available: true, Snapshots: []VolumeSnapshot{{Name: "literal", VolumeID: "review-disk", MountPoint: "/"}}}
+	if failures := classifyWideChanges(context.Background(), changes, indexes, platform, &backstop, nil); len(failures) != 0 {
+		t.Fatalf("classification failures = %#v", failures)
+	}
+	if platform.batchCalls != 3 || len(platform.isExcludedCalls) != 2 {
+		t.Fatalf("calls = %d batches/%d singles, want independent literals 3/2", platform.batchCalls, len(platform.isExcludedCalls))
+	}
+	var safeBatch []string
+	for _, batch := range platform.batchPaths {
+		if len(batch) == 2 {
+			safeBatch = batch
+		}
+	}
+	if len(safeBatch) != 2 || safeBatch[0] != "/literal/normal-a.txt" || safeBatch[1] != "/literal/normal-b.txt" {
+		t.Fatalf("safe batch = %#v, want two independent normal paths", safeBatch)
+	}
+}
+
+func TestWideInclusionDepthOrderingOnlyInheritsExcludedAncestors(t *testing.T) {
+	paths := []string{
+		"/literal/excluded", "/literal/excluded/deep/child.txt",
+		"/literal/included", "/literal/included/deep/child.txt",
+	}
+	changes := make([]Change, len(paths))
+	indexes := make([]int, len(paths))
+	for index, path := range paths {
+		changes[index] = Change{Kind: "created", Path: path, After: &Entry{Type: "file"}}
+		indexes[index] = index
+	}
+	platform := &reviewRoundPlatform{excluded: map[string]bool{"/literal/excluded": true}}
+	backstop := Backstop{Available: true, Snapshots: []VolumeSnapshot{{Name: "literal", VolumeID: "review-disk", MountPoint: "/"}}}
+	if failures := classifyWideChanges(context.Background(), changes, indexes, platform, &backstop, nil); len(failures) != 0 {
+		t.Fatalf("classification failures = %#v", failures)
+	}
+	checked := strings.Join(flattenReviewBatches(platform.batchPaths), "\n")
+	if strings.Contains(checked, "/literal/excluded/deep/child.txt") {
+		t.Fatalf("excluded descendant was redundantly checked:\n%s", checked)
+	}
+	for _, literal := range []string{"/literal/excluded", "/literal/included", "/literal/included/deep/child.txt"} {
+		if !strings.Contains(checked, literal) {
+			t.Fatalf("depth-ordered checks omitted %q:\n%s", literal, checked)
+		}
+	}
+}
+
+func flattenReviewBatches(batches [][]string) []string {
+	var paths []string
+	for _, batch := range batches {
+		paths = append(paths, batch...)
+	}
+	return paths
 }
 
 func (platform *reviewRoundPlatform) ListSnapshots(Volume) ([]string, error) {
@@ -117,8 +277,155 @@ func TestSealChecksEveryIncludedChangedPathForTimeMachineExclusion(t *testing.T)
 	if len(summary.Changes) != 500 {
 		t.Fatalf("changes = %d, want 500", len(summary.Changes))
 	}
-	if len(platform.isExcludedCalls) != 500 {
-		t.Fatalf("IsExcluded call count = %d, want one exact lookup for each of 500 included changed paths", len(platform.isExcludedCalls))
+	if got := len(flattenReviewBatches(platform.batchPaths)); got != 500 {
+		t.Fatalf("paths submitted for inclusion = %d, want independent literal 500", got)
+	}
+	if platform.batchCalls != 2 || len(platform.isExcludedCalls) != 0 {
+		t.Fatalf("classification used %d batches and %d serial fallbacks, want independent literals 2 and 0", platform.batchCalls, len(platform.isExcludedCalls))
+	}
+}
+
+func TestCanceledFilesystemWalkPublishesInterruptedManifestWithoutUncapturedSnapshotClaim(t *testing.T) {
+	stateDir := t.TempDir()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "literal.txt"), []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, _, err := StartScope(stateDir, "canceled-filesystem-walk", Scope{
+		Watched: []string{root},
+	}, 1<<30, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	summary := session.SealContext(ctx, time.Unix(2, 0), nil)
+	if summary.Complete || !summary.Interrupted {
+		t.Fatalf("canceled walk summary = %#v, want incomplete interrupted", summary)
+	}
+	for _, failure := range summary.Uncaptured {
+		if failure.Path == root || strings.Contains(failure.Error, context.Canceled.Error()) {
+			t.Fatalf("canceled post-session walk was mislabeled as uncaptured snapshot: %#v", summary.Uncaptured)
+		}
+	}
+	if len(summary.PostSessionFailures) != 1 || summary.PostSessionFailures[0].Path != root || summary.PostSessionFailures[0].Error != context.Canceled.Error() {
+		t.Fatalf("post-session failures = %#v, want independent canceled-walk literal", summary.PostSessionFailures)
+	}
+	stored, err := LoadSealedSummary(stateDir, "canceled-filesystem-walk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Complete || !stored.Interrupted {
+		t.Fatalf("first published sealed manifest lost interruption: %#v", stored)
+	}
+}
+
+func TestPartlyCanceledFilesystemWalkDoesNotFabricateDeletions(t *testing.T) {
+	stateDir := t.TempDir()
+	root := t.TempDir()
+	for _, name := range []string{"alpha.txt", "bravo.txt", "charlie.txt"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("unchanged"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	session, _, err := StartScope(stateDir, "partly-canceled-filesystem-walk", Scope{
+		Watched: []string{root},
+	}, 1<<30, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	visited := 0
+	restoreHook := SetScanPathHookForTest(func(hookContext context.Context, _ string) {
+		if hookContext != ctx {
+			return
+		}
+		visited++
+		if visited == 2 {
+			cancel()
+		}
+	})
+	defer restoreHook()
+	summary := session.SealContext(ctx, time.Unix(2, 0), nil)
+	if visited != 2 {
+		t.Fatalf("walk visited %d paths before cancellation, want independent literal 2", visited)
+	}
+	if len(summary.Changes) != 0 {
+		t.Fatalf("recorded %d changes for an unchanged tree, want independent literal 0: %#v", len(summary.Changes), summary.Changes)
+	}
+	if len(summary.Unscanned) != 1 || summary.Unscanned[0].Path != root {
+		t.Fatalf("unscanned roots = %#v, want the independently selected watched root", summary.Unscanned)
+	}
+	stored, err := LoadSealedSummary(stateDir, "partly-canceled-filesystem-walk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Changes) != 0 {
+		t.Fatalf("stored manifest recorded %d fabricated changes, want independent literal 0: %#v", len(stored.Changes), stored.Changes)
+	}
+	if len(stored.Unscanned) != 1 || stored.Unscanned[0].Path != root {
+		t.Fatalf("stored unscanned roots = %#v, want the independently selected watched root", stored.Unscanned)
+	}
+}
+
+func TestUnavailableCloneRootKeepsCompleteWideAndSiblingChanges(t *testing.T) {
+	stateDir := t.TempDir()
+	home := t.TempDir()
+	removedRoot := filepath.Join(home, "removed-project")
+	scannedRoot := filepath.Join(home, "scanned-project")
+	for _, root := range []string{removedRoot, scannedRoot} {
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removedOne := filepath.Join(removedRoot, "one.txt")
+	removedTwo := filepath.Join(removedRoot, "two.txt")
+	scannedFile := filepath.Join(scannedRoot, "kept.txt")
+	for path, contents := range map[string]string{
+		removedOne: "one", removedTwo: "two", scannedFile: "before",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	platform := &reviewRoundPlatform{excluded: map[string]bool{}}
+	restorePlatform := SetVolumeSnapshotPlatformForTest(platform)
+	defer restorePlatform()
+	session, _, err := StartScope(stateDir, "unavailable-root-wide-observation", Scope{
+		Watched:         []string{removedRoot, scannedRoot},
+		ChangeListScope: ChangeListScopeHomeAndClone,
+		ChangeListRoots: []string{home},
+		ScanRoot:        home,
+	}, 1<<30, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(removedRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scannedFile, []byte("after-content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	summary := session.Seal(time.Unix(2, 0))
+	if len(summary.Unscanned) != 1 || summary.Unscanned[0].Path != removedRoot ||
+		!strings.Contains(summary.Unscanned[0].Error, "no longer resolves") {
+		t.Fatalf("unscanned roots = %#v, want independently removed project root", summary.Unscanned)
+	}
+	wantKinds := map[string]string{
+		removedRoot: "deleted", removedOne: "deleted", removedTwo: "deleted", scannedFile: "modified",
+	}
+	if len(summary.Changes) != 4 {
+		t.Fatalf("changes = %d, want independent literal 4: %#v", len(summary.Changes), summary.Changes)
+	}
+	for _, change := range summary.Changes {
+		wantKind, ok := wantKinds[change.Path]
+		if !ok || change.Kind != wantKind {
+			t.Fatalf("unexpected change %#v; literal expectations = %#v", change, wantKinds)
+		}
+		delete(wantKinds, change.Path)
+	}
+	if len(wantKinds) != 0 {
+		t.Fatalf("fully observed changes were hidden: %#v", wantKinds)
 	}
 }
 

@@ -20,6 +20,8 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -37,16 +39,32 @@ import (
 )
 
 const (
-	internalErrorExitCode   = 1
-	usageExitCode           = 2
-	defaultReviewWidth      = 80
-	defaultSessionListLimit = 50
+	internalErrorExitCode         = 1
+	usageExitCode                 = 2
+	defaultReviewWidth            = 80
+	defaultSessionListLimit       = 50
+	completionKindNoDecision      = "no_decision_needed"
+	completionKindDefaultDiscard  = "noninteractive_default_discard"
+	completionKindExplicitDiscard = "explicit_discard"
+	completionKindAbnormalDiscard = "abnormal_discard"
 
-	quietSessionDisclosure = "unring: nothing intercepted. Outbound is not covered unless --outbound was given. Not visible to unring: SSH/git push, raw sockets, unshimmed CLIs."
-	homeScanExclusions     = "Library, node_modules, .git, .cache, and go/pkg"
+	quietSessionDisclosure         = "unring: Files changed: 0; the post-session scan completed. Nothing intercepted. Outbound is not covered unless --outbound was given. Not visible to unring: SSH/git push, raw sockets, unshimmed CLIs."
+	quietSessionActivityDisclosure = "unring: nothing intercepted. Outbound is not covered unless --outbound was given. Not visible to unring: SSH/git push, raw sockets, unshimmed CLIs."
+	homeScanExclusions             = "Library, node_modules, .git, .cache, and go/pkg"
 )
 
 type stringListFlag []string
+
+type synchronizedWriter struct {
+	mu     sync.Mutex
+	writer io.Writer
+}
+
+func (writer *synchronizedWriter) Write(data []byte) (int, error) {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	return writer.writer.Write(data)
+}
 
 func (values *stringListFlag) String() string { return strings.Join(*values, ",") }
 
@@ -75,6 +93,14 @@ type unconfiguredPostgresSession struct {
 func newUnconfiguredPostgresSession() *unconfiguredPostgresSession {
 	return &unconfiguredPostgresSession{done: make(chan struct{})}
 }
+
+var unconfiguredPostgresSessionFactory = func() postgresSession {
+	return newUnconfiguredPostgresSession()
+}
+
+var automaticRetentionTestHook func(context.Context)
+var automaticRetentionProgressInterval = 2 * time.Second
+var sealProgressInterval = 2 * time.Second
 
 func (session *unconfiguredPostgresSession) Address() string {
 	return ""
@@ -151,6 +177,7 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 }
 
 func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitCode int) {
+	stderr = &synchronizedWriter{writer: stderr}
 	flags := flag.NewFlagSet("unring run", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	forceCommit := flags.Bool("commit", false, "commit without prompting")
@@ -194,6 +221,16 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		fmt.Fprintln(stderr, "unring: --snapshot-cap-bytes must be non-negative")
 		return usageExitCode
 	}
+	signalChannel := make(chan os.Signal, 4)
+	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGPIPE)
+	postChildSignals := startPostChildSignalHandler(signalChannel, stderr)
+	postChildSignals.SetPhase("session initialization")
+	defer func() {
+		if received := postChildSignals.Stop(); received != nil {
+			exitCode = exitCodeForSignal(received)
+		}
+		signal.Stop(signalChannel)
+	}()
 	auditStore, err := audit.OpenStore()
 	if err != nil {
 		fmt.Fprintf(stderr, "unring: open audit log: %v\n", err)
@@ -246,53 +283,42 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		return internalErrorExitCode
 	}
 	auditRecord := auditSession.Snapshot()
-	if scope.ScanRoot != "" && os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") == "" {
-		fmt.Fprintf(stderr,
-			"unring: scanning %s for the widened change list; this metadata scan may take several seconds and excludes %s.\n",
-			scope.ScanRoot, homeScanExclusions)
-	} else if scope.ScanError != "" {
-		fmt.Fprintf(stderr, "unring: WIDENED CHANGE LIST UNAVAILABLE: %s\n", scope.ScanError)
-	}
-	fileSession, fileSummary, err := localrollback.StartScope(
-		auditStore.StateDir(), auditRecord.ID, scope, capBytes, auditRecord.StartedAt,
-	)
-	if err != nil {
-		_ = finishNotStarted(auditSession, *outboundEnabled, internalErrorExitCode, err,
-			localrollback.Summary{
-				Watched: watchPaths, Complete: false, Error: err.Error(),
-				RetentionCap: capBytes, Retained: false,
-			})
-		fmt.Fprintf(stderr, "unring: create file snapshot: %v\n", err)
-		return internalErrorExitCode
-	}
-	if err := auditSession.Update(func(record *audit.Record) {
-		record.Files = fileSummary
-		record.Outbound = *outboundEnabled
-		if !*outboundEnabled {
-			record.HTTPS = httpsproxy.Summary{Sealed: true, Finalized: true}
-			record.GH = ghshim.Summary{Sealed: true}
-		}
-	}); err != nil {
-		_ = finishNotStarted(auditSession, *outboundEnabled, internalErrorExitCode, err, fileSummary)
-		fmt.Fprintf(stderr, "unring: record file snapshot: %v\n", err)
-		return internalErrorExitCode
-	}
-	applyAutomaticRetention(auditStore, auditRecord.ID, capBytes, scope.RetentionDays, &fileSummary, stderr)
-	if err := auditSession.Update(func(record *audit.Record) { record.Files = fileSummary }); err != nil {
-		fmt.Fprintf(stderr, "unring: record start-time retention: %v\n", err)
-		return internalErrorExitCode
-	}
-	printSnapshotStarted(stderr, fileSummary)
-
+	var fileSession *localrollback.Session
+	var fileSealed bool
+	fileSummary := localrollback.Summary{Watched: watchPaths, Complete: false, Retained: false}
 	var proxy postgresSession
 	var httpsProxy *httpsproxy.Proxy
 	var ghSession *ghshim.Session
 	var finalized bool
 	var auditError string
 	requestedDecision := "discard"
+	completionKind := ""
+
+	postChildSignals.SetPhase("the pre-session filesystem scan")
 	defer func() {
+		received := postChildSignals.First()
+		if received != nil {
+			completionKind = completionKindAbnormalDiscard
+			requestedDecision = "discard"
+			exitCode = exitCodeForSignal(received)
+		}
 		recovered := recover()
 		outcome := ""
+		if received != nil {
+			outcome = "discarded"
+			if fileSession != nil && !fileSealed {
+				phase := fileSummary.InterruptedPhase
+				if phase == "" {
+					phase = postChildSignals.Phase()
+				}
+				evicted := append([]string(nil), fileSummary.Evicted...)
+				retentionEvents := append([]localrollback.RetentionEvent(nil), fileSummary.RetentionEvents...)
+				fileSummary = fileSession.SealInterruptedContext(postChildSignals.Context(), time.Now(), phase)
+				fileSummary.Evicted = append(evicted, fileSummary.Evicted...)
+				fileSummary.RetentionEvents = append(retentionEvents, fileSummary.RetentionEvents...)
+				fileSealed = true
+			}
+		}
 		if proxy != nil && !finalized {
 			closeErr := proxy.Close()
 			if closeErr == nil {
@@ -313,16 +339,21 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			}
 		}
 		if recovered != nil {
+			completionKind = completionKindAbnormalDiscard
 			auditError = fmt.Sprintf("panic: %v", recovered)
 			if exitCode == 0 {
 				exitCode = internalErrorExitCode
 			}
+		}
+		if outcome == "discarded" && completionKind == "" {
+			completionKind = completionKindAbnormalDiscard
 		}
 		saveErr := auditSession.Update(func(record *audit.Record) {
 			record.EndedAt = time.Now().UTC()
 			record.ExitCode = exitCode
 			record.Error = strings.TrimPrefix(auditError, "\n")
 			record.Decision = requestedDecision
+			record.CompletionKind = completionKind
 			record.Outbound = *outboundEnabled
 			record.Files = fileSummary
 			if proxy != nil {
@@ -346,10 +377,88 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 				exitCode = internalErrorExitCode
 			}
 		}
+		finalReceived := postChildSignals.Stop()
+		signal.Stop(signalChannel)
+		if received == nil && finalReceived != nil {
+			completionKind = completionKindAbnormalDiscard
+			requestedDecision = "discard"
+			exitCode = exitCodeForSignal(finalReceived)
+			lateSaveErr := auditSession.Update(func(record *audit.Record) {
+				record.EndedAt = time.Now().UTC()
+				record.ExitCode = exitCode
+				record.Decision = requestedDecision
+				record.CompletionKind = completionKind
+				record.Outcome = "discarded"
+				record.Files = fileSummary
+			})
+			if lateSaveErr != nil && exitCode == 0 {
+				exitCode = internalErrorExitCode
+			}
+		}
 		if recovered != nil {
 			panic(recovered)
 		}
 	}()
+	if scope.ScanRoot != "" && os.Getenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP") == "" {
+		fmt.Fprintf(stderr,
+			"unring: scanning %s for the widened change list; this metadata scan may take several seconds and excludes %s.\n",
+			scope.ScanRoot, homeScanExclusions)
+	} else if scope.ScanError != "" {
+		fmt.Fprintf(stderr, "unring: WIDENED CHANGE LIST UNAVAILABLE: %s\n", scope.ScanError)
+	}
+	fileSession, fileSummary, err = localrollback.StartScopeContext(
+		postChildSignals.Context(),
+		auditStore.StateDir(), auditRecord.ID, scope, capBytes, auditRecord.StartedAt,
+	)
+	if err != nil {
+		if received := postChildSignals.First(); received != nil {
+			fileSummary = localrollback.Summary{
+				Watched: watchPaths, Complete: false, Interrupted: true, Retained: false,
+				InterruptedPhase: "pre-session filesystem scan",
+				Storage:          "not created",
+				Error:            "pre-session filesystem scan interrupted: " + postChildSignals.Context().Err().Error(),
+			}
+			auditError = fileSummary.Error
+			completionKind = completionKindAbnormalDiscard
+			return exitCodeForSignal(received)
+		}
+		_ = finishNotStarted(auditSession, *outboundEnabled, internalErrorExitCode, err,
+			localrollback.Summary{
+				Watched: watchPaths, Complete: false, Error: err.Error(),
+				RetentionCap: capBytes, Retained: false,
+			})
+		fmt.Fprintf(stderr, "unring: create file snapshot: %v\n", err)
+		return internalErrorExitCode
+	}
+	if err := auditSession.Update(func(record *audit.Record) {
+		record.Files = fileSummary
+		record.Outbound = *outboundEnabled
+		if !*outboundEnabled {
+			record.HTTPS = httpsproxy.Summary{Sealed: true, Finalized: true}
+			record.GH = ghshim.Summary{Sealed: true}
+		}
+	}); err != nil {
+		_ = finishNotStarted(auditSession, *outboundEnabled, internalErrorExitCode, err, fileSummary)
+		fmt.Fprintf(stderr, "unring: record file snapshot: %v\n", err)
+		return internalErrorExitCode
+	}
+	postChildSignals.SetPhase("automatic retention before the child starts")
+	applyAutomaticRetention(postChildSignals.Context(), auditStore, auditRecord.ID, capBytes, scope.RetentionDays, &fileSummary, stderr, postChildSignals.Progressf)
+	if received := postChildSignals.First(); received != nil {
+		fileSummary.Complete = false
+		fileSummary.Interrupted = true
+		fileSummary.InterruptedPhase = "automatic retention before the child started"
+		fileSummary.Error = joinErrorText(fileSummary.Error, fmt.Errorf("automatic retention interrupted before the child started: %w", postChildSignals.Context().Err()))
+		auditError = joinErrorText(auditError, errors.New(fileSummary.Error))
+		completionKind = completionKindAbnormalDiscard
+		return exitCodeForSignal(received)
+	}
+	if err := auditSession.Update(func(record *audit.Record) { record.Files = fileSummary }); err != nil {
+		fmt.Fprintf(stderr, "unring: record start-time retention: %v\n", err)
+		return internalErrorExitCode
+	}
+	printSnapshotStarted(stderr, fileSummary)
+	postChildSignals.SetPhase("session setup")
 
 	backendConfig, databaseConfigured, err := parseOptionalBackendConfig()
 	if err != nil {
@@ -550,47 +659,78 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		}
 		childEnvironment = ghSession.Environment(childEnvironment)
 	}
-
-	signalChannel := make(chan os.Signal, 2)
-	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signalChannel)
+	if received := postChildSignals.First(); received != nil {
+		fileSummary.Complete = false
+		fileSummary.Interrupted = true
+		fileSummary.InterruptedPhase = "session setup"
+		fileSummary.Error = joinErrorText(fileSummary.Error, fmt.Errorf("session setup interrupted: %w", postChildSignals.Context().Err()))
+		auditError = joinErrorText(auditError, errors.New(fileSummary.Error))
+		completionKind = completionKindAbnormalDiscard
+		return exitCodeForSignal(received)
+	}
 
 	if !databaseConfigured {
 		// Assign the no-op database session only when every startup step has
 		// succeeded and the child is about to run. Earlier failures must retain
 		// the audit record's not_started outcome.
-		proxy = newUnconfiguredPostgresSession()
+		proxy = unconfiguredPostgresSessionFactory()
 	}
+	childSignals := make(chan os.Signal, 4)
+	postChildSignals.SetPhase("the child command")
+	postChildSignals.SetForward(childSignals)
 	result := runner.Run(runner.Options{
 		Command:   command,
 		Env:       childEnvironment,
 		Stdin:     stdin,
 		Stdout:    stdout,
 		Stderr:    stderr,
-		Signals:   signalChannel,
+		Signals:   childSignals,
 		Abort:     proxy.Done(),
 		Approvals: approvalRequests,
 	})
-	interrupted := result.Interrupted || pendingSignal(signalChannel)
+	scanContext := postChildSignals.ResetPhaseContext("post-session scan")
+	postChildSignals.SetForward(nil)
+	interrupted := result.Interrupted
+	observePostChildSignal := func() {
+		if received := postChildSignals.First(); received != nil {
+			interrupted = true
+			result.ExitCode = exitCodeForSignal(received)
+			completionKind = completionKindAbnormalDiscard
+			requestedDecision = "discard"
+		}
+	}
+	postChildPhaseParent := func() context.Context {
+		if interrupted {
+			return context.Background()
+		}
+		return postChildSignals.Context()
+	}
 	if result.Err != nil {
 		auditError = joinErrorText(auditError, result.Err)
 	}
 	printScanFinishing(stderr, fileSummary)
 	startEvicted := append([]string(nil), fileSummary.Evicted...)
 	startRetentionEvents := append([]localrollback.RetentionEvent(nil), fileSummary.RetentionEvents...)
-	fileSummary = fileSession.Seal(time.Now())
+	fileSummary = sealFileSession(scanContext, fileSession, postChildSignals.Progressf)
+	fileSealed = true
+	observePostChildSignal()
 	fileSummary.Evicted = append(startEvicted, fileSummary.Evicted...)
 	fileSummary.RetentionEvents = append(startRetentionEvents, fileSummary.RetentionEvents...)
 	printScanFinished(stderr, fileSummary)
-	applyAutomaticRetention(auditStore, auditRecord.ID, capBytes, scope.RetentionDays, &fileSummary, stderr)
+	postChildSignals.SetPhase("automatic retention")
+	applyAutomaticRetention(postChildSignals.Context(), auditStore, auditRecord.ID, capBytes, scope.RetentionDays, &fileSummary, stderr, postChildSignals.Progressf)
+	observePostChildSignal()
+	postChildSignals.SetPhase("session review output")
 	if !fileSummary.Complete {
-		if hasActionableFileCoverageFailure(fileSummary) {
+		if fileSummary.Interrupted {
+			fmt.Fprintf(stderr, "unring: FILE CHANGE LIST INCOMPLETE: the post-session scan was interrupted; the recorded list may omit file changes. Run unring log --json %s for precise diagnostic details.\n", auditRecord.ID)
+		} else if hasActionableFileCoverageFailure(fileSummary) {
 			fmt.Fprintf(stderr, "unring: FILE COVERAGE INCOMPLETE: %s\n", fileSummary.Error)
 		} else {
 			fmt.Fprintln(stderr, "unring: FILE COVERAGE NOTE: unsupported file types remain recorded but cannot be restored per path.")
 		}
 	}
-	printFileChanges(stdout, auditRecord.ID, fileSummary)
+	printFileChanges(stdout, auditRecord.ID, fileSummary, !databaseConfigured)
 	if err := auditSession.Update(func(record *audit.Record) { record.Files = fileSummary }); err != nil {
 		auditError = joinErrorText(auditError, err)
 		fmt.Fprintf(stderr, "unring: record file changes: %v\n", err)
@@ -601,20 +741,41 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	var ghSealErr error
 	var httpsSealErr error
 	if *outboundEnabled {
-		ghSealContext, ghSealCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		postChildSignals.SetPhase("gh sealing")
+		ghSealContext, ghSealCancel := context.WithTimeout(postChildPhaseParent(), 10*time.Second)
 		ghSealErr = ghSession.Seal(ghSealContext)
 		ghSealCancel()
+		observePostChildSignal()
+		if interrupted && errors.Is(ghSealErr, context.Canceled) {
+			ghSealContext, ghSealCancel = context.WithTimeout(context.Background(), 10*time.Second)
+			ghSealErr = ghSession.Seal(ghSealContext)
+			ghSealCancel()
+		}
 		ghSummary = ghSession.Summary()
 
-		httpsSealContext, httpsSealCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		postChildSignals.SetPhase("HTTPS sealing")
+		httpsSealContext, httpsSealCancel := context.WithTimeout(postChildPhaseParent(), 10*time.Second)
 		httpsSealErr = httpsProxy.Seal(httpsSealContext)
 		httpsSealCancel()
+		observePostChildSignal()
+		if interrupted && errors.Is(httpsSealErr, context.Canceled) {
+			httpsSealContext, httpsSealCancel = context.WithTimeout(context.Background(), 10*time.Second)
+			httpsSealErr = httpsProxy.Seal(httpsSealContext)
+			httpsSealCancel()
+		}
 		httpsSummary = httpsProxy.Summary()
 	}
 
-	sealContext, sealCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	postChildSignals.SetPhase("Postgres sealing")
+	sealContext, sealCancel := context.WithTimeout(postChildPhaseParent(), 10*time.Second)
 	sealErr := proxy.Seal(sealContext)
 	sealCancel()
+	observePostChildSignal()
+	if interrupted && errors.Is(sealErr, context.Canceled) {
+		sealContext, sealCancel = context.WithTimeout(context.Background(), 10*time.Second)
+		sealErr = proxy.Seal(sealContext)
+		sealCancel()
+	}
 	summary := proxy.Summary()
 
 	postgresInterceptionErr := sealErr
@@ -646,6 +807,13 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 
 	if interceptionErr == nil && !summary.HasReviewableActivity() &&
 		!httpsSummary.HasReviewableActivity() && !ghSummary.HasReviewableActivity() {
+		completionKind = completionKindNoDecision
+		if *forceDiscard {
+			completionKind = completionKindExplicitDiscard
+		}
+		if interrupted || result.Err != nil || result.ExitCode != 0 || fileCoverageEndedAbnormally(fileSummary) {
+			completionKind = completionKindAbnormalDiscard
+		}
 		if result.Err != nil {
 			fmt.Fprintf(stderr, "unring: %v\n", result.Err)
 		}
@@ -659,9 +827,14 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			}
 			printCoverageOnlyReview(stdout, summary)
 		} else {
-			fmt.Fprintln(stderr, quietSessionDisclosure)
+			disclosure := quietSessionDisclosure
+			if !fileSummary.Complete || len(fileSummary.Changes) != 0 {
+				disclosure = quietSessionActivityDisclosure
+			}
+			fmt.Fprintln(stderr, disclosure)
 		}
-		finalizeContext, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		postChildSignals.SetPhase("discard finalization")
+		finalizeContext, finalizeCancel := context.WithTimeout(postChildPhaseParent(), 10*time.Second)
 		var ghFinalizeErr error
 		var httpsFinalizeErr error
 		if *outboundEnabled {
@@ -673,6 +846,22 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			proxy.Finalize(finalizeContext, pgproxy.DecisionRollback),
 		)
 		finalizeCancel()
+		observePostChildSignal()
+		if interrupted && errors.Is(finalizeErr, context.Canceled) {
+			postChildSignals.SetPhase("safe discard finalization")
+			finalizeContext, finalizeCancel = context.WithTimeout(context.Background(), 10*time.Second)
+			ghFinalizeErr = nil
+			httpsFinalizeErr = nil
+			if *outboundEnabled {
+				ghFinalizeErr = ghSession.Finalize(finalizeContext, false)
+				httpsFinalizeErr = httpsProxy.Finalize(finalizeContext, false)
+			}
+			finalizeErr = errors.Join(
+				ghFinalizeErr, httpsFinalizeErr,
+				proxy.Finalize(finalizeContext, pgproxy.DecisionRollback),
+			)
+			finalizeCancel()
+		}
 		if finalizeErr != nil {
 			finalized = true
 			auditError = finalizeErr.Error()
@@ -717,6 +906,8 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	}
 
 	decision := pgproxy.DecisionRollback
+	defaultDiscard := false
+	postChildSignals.SetPhase("the final decision")
 	switch {
 	case interceptionErr != nil:
 		// Rollback remains the only safe request, but Finalize will report
@@ -736,7 +927,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		if useTUI {
 			var reviewErr error
 			decision, interrupted, reviewErr = reviewDecisionWithSignal(
-				stdin, stdout, signalChannel, summary, httpsSummary, ghSummary,
+				stdin, stdout, postChildSignals.Context(), summary, httpsSummary, ghSummary,
 			)
 			if reviewErr != nil {
 				fmt.Fprintf(stderr, "unring: %v; defaulting to discard\n", reviewErr)
@@ -744,16 +935,25 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			}
 		} else {
 			var promptInterrupted bool
-			decision, promptInterrupted = promptDecisionWithSignal(stdin, stdout, signalChannel)
+			decision, promptInterrupted, defaultDiscard = promptDecisionWithSignal(
+				stdin, stdout, postChildSignals.Context().Done(),
+			)
 			interrupted = interrupted || promptInterrupted
 		}
 	}
 
-	if pendingSignal(signalChannel) {
-		interrupted = true
-	}
+	observePostChildSignal()
 	if interrupted {
 		decision = pgproxy.DecisionRollback
+	}
+	if decision == pgproxy.DecisionRollback {
+		completionKind = completionKindExplicitDiscard
+		if defaultDiscard {
+			completionKind = completionKindDefaultDiscard
+		}
+		if interrupted || result.Err != nil || result.ExitCode != 0 || interceptionErr != nil || fileCoverageEndedAbnormally(fileSummary) {
+			completionKind = completionKindAbnormalDiscard
+		}
 	}
 
 	if err := auditSession.Update(func(record *audit.Record) {
@@ -770,9 +970,16 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	commitExternal := decision == pgproxy.DecisionCommit
 	var ghFinalizeErr error
 	if *outboundEnabled {
-		ghFinalizeContext, ghFinalizeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		postChildSignals.SetPhase("gh finalization")
+		ghFinalizeContext, ghFinalizeCancel := context.WithTimeout(postChildPhaseParent(), 30*time.Second)
 		ghFinalizeErr = ghSession.Finalize(ghFinalizeContext, commitExternal)
 		ghFinalizeCancel()
+		observePostChildSignal()
+		if interrupted && errors.Is(ghFinalizeErr, context.Canceled) {
+			ghFinalizeContext, ghFinalizeCancel = context.WithTimeout(context.Background(), 30*time.Second)
+			ghFinalizeErr = ghSession.Finalize(ghFinalizeContext, false)
+			ghFinalizeCancel()
+		}
 	}
 	if ghFinalizeErr != nil {
 		auditError = joinErrorText(auditError, ghFinalizeErr)
@@ -780,9 +987,16 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	commitHTTPS := commitExternal && ghFinalizeErr == nil
 	var httpsFinalizeErr error
 	if *outboundEnabled {
-		httpsFinalizeContext, httpsFinalizeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		postChildSignals.SetPhase("HTTPS finalization")
+		httpsFinalizeContext, httpsFinalizeCancel := context.WithTimeout(postChildPhaseParent(), 30*time.Second)
 		httpsFinalizeErr = httpsProxy.Finalize(httpsFinalizeContext, commitHTTPS)
 		httpsFinalizeCancel()
+		observePostChildSignal()
+		if interrupted && errors.Is(httpsFinalizeErr, context.Canceled) {
+			httpsFinalizeContext, httpsFinalizeCancel = context.WithTimeout(context.Background(), 30*time.Second)
+			httpsFinalizeErr = httpsProxy.Finalize(httpsFinalizeContext, false)
+			httpsFinalizeCancel()
+		}
 	}
 	postgresDecision := decision
 	if httpsFinalizeErr != nil || ghFinalizeErr != nil {
@@ -791,9 +1005,16 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		postgresDecision = pgproxy.DecisionRollback
 		auditError = joinErrorText(auditError, httpsFinalizeErr)
 	}
-	finalizeContext, finalizeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	postChildSignals.SetPhase("Postgres finalization")
+	finalizeContext, finalizeCancel := context.WithTimeout(postChildPhaseParent(), 10*time.Second)
 	postgresFinalizeErr := proxy.Finalize(finalizeContext, postgresDecision)
 	finalizeCancel()
+	observePostChildSignal()
+	if interrupted && errors.Is(postgresFinalizeErr, context.Canceled) {
+		finalizeContext, finalizeCancel = context.WithTimeout(context.Background(), 10*time.Second)
+		postgresFinalizeErr = proxy.Finalize(finalizeContext, pgproxy.DecisionRollback)
+		finalizeCancel()
+	}
 	finalizeErr := errors.Join(ghFinalizeErr, httpsFinalizeErr, postgresFinalizeErr)
 	finalized = true
 	if finalizeErr != nil {
@@ -910,9 +1131,6 @@ func printSnapshotStarted(output io.Writer, summary localrollback.Summary) {
 	for _, failure := range summary.ScanFailures {
 		fmt.Fprintf(output, "unring: CHANGE-LIST SCAN INCOMPLETE: %s: %s\n", humanPath(failure.Path), failure.Error)
 	}
-	for _, evicted := range summary.Evicted {
-		fmt.Fprintf(output, "unring: retention evicted oldest snapshot %s.\n", evicted)
-	}
 	if summary.StorageExact && summary.StorageBytes > summary.RetentionCap {
 		fmt.Fprintf(output,
 			"unring: current snapshot uses %d measured bytes, above the %d-byte cap; it is retained for this session and becomes eligible for eviction later.\n",
@@ -987,8 +1205,259 @@ func printScanFinished(output io.Writer, summary localrollback.Summary) {
 		summary.ScanAfterFiles, summary.ScanAfterMillis)
 }
 
-func printFileChanges(output io.Writer, sessionID string, summary localrollback.Summary) {
+type postChildSignalHandler struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	input  <-chan os.Signal
+	output io.Writer
+	stop   chan struct{}
+	done   chan struct{}
+	once   sync.Once
+
+	mu          sync.Mutex
+	phase       string
+	first       os.Signal
+	secondNamed bool
+	forward     chan<- os.Signal
+	outputGate  sync.Mutex
+}
+
+func startPostChildSignalHandler(input <-chan os.Signal, output io.Writer) *postChildSignalHandler {
+	ctx, cancel := context.WithCancel(context.Background())
+	handler := &postChildSignalHandler{
+		ctx: ctx, cancel: cancel, input: input, output: output,
+		stop: make(chan struct{}), done: make(chan struct{}), phase: "post-session scan",
+	}
+	go handler.run()
+	return handler
+}
+
+func (handler *postChildSignalHandler) run() {
+	defer close(handler.done)
+	for {
+		select {
+		case received := <-handler.input:
+			handler.record(received)
+		case <-handler.stop:
+			for {
+				select {
+				case received := <-handler.input:
+					handler.record(received)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (handler *postChildSignalHandler) record(received os.Signal) {
+	handler.mu.Lock()
+	forward := handler.forward
+	phase := handler.phase
+	cancelPhase := handler.cancel
+	if handler.first == nil {
+		handler.first = received
+		handler.mu.Unlock()
+		cancelPhase()
+		forwardSignal(forward, received)
+		handler.outputGate.Lock()
+		defer handler.outputGate.Unlock()
+		if phase == "post-session scan" {
+			fmt.Fprintf(handler.output, "unring: %s received during the post-session scan; stopping the scan and discarding the session.\n", postChildSignalName(received))
+			return
+		}
+		fmt.Fprintf(handler.output, "unring: %s received during %s; stopping that phase and discarding the session.\n", postChildSignalName(received), phase)
+		return
+	}
+	if !handler.secondNamed {
+		handler.secondNamed = true
+		handler.mu.Unlock()
+		cancelPhase()
+		forwardSignal(forward, received)
+		handler.outputGate.Lock()
+		defer handler.outputGate.Unlock()
+		fmt.Fprintf(handler.output, "unring: second signal received (%s); safe discard finalization is already in progress and will not be skipped.\n", postChildSignalName(received))
+		if phase == "post-session scan" {
+			fmt.Fprintln(handler.output, "unring: the active post-session scan is also being stopped; the first signal still determines the exit status.")
+		}
+		return
+	}
+	handler.mu.Unlock()
+	cancelPhase()
+	forwardSignal(forward, received)
+}
+
+func forwardSignal(destination chan<- os.Signal, received os.Signal) {
+	if destination == nil {
+		return
+	}
+	select {
+	case destination <- received:
+	default:
+	}
+}
+
+func (handler *postChildSignalHandler) Context() context.Context {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	return handler.ctx
+}
+
+func (handler *postChildSignalHandler) SetPhase(phase string) {
+	handler.mu.Lock()
+	handler.phase = phase
+	handler.mu.Unlock()
+}
+
+// ResetPhaseContext establishes a fresh cancellation boundary at a phase
+// transition. In particular, a child signal remains the run's disposition but
+// does not pre-cancel the evidence-producing post-session scan.
+func (handler *postChildSignalHandler) ResetPhaseContext(phase string) context.Context {
+	handler.mu.Lock()
+	previousCancel := handler.cancel
+	ctx, cancel := context.WithCancel(context.Background())
+	handler.ctx = ctx
+	handler.cancel = cancel
+	handler.phase = phase
+	handler.mu.Unlock()
+	previousCancel()
+	return ctx
+}
+
+func (handler *postChildSignalHandler) Phase() string {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	return handler.phase
+}
+
+func (handler *postChildSignalHandler) SetForward(destination chan<- os.Signal) {
+	handler.mu.Lock()
+	handler.forward = destination
+	handler.mu.Unlock()
+}
+
+func (handler *postChildSignalHandler) Progressf(format string, arguments ...any) {
+	handler.outputGate.Lock()
+	defer handler.outputGate.Unlock()
+	if handler.Context().Err() != nil {
+		return
+	}
+	fmt.Fprintf(handler.output, format, arguments...)
+}
+
+func (handler *postChildSignalHandler) First() os.Signal {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	return handler.first
+}
+
+func (handler *postChildSignalHandler) Stop() os.Signal {
+	handler.once.Do(func() { close(handler.stop) })
+	<-handler.done
+	handler.mu.Lock()
+	cancel := handler.cancel
+	handler.mu.Unlock()
+	cancel()
+	return handler.First()
+}
+
+func sealFileSession(
+	ctx context.Context,
+	session *localrollback.Session,
+	progressf func(string, ...any),
+) localrollback.Summary {
+	type sealResult struct {
+		summary localrollback.Summary
+	}
+	results := make(chan sealResult, 1)
+	progress := make(chan localrollback.SealProgress, 1)
+	go func() {
+		summary := session.SealContext(ctx, time.Now(), func(update localrollback.SealProgress) {
+			select {
+			case progress <- update:
+			default:
+			}
+		})
+		results <- sealResult{summary: summary}
+	}()
+	ticker := time.NewTicker(sealProgressInterval)
+	defer ticker.Stop()
+	started := time.Now()
+	var latest localrollback.SealProgress
+	nextProgress := 0
+	for {
+		select {
+		case result := <-results:
+			return result.summary
+		case update := <-progress:
+			latest = update
+			if update.Total == 0 {
+				continue
+			}
+			step := update.Total / 10
+			if step < timeMachineProgressMinimumStep {
+				step = timeMachineProgressMinimumStep
+			}
+			if update.Completed == 0 || update.Completed == update.Total || update.Completed >= nextProgress {
+				progressf(
+					"unring: Time Machine inclusion progress: %d of %d changed paths checked in batches.\n",
+					update.Completed, update.Total)
+				nextProgress = update.Completed + step
+			}
+		case <-ticker.C:
+			if latest.Total > 0 {
+				progressf(
+					"unring: Time Machine inclusion is still running: %d of %d changed paths checked (%s elapsed).\n",
+					latest.Completed, latest.Total, time.Since(started).Round(time.Second))
+			} else {
+				progressf("unring: post-session filesystem scan is still running (%s elapsed).\n",
+					time.Since(started).Round(time.Second))
+			}
+		}
+	}
+}
+
+func postChildSignalName(signal os.Signal) string {
+	switch signal {
+	case os.Interrupt:
+		return "interrupt"
+	case syscall.SIGTERM:
+		return "termination signal"
+	case syscall.SIGHUP:
+		return "hangup signal"
+	default:
+		return signal.String()
+	}
+}
+
+const timeMachineProgressMinimumStep = 256
+
+func exitCodeForSignal(signal os.Signal) int {
+	if unixSignal, ok := signal.(syscall.Signal); ok {
+		return 128 + int(unixSignal)
+	}
+	return internalErrorExitCode
+}
+
+func printFileChanges(output io.Writer, sessionID string, summary localrollback.Summary, announceCompleteZero bool) {
+	if summary.Interrupted {
+		fmt.Fprintf(output, "File change list incomplete: the post-session scan was interrupted, so this session must not be treated as having no file changes. Run unring log --json %s for precise diagnostic details.\n", sessionID)
+	}
+	printUnscannedRoots(output, "", summary.Unscanned)
+	if summary.Interrupted {
+		if len(summary.Changes) == 0 {
+			return
+		}
+	}
 	if len(summary.Changes) == 0 {
+		if summary.Complete {
+			if announceCompleteZero {
+				fmt.Fprintln(output, "Files changed: 0 created, 0 modified, 0 deleted. The post-session scan completed.")
+			}
+		} else {
+			fmt.Fprintln(output, "File change list incomplete: the post-session scan did not produce a complete result, so this session must not be treated as having no file changes.")
+		}
 		return
 	}
 	created, modified, deleted := 0, 0, 0
@@ -1010,10 +1479,13 @@ func printFileChanges(output io.Writer, sessionID string, summary localrollback.
 		printAgentStateGroupingInference(output, "", agentStateRoots)
 	}
 	regular, agentState := groupAgentStateChanges(summary.Changes, agentStateRoots)
-	printLiveChanges(output, regular)
+	printChange := func(output io.Writer, change localrollback.Change) {
+		printLiveChange(output, change, summary.Interrupted)
+	}
+	printWatchedRootChangeGroups(output, regular, summary.Watched, summary.ChangeListRoots, sessionID, printChange)
 	if len(agentState) > 0 {
 		fmt.Fprintln(output, "AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
-		printLiveChanges(output, agentState)
+		printDeclaredRootChangeGroups(output, agentState, agentStateRoots, sessionID, "agent own-state changes", "AGENT-STATE ROOT CHANGES", printChange)
 	}
 	if summary.Retained && hasRestorableFileChange(summary.Changes) {
 		fmt.Fprintf(output, "Restore later with: unring restore %s\n", sessionID)
@@ -1024,22 +1496,30 @@ func printFileChanges(output io.Writer, sessionID string, summary localrollback.
 	}
 }
 
-func printLiveChanges(output io.Writer, changes []localrollback.Change) {
-	for _, change := range changes {
-		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, humanPath(change.Path))
-		if change.RestoreSource == localrollback.RestoreSourceVolume {
-			fmt.Fprintln(output, "             SNAPSHOT ONLY: restoring this path requires sudo to mount the APFS snapshot.")
-		} else if change.UnrestorableReason != "" {
-			fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
-		}
+func printLiveChange(output io.Writer, change localrollback.Change, interrupted bool) {
+	fmt.Fprintf(output, "  %-8s %s\n", change.Kind, humanPath(change.Path))
+	if change.RestoreSource == localrollback.RestoreSourceVolume {
+		fmt.Fprintln(output, "             SNAPSHOT ONLY: restoring this path requires sudo to mount the APFS snapshot.")
+	} else if change.UnrestorableReason != "" {
+		fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", humanUnrestorableReason(change.UnrestorableReason, interrupted))
 	}
 }
 
-func printAuditFiles(output io.Writer, summary localrollback.Summary) {
+func printAuditFiles(output io.Writer, sessionID string, summary localrollback.Summary) {
 	if len(summary.Watched) == 0 {
 		return
 	}
 	fmt.Fprintln(output, "\nFILES — RESTORE COVERAGE")
+	if len(summary.Changes) == 0 {
+		switch {
+		case summary.Interrupted:
+			fmt.Fprintf(output, "  %s\n", interruptedChangeListMessage(summary))
+		case summary.Complete:
+			fmt.Fprintln(output, "  Files changed: 0 created, 0 modified, 0 deleted. The post-session scan completed.")
+		default:
+			fmt.Fprintln(output, "  File change list incomplete: the post-session scan did not produce a complete result; zero changes must not be inferred.")
+		}
+	}
 	storageLabel := "measured storage bytes"
 	if !summary.StorageExact {
 		storageLabel = "storage-byte upper bound"
@@ -1047,21 +1527,31 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 	fmt.Fprintf(output, "  Snapshot: %s; %d %s (%d logical); retained: %t\n",
 		summary.Storage, summary.StorageBytes, storageLabel, summary.LogicalBytes, summary.Retained)
 	for _, failure := range summary.Uncaptured {
+		if summary.Interrupted && isInternalCancellationFailure(failure.Error) {
+			continue
+		}
 		printCaptureFailure(output, "  ", failure)
 	}
+	printUnscannedRoots(output, "  ", summary.Unscanned)
 	if summary.Backstop.Available {
 		for _, snapshot := range summary.Backstop.Snapshots {
 			fmt.Fprintf(output, "  Volume backstop: %s on %s\n", snapshot.Name, snapshot.MountPoint)
 		}
-	} else {
+	} else if summary.Backstop.Reason != "" {
 		fmt.Fprintf(output, "  NO WHOLE-VOLUME BACKSTOP: %s\n", summary.Backstop.Reason)
+	} else if !summary.Backstop.Checked {
+		fmt.Fprintln(output, "  Whole-volume backstop was not checked for this session.")
+	} else {
+		fmt.Fprintln(output, "  NO WHOLE-VOLUME BACKSTOP: no reason was recorded.")
 	}
 	for _, failure := range summary.Backstop.Excluded {
 		fmt.Fprintf(output, "  OUTSIDE VOLUME BACKSTOP: %s: %s\n", humanPath(failure.Path), failure.Error)
 	}
 	printStoredChangeListLimitation(output, summary, "  ", false)
 	for _, failure := range summary.ScanFailures {
-		fmt.Fprintf(output, "  CHANGE-LIST SCAN INCOMPLETE: %s: %s\n", humanPath(failure.Path), failure.Error)
+		if !summary.Interrupted {
+			fmt.Fprintf(output, "  CHANGE-LIST SCAN INCOMPLETE: %s: %s\n", humanPath(failure.Path), failure.Error)
+		}
 	}
 	if summary.ScanRoot != "" {
 		fmt.Fprintf(output, "  Change-list scan: %d entries/%d ms before; %d entries/%d ms after\n",
@@ -1082,17 +1572,44 @@ func printAuditFiles(output io.Writer, summary localrollback.Summary) {
 		printAgentStateGroupingInference(output, "  ", agentStateRoots)
 	}
 	regular, agentState := groupAgentStateChanges(summary.Changes, agentStateRoots)
-	printStoredChanges(output, regular)
+	printChange := func(output io.Writer, change localrollback.Change) {
+		printStoredChange(output, change, summary.Interrupted)
+	}
+	printWatchedRootChangeGroups(output, regular, summary.Watched, summary.ChangeListRoots, sessionID, printChange)
 	if len(agentState) > 0 {
 		fmt.Fprintln(output, "  AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
-		printStoredChanges(output, agentState)
+		printDeclaredRootChangeGroups(output, agentState, agentStateRoots, sessionID, "agent own-state changes", "  AGENT-STATE ROOT CHANGES", printChange)
 	}
-	if summary.Error != "" {
+	if summary.Interrupted {
+		fmt.Fprintf(output, "  INCOMPLETE: %s Run unring log --json %s for precise diagnostic details.\n",
+			interruptedChangeListDetail(summary), sessionID)
+	} else if summary.Error != "" {
 		if hasActionableFileCoverageFailure(summary) {
 			fmt.Fprintf(output, "  INCOMPLETE: %s\n", summary.Error)
 		} else {
 			fmt.Fprintf(output, "  Coverage note: %s\n", summary.Error)
 		}
+	}
+}
+
+func interruptedChangeListMessage(summary localrollback.Summary) string {
+	if summary.InterruptedPhase != "" && summary.InterruptedPhase != "post-session filesystem scan" {
+		return fmt.Sprintf("File change list unavailable: the session was interrupted during %s; no complete post-session comparison was produced.", summary.InterruptedPhase)
+	}
+	return "File change list incomplete: the post-session scan was interrupted; zero changes must not be inferred."
+}
+
+func interruptedChangeListDetail(summary localrollback.Summary) string {
+	if summary.InterruptedPhase != "" && summary.InterruptedPhase != "post-session filesystem scan" {
+		return fmt.Sprintf("the session was interrupted during %s; no complete post-session change list is available.", summary.InterruptedPhase)
+	}
+	return "the post-session scan was interrupted; the recorded change list may omit file changes."
+}
+
+func printUnscannedRoots(output io.Writer, prefix string, failures []localrollback.CaptureFailure) {
+	for _, failure := range failures {
+		fmt.Fprintf(output, "%sWATCHED ROOT CHANGE LIST UNAVAILABLE: %s: its post-session scan did not complete.\n",
+			prefix, humanPath(failure.Path))
 	}
 }
 
@@ -1108,15 +1625,206 @@ func hasActionableFileCoverageFailure(summary localrollback.Summary) bool {
 	return !localrollback.HasOnlyUnsupportedFileTypeFailures(summary)
 }
 
-func printStoredChanges(output io.Writer, changes []localrollback.Change) {
+func fileCoverageEndedAbnormally(summary localrollback.Summary) bool {
+	return !summary.Complete && !localrollback.HasOnlyRoutinePermissionScanFailures(summary)
+}
+
+func printStoredChange(output io.Writer, change localrollback.Change, interrupted bool) {
+	fmt.Fprintf(output, "  %-8s %s\n", change.Kind, humanPath(change.Path))
+	if change.RestoreSource == localrollback.RestoreSourceVolume {
+		fmt.Fprintln(output, "             SNAPSHOT ONLY: requires sudo to mount the APFS snapshot")
+	} else if change.UnrestorableReason != "" {
+		fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", humanUnrestorableReason(change.UnrestorableReason, interrupted))
+	}
+}
+
+func humanUnrestorableReason(reason string, interrupted bool) string {
+	if interrupted && isInternalCancellationFailure(reason) {
+		return "the post-session scan was interrupted before this path's restore coverage could be verified"
+	}
+	return reason
+}
+
+func isInternalCancellationFailure(reason string) bool {
+	return strings.Contains(reason, context.Canceled.Error()) || strings.Contains(reason, context.DeadlineExceeded.Error())
+}
+
+func printBoundedChanges(
+	output io.Writer,
+	changes []localrollback.Change,
+	sessionID string,
+	group string,
+	printChange func(io.Writer, localrollback.Change),
+) {
+	shown, truncated := boundedHumanSessionCount(len(changes), false)
+	for _, change := range changes[:shown] {
+		printChange(output, change)
+	}
+	if truncated {
+		withheld := len(changes) - shown
+		fmt.Fprintf(output,
+			"Showing %d of %d %s; %d withheld. Run unring restore %s to show every recorded change.\n",
+			shown, len(changes), group, withheld, sessionID)
+	}
+}
+
+type watchedRootChangeGroup struct {
+	root    string
+	changes []localrollback.Change
+}
+
+func printWatchedRootChangeGroups(
+	output io.Writer,
+	changes []localrollback.Change,
+	watched []string,
+	changeListRoots []string,
+	sessionID string,
+	printChange func(io.Writer, localrollback.Change),
+) {
+	if len(changes) == 0 {
+		return
+	}
+	groups := make([]watchedRootChangeGroup, 0, len(watched)+1)
+	rootIndexes := make(map[string]int)
+	for _, root := range watched {
+		root = filepath.Clean(root)
+		if _, exists := rootIndexes[root]; exists {
+			continue
+		}
+		rootIndexes[root] = len(groups)
+		groups = append(groups, watchedRootChangeGroup{root: root})
+	}
+	outsideIndexes := make(map[string]int)
 	for _, change := range changes {
-		fmt.Fprintf(output, "  %-8s %s\n", change.Kind, humanPath(change.Path))
-		if change.RestoreSource == localrollback.RestoreSourceVolume {
-			fmt.Fprintln(output, "             SNAPSHOT ONLY: requires sudo to mount the APFS snapshot")
-		} else if change.UnrestorableReason != "" {
-			fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
+		matchedRoot := ""
+		matchedIndex := -1
+		for root, index := range rootIndexes {
+			if pathWithinRoot(change.Path, root) && len(root) > len(matchedRoot) {
+				matchedRoot = root
+				matchedIndex = index
+			}
+		}
+		if matchedIndex < 0 {
+			outsideRoot := outsidePresentationRoot(change.Path, changeListRoots)
+			var exists bool
+			matchedIndex, exists = outsideIndexes[outsideRoot]
+			if !exists {
+				matchedIndex = len(groups)
+				outsideIndexes[outsideRoot] = matchedIndex
+				groups = append(groups, watchedRootChangeGroup{root: outsideRoot})
+			}
+		}
+		groups[matchedIndex].changes = append(groups[matchedIndex].changes, change)
+	}
+	nonempty := 0
+	for _, group := range groups {
+		if len(group.changes) > 0 {
+			nonempty++
 		}
 	}
+	showHeadings := len(watched) > 1 || len(outsideIndexes) > 0 || nonempty > 1
+	for _, group := range groups {
+		if len(group.changes) == 0 {
+			continue
+		}
+		_, outside := outsideIndexes[group.root]
+		label := "changes outside watched roots"
+		if !outside && group.root != "" {
+			label = "changes under watched root " + humanPath(group.root)
+		} else if outside && len(outsideIndexes) > 1 {
+			label = "changes outside watched roots under " + humanPath(group.root)
+		}
+		if showHeadings {
+			if outside {
+				fmt.Fprintf(output, "CHANGES OUTSIDE WATCHED ROOTS — %s\n", humanPath(group.root))
+			} else {
+				fmt.Fprintf(output, "WATCHED ROOT CHANGES — %s\n", humanPath(group.root))
+			}
+		}
+		printBoundedChanges(output, group.changes, sessionID, label, printChange)
+	}
+}
+
+func outsidePresentationRoot(path string, changeListRoots []string) string {
+	path = filepath.Clean(path)
+	base := ""
+	for _, candidate := range changeListRoots {
+		candidate = filepath.Clean(candidate)
+		if pathWithinRoot(path, candidate) && len(candidate) > len(base) {
+			base = candidate
+		}
+	}
+	if base == "" {
+		base = filepath.VolumeName(path) + string(os.PathSeparator)
+	}
+	relative, err := filepath.Rel(base, path)
+	if err != nil || relative == "." {
+		return base
+	}
+	first := strings.Split(relative, string(os.PathSeparator))[0]
+	return filepath.Join(base, first)
+}
+
+func printDeclaredRootChangeGroups(
+	output io.Writer,
+	changes []localrollback.Change,
+	roots []string,
+	sessionID string,
+	groupLabel string,
+	heading string,
+	printChange func(io.Writer, localrollback.Change),
+) {
+	groups := make([]watchedRootChangeGroup, 0, len(roots)+1)
+	rootIndexes := make(map[string]int)
+	for _, root := range roots {
+		root = filepath.Clean(root)
+		if _, exists := rootIndexes[root]; exists {
+			continue
+		}
+		rootIndexes[root] = len(groups)
+		groups = append(groups, watchedRootChangeGroup{root: root})
+	}
+	unmatched := -1
+	for _, change := range changes {
+		matchedRoot := ""
+		matchedIndex := -1
+		for root, index := range rootIndexes {
+			if pathWithinRoot(change.Path, root) && len(root) > len(matchedRoot) {
+				matchedRoot = root
+				matchedIndex = index
+			}
+		}
+		if matchedIndex < 0 {
+			if unmatched < 0 {
+				unmatched = len(groups)
+				groups = append(groups, watchedRootChangeGroup{})
+			}
+			matchedIndex = unmatched
+		}
+		groups[matchedIndex].changes = append(groups[matchedIndex].changes, change)
+	}
+	nonempty := 0
+	for _, group := range groups {
+		if len(group.changes) > 0 {
+			nonempty++
+		}
+	}
+	for _, group := range groups {
+		if len(group.changes) == 0 {
+			continue
+		}
+		label := groupLabel
+		if nonempty > 1 && group.root != "" {
+			fmt.Fprintf(output, "%s — %s\n", heading, humanPath(group.root))
+			label += " under " + humanPath(group.root)
+		}
+		printBoundedChanges(output, group.changes, sessionID, label, printChange)
+	}
+}
+
+func pathWithinRoot(path, root string) bool {
+	path = filepath.Clean(path)
+	return path == root || strings.HasPrefix(path, root+string(os.PathSeparator))
 }
 
 func groupAgentStateChanges(changes []localrollback.Change, roots []string) ([]localrollback.Change, []localrollback.Change) {
@@ -1430,11 +2138,11 @@ func logCommand(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout, "No unring sessions have been recorded.")
 			return 0
 		}
-		fmt.Fprintln(stdout, "SESSION ID                                  STARTED               OUTCOME      COMMAND")
+		fmt.Fprintln(stdout, "SESSION ID                                  STARTED               OUTCOME          COMMAND")
 		for _, record := range records {
-			fmt.Fprintf(stdout, "%-43s %-21s %-12s %s\n",
+			fmt.Fprintf(stdout, "%-43s %-21s %-16s %s\n",
 				record.ID, record.StartedAt.Local().Format("2006-01-02 15:04:05"),
-				record.Outcome, humanCommand(record.Command))
+				displayedOutcome(record), humanCommand(record.Command))
 		}
 		if truncated {
 			fmt.Fprintf(stdout, "Showing the newest %d of %d sessions; use unring log --all to show everything.\n", defaultSessionListLimit, total)
@@ -1491,9 +2199,9 @@ func pruneCommand(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "unring: clean expired prune previews: %v\n", err)
 			return internalErrorExitCode
 		}
-		if err := applyRetentionRemovals(store, preview.Removals, func() error {
+		if _, err := applyRetentionRemovals(context.Background(), store, preview.Removals, func() error {
 			return validatePrunePreview(store, preview, time.Now())
-		}, nil, stdout, "removed"); err != nil {
+		}, nil, stdout, nil, "removed"); err != nil {
 			printPartialRetentionFailure(stderr, err)
 			fmt.Fprintf(stderr, "unring: prune preview %q was not fully applied: %v; run unring prune again if no removals were reported above.\n", *confirm, err)
 			return internalErrorExitCode
@@ -1760,15 +2468,11 @@ func retentionSpace(removal localrollback.RetentionRemoval) string {
 }
 
 func printRetentionRemoval(output io.Writer, verb string, removal localrollback.RetentionRemoval) {
-	target := "clone snapshot only"
-	if removal.Expired && removal.HasSnapshot {
-		target = "stored session and clone snapshot"
-	} else if removal.Expired {
-		target = "stored session audit record"
-	}
 	if verb == "retention removed" && !removal.Expired {
-		fmt.Fprintf(output, "unring: retention evicted oldest snapshot %s.\n", removal.SessionID)
+		fmt.Fprintf(output, "unring: retention evicted oldest snapshot %s; the audit record remains available.\n", removal.SessionID)
+		return
 	}
+	target := retentionTarget(removal)
 	space := retentionSpace(removal)
 	if !removal.HasSnapshot {
 		space = "this removes only the audit record; no snapshot data remains"
@@ -1780,6 +2484,16 @@ func printRetentionRemoval(output io.Writer, verb string, removal localrollback.
 	}
 }
 
+func retentionTarget(removal localrollback.RetentionRemoval) string {
+	if removal.Expired && removal.HasSnapshot {
+		return "stored session and clone snapshot"
+	}
+	if removal.Expired {
+		return "stored session audit record"
+	}
+	return "clone snapshot only"
+}
+
 func printRetentionWarnings(output io.Writer, warnings []localrollback.RetentionWarning) {
 	for _, warning := range warnings {
 		fmt.Fprintf(output, "unring: retention warning for %s: %s.\n", warning.SessionID, warning.Error)
@@ -1787,14 +2501,18 @@ func printRetentionWarnings(output io.Writer, warnings []localrollback.Retention
 }
 
 func applyRetentionRemovals(
+	ctx context.Context,
 	store *audit.Store,
 	removals []localrollback.RetentionRemoval,
 	validate func() error,
 	summary *localrollback.Summary,
 	output io.Writer,
+	progress func(int),
 	verb string,
-) error {
-	return localrollback.ApplyRetentionRemovals(
+) ([]localrollback.RetentionRemoval, error) {
+	var applied []localrollback.RetentionRemoval
+	err := localrollback.ApplyRetentionRemovalsContext(
+		ctx,
 		store.StateDir(), removals, validate,
 		func(removal localrollback.RetentionRemoval) error {
 			if removal.Expired {
@@ -1811,6 +2529,10 @@ func applyRetentionRemovals(
 			return store.SaveWhileSessionLocked(record)
 		},
 		func(removal localrollback.RetentionRemoval) {
+			applied = append(applied, removal)
+			if progress != nil {
+				progress(len(applied))
+			}
 			if summary != nil {
 				summary.Evicted = append(summary.Evicted, removal.SessionID)
 				summary.RetentionEvents = append(summary.RetentionEvents, localrollback.RetentionEvent{
@@ -1819,32 +2541,83 @@ func applyRetentionRemovals(
 					CapRequired: removal.CapRequired,
 				})
 			}
-			printRetentionRemoval(output, verb, removal)
+			if output != nil {
+				printRetentionRemoval(output, verb, removal)
+			}
 		},
 	)
+	return applied, err
 }
 
 func applyAutomaticRetention(
+	ctx context.Context,
 	store *audit.Store,
 	activeSession string,
 	capBytes int64,
 	retentionDays int,
 	summary *localrollback.Summary,
 	output io.Writer,
+	progressOutputs ...func(string, ...any),
 ) {
-	records, err := store.List()
+	var completed atomic.Int64
+	var total atomic.Int64
+	stopProgress := make(chan struct{})
+	progressDone := make(chan struct{})
+	if len(progressOutputs) > 0 && progressOutputs[0] != nil {
+		progressf := progressOutputs[0]
+		started := time.Now()
+		go func() {
+			defer close(progressDone)
+			ticker := time.NewTicker(automaticRetentionProgressInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					planned := total.Load()
+					if planned == 0 {
+						progressf("unring: automatic retention is still running (%s elapsed).\n", time.Since(started).Round(time.Second))
+					} else {
+						progressf("unring: automatic retention is still running: %d of %d removals completed (%s elapsed).\n",
+							completed.Load(), planned, time.Since(started).Round(time.Second))
+					}
+				case <-stopProgress:
+					return
+				}
+			}
+		}()
+	} else {
+		close(progressDone)
+	}
+	defer func() {
+		close(stopProgress)
+		<-progressDone
+	}()
+	if automaticRetentionTestHook != nil {
+		automaticRetentionTestHook(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	records, err := store.ListContext(ctx)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		if records == nil {
 			fmt.Fprintf(output, "unring: enforce session retention: cannot inspect stored sessions: %v\n", err)
 			return
 		}
 		fmt.Fprintf(output, "unring: retention warning: unreadable audit records were skipped: %v\n", err)
 	}
-	plan, err := localrollback.PlanRetention(
+	plan, err := localrollback.PlanRetentionContext(
+		ctx,
 		store.StateDir(), storedSessions(records), capBytes,
 		time.Duration(retentionDays)*24*time.Hour, time.Now(),
 	)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		fmt.Fprintf(output, "unring: enforce session retention: %v\n", err)
 		return
 	}
@@ -1855,7 +2628,15 @@ func applyAutomaticRetention(
 			removals = append(removals, removal)
 		}
 	}
-	if err := applyRetentionRemovals(store, removals, nil, summary, output, "retention removed"); err != nil {
+	total.Store(int64(len(removals)))
+	applied, err := applyRetentionRemovals(ctx, store, removals, nil, summary, nil, func(count int) {
+		completed.Store(int64(count))
+	}, "retention removed")
+	printAutomaticRetentionRemovals(output, activeSession, applied)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		printPartialRetentionFailure(output, err)
 		fmt.Fprintf(output, "unring: enforce session retention: %v\n", err)
 		return
@@ -1866,6 +2647,74 @@ func applyAutomaticRetention(
 			plan.After.Bytes, plan.After.CapBytes)
 	}
 }
+
+func printAutomaticRetentionRemovals(output io.Writer, activeSession string, removals []localrollback.RetentionRemoval) {
+	if len(removals) == 0 {
+		return
+	}
+	noun := "sessions"
+	if len(removals) == 1 {
+		noun = "session"
+	}
+	fmt.Fprintf(output, "unring: automatic retention removed %d %s.\n", len(removals), noun)
+	shown, truncated := boundedHumanSessionCount(len(removals), false)
+	shownRemovals := removals[:shown]
+	if len(shownRemovals) == 1 {
+		printRetentionRemoval(output, "retention removed", shownRemovals[0])
+	} else {
+		printCompactRetentionRemovals(output, shownRemovals)
+	}
+	if truncated {
+		fmt.Fprintf(output,
+			"unring: showing %d of %d automatic retention removals; %d withheld. Run unring log %s to see every removal recorded for this session.\n",
+			shown, len(removals), len(removals)-shown, activeSession)
+	}
+}
+
+func printCompactRetentionRemovals(output io.Writer, removals []localrollback.RetentionRemoval) {
+	type removalGroup struct {
+		label string
+		ids   []string
+	}
+	var groups []removalGroup
+	groupIndexes := make(map[string]int)
+	var measuredBytes, upperBoundBytes int64
+	for _, removal := range removals {
+		target := retentionTarget(removal)
+		if !removal.Expired {
+			target += "; audit record retained"
+		}
+		label := retentionReason(removal) + "; removed " + target
+		index, exists := groupIndexes[label]
+		if !exists {
+			index = len(groups)
+			groupIndexes[label] = index
+			groups = append(groups, removalGroup{label: label})
+		}
+		groups[index].ids = append(groups[index].ids, removal.SessionID)
+		if removal.StorageExact {
+			measuredBytes += removal.StorageBytes
+		} else {
+			upperBoundBytes += removal.StorageBytes
+		}
+	}
+	for _, group := range groups {
+		fmt.Fprintf(output, "unring: %s (%d sessions):\n", group.label, len(group.ids))
+		for start := 0; start < len(group.ids); start += automaticRetentionIDsPerLine {
+			end := start + automaticRetentionIDsPerLine
+			if end > len(group.ids) {
+				end = len(group.ids)
+			}
+			fmt.Fprintf(output, "  %s\n", strings.Join(group.ids[start:end], ", "))
+		}
+	}
+	fmt.Fprintf(output,
+		"unring: shown-removal accounting: %d measured retained-snapshot bytes/references; %d bytes of upper-bound accounting.\n",
+		measuredBytes, upperBoundBytes)
+	fmt.Fprintln(output, "unring: deleting copy-on-write clone references does not promise the same increase in immediate free disk space.")
+}
+
+const automaticRetentionIDsPerLine = 5
 
 func printPartialRetentionFailure(output io.Writer, err error) {
 	var applyErr *localrollback.RetentionApplyError
@@ -1958,7 +2807,19 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	record.Files = loadStoredFileSummary(store.StateDir(), record)
 	if len(record.Files.Changes) == 0 {
-		fmt.Fprintf(stdout, "Session %s changed no watched files.\n", record.ID)
+		if !record.Files.Complete {
+			fmt.Fprintf(stdout, "UNRING FILE CHANGES %s\n", record.ID)
+			printStoredChangeListLimitation(stdout, record.Files, "  ", true)
+			if record.Files.Interrupted {
+				fmt.Fprintf(stdout, "INCOMPLETE: %s This session must not be treated as clean. Run unring log --json %s for precise diagnostic details.\n",
+					interruptedChangeListDetail(record.Files), record.ID)
+			} else {
+				fmt.Fprintln(stdout, "INCOMPLETE: the post-session scan did not produce a complete change list, and this session must not be treated as clean.")
+			}
+			printUnscannedRoots(stdout, "", record.Files.Unscanned)
+			return 0
+		}
+		fmt.Fprintf(stdout, "Session %s changed no watched files; the post-session scan completed.\n", record.ID)
 		printStoredChangeListLimitation(stdout, record.Files, "", true)
 		return 0
 	}
@@ -1967,6 +2828,7 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	printStoredChangeListLimitation(stdout, record.Files, "", true)
+	printRestoreExecutionCoverage(stdout, record)
 	if restoreAll {
 		if len(selections) > 0 {
 			fmt.Fprintln(stderr, "unring: --all cannot be combined with selected paths")
@@ -2063,6 +2925,16 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		return internalErrorExitCode
 	}
 	return exitCode
+}
+
+func printRestoreExecutionCoverage(output io.Writer, record audit.Record) {
+	if record.Files.Interrupted {
+		fmt.Fprintf(output, "INCOMPLETE: %s Restore will use only the recorded changes from completed scans.\n",
+			interruptedChangeListDetail(record.Files))
+	} else if len(record.Files.Unscanned) > 0 {
+		fmt.Fprintln(output, "INCOMPLETE: at least one watched root's post-session change list is unavailable; restore will use only the recorded changes from completed scans.")
+	}
+	printUnscannedRoots(output, "", record.Files.Unscanned)
 }
 
 func snapshotsCommand(args []string, stdout, stderr io.Writer) int {
@@ -2212,18 +3084,29 @@ func boundedHumanSessionCount(total int, showAll bool) (int, bool) {
 func printRestoreListing(output io.Writer, record audit.Record) {
 	fmt.Fprintf(output, "UNRING FILE CHANGES %s\n", record.ID)
 	printStoredChangeListLimitation(output, record.Files, "  ", true)
+	if record.Files.Interrupted {
+		if record.Files.InterruptedPhase != "" && record.Files.InterruptedPhase != "post-session filesystem scan" {
+			fmt.Fprintf(output, "INCOMPLETE: %s Run unring log --json %s for precise diagnostic details.\n",
+				interruptedChangeListDetail(record.Files), record.ID)
+		} else {
+			fmt.Fprintf(output, "INCOMPLETE: the post-session scan was interrupted; the paths below come only from sources whose scans completed, and this session must not be treated as clean. Run unring log --json %s for precise diagnostic details.\n", record.ID)
+		}
+	} else if !record.Files.Complete {
+		fmt.Fprintln(output, "INCOMPLETE: the post-session scan did not produce a complete change list; the paths below may omit changes.")
+	}
+	printUnscannedRoots(output, "", record.Files.Unscanned)
 	agentStateRoots, inferredAgentStateRoots := agentStateGroupingRoots(record.Files.AgentStateRoots)
 	if inferredAgentStateRoots {
 		printAgentStateGroupingInference(output, "", agentStateRoots)
 	}
 	regular, agentState := groupAgentStateChanges(record.Files.Changes, agentStateRoots)
 	for _, change := range regular {
-		printRestoreListingChange(output, change, record.Files.Retained)
+		printRestoreListingChange(output, change, record.Files.Retained, record.Files.Interrupted)
 	}
 	if len(agentState) > 0 {
 		fmt.Fprintln(output, "AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
 		for _, change := range agentState {
-			printRestoreListingChange(output, change, record.Files.Retained)
+			printRestoreListingChange(output, change, record.Files.Retained, record.Files.Interrupted)
 		}
 		if hasCurrentlyRestorableFileChange(agentState, record.Files.Retained) {
 			fmt.Fprintf(output, "Include this group with: unring restore --all --include-agent-state %s\n", record.ID)
@@ -2246,11 +3129,11 @@ func printRestoreListing(output io.Writer, record audit.Record) {
 	}
 }
 
-func printRestoreListingChange(output io.Writer, change localrollback.Change, cloneRetained bool) {
+func printRestoreListingChange(output io.Writer, change localrollback.Change, cloneRetained, interrupted bool) {
 	fmt.Fprintf(output, "  %-8s %s\n", change.Kind, humanPath(change.Path))
 	switch {
 	case change.UnrestorableReason != "":
-		fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", change.UnrestorableReason)
+		fmt.Fprintf(output, "             NOT RESTORABLE: %s\n", humanUnrestorableReason(change.UnrestorableReason, interrupted))
 	case change.RestoreSource == localrollback.RestoreSourceVolume:
 		fmt.Fprintln(output, "             SNAPSHOT ONLY: restore requires sudo because APFS snapshot mounting is root-only")
 	case !cloneRetained:
@@ -2316,13 +3199,13 @@ func printAuditRecord(output io.Writer, record audit.Record) {
 	}
 	fmt.Fprintf(output, "Command:  %s\n", humanCommand(record.Command))
 	fmt.Fprintf(output, "Decision: %s\n", record.Decision)
-	fmt.Fprintf(output, "Outcome:  %s\n", record.Outcome)
+	fmt.Fprintf(output, "Outcome:  %s\n", displayedOutcomeDetail(record))
 	fmt.Fprintf(output, "Exit code: %d\n", record.ExitCode)
 	fmt.Fprintf(output, "Outbound interception: %t\n", record.Outbound)
 	if record.Error != "" {
-		fmt.Fprintf(output, "Error: %s\n", record.Error)
+		fmt.Fprintf(output, "Error: %s\n", humanAuditError(record))
 	}
-	printAuditFiles(output, record.Files)
+	printAuditFiles(output, record.ID, record.Files)
 	if hasOnlyObservedHTTPSActivity(record.Postgres, record.HTTPS, record.GH) {
 		printObservedSummaryWithExternal(output, record.Postgres, record.HTTPS, record.GH)
 	} else {
@@ -2337,6 +3220,59 @@ func printAuditRecord(output io.Writer, record audit.Record) {
 				fmt.Fprintf(output, "    Error: %s\n", approval.Error)
 			}
 		}
+	}
+}
+
+func humanAuditError(record audit.Record) string {
+	message := record.Error
+	if record.CompletionKind != completionKindAbnormalDiscard {
+		return message
+	}
+	message = strings.ReplaceAll(message, context.Canceled.Error(), "stopped after the user interrupted the session")
+	message = strings.ReplaceAll(message, context.DeadlineExceeded.Error(), "stopped after its safety timeout")
+	return message
+}
+
+func displayedOutcome(record audit.Record) string {
+	if record.CompletionKind == completionKindAbnormalDiscard &&
+		(record.ExitCode == 128+int(syscall.SIGINT) || record.ExitCode == 128+int(syscall.SIGTERM)) {
+		if record.Outcome == "unknown" {
+			return "interrupted (unconfirmed)"
+		}
+		return "interrupted"
+	}
+	if record.Outcome != "discarded" {
+		return record.Outcome
+	}
+	switch record.CompletionKind {
+	case completionKindNoDecision:
+		return "no decision"
+	case completionKindDefaultDiscard:
+		return "default discard"
+	case completionKindAbnormalDiscard:
+		if record.ExitCode == 128+int(syscall.SIGINT) || record.ExitCode == 128+int(syscall.SIGTERM) {
+			return "interrupted"
+		}
+		return "abnormal end"
+	default:
+		return "discarded"
+	}
+}
+
+func displayedOutcomeDetail(record audit.Record) string {
+	switch displayedOutcome(record) {
+	case "no decision":
+		return "no decision needed"
+	case "default discard":
+		return "discarded by the non-interactive default"
+	case "interrupted":
+		return "interrupted; reversible effects were discarded"
+	case "interrupted (unconfirmed)":
+		return "interrupted; final discard could not be confirmed"
+	case "abnormal end":
+		return "abnormal end; reversible effects were discarded"
+	default:
+		return displayedOutcome(record)
 	}
 }
 
@@ -2525,11 +3461,11 @@ func readOnePromptLine(input io.Reader) (string, error) {
 func promptDecisionWithSignal(
 	input io.Reader,
 	output io.Writer,
-	signals <-chan os.Signal,
-) (pgproxy.Decision, bool) {
+	interrupted <-chan struct{},
+) (pgproxy.Decision, bool, bool) {
 	if !isTerminal(input) || !isTerminalWriter(output) {
 		fmt.Fprintln(output, "No interactive terminal; defaulting to discard. Use --commit to commit.")
-		return pgproxy.DecisionRollback, false
+		return pgproxy.DecisionRollback, false, true
 	}
 
 	decision := make(chan pgproxy.Decision, 1)
@@ -2538,19 +3474,10 @@ func promptDecisionWithSignal(
 	}()
 	select {
 	case chosen := <-decision:
-		return chosen, false
-	case <-signals:
+		return chosen, false, false
+	case <-interrupted:
 		fmt.Fprintln(output, "\nSignal received: discarding the session.")
-		return pgproxy.DecisionRollback, true
-	}
-}
-
-func pendingSignal(signals <-chan os.Signal) bool {
-	select {
-	case <-signals:
-		return true
-	default:
-		return false
+		return pgproxy.DecisionRollback, true, false
 	}
 }
 

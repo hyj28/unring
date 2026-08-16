@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -29,6 +30,14 @@ func (*cliBackstopPlatform) VolumeForPath(string) (localrollback.Volume, error) 
 
 func (platform *cliBackstopPlatform) IsExcluded(path string) (bool, error) {
 	return platform.excluded[filepath.Clean(path)], nil
+}
+
+func (platform *cliBackstopPlatform) IsExcludedBatch(_ context.Context, paths []string) ([]bool, error) {
+	results := make([]bool, len(paths))
+	for index, path := range paths {
+		results[index], _ = platform.IsExcluded(path)
+	}
+	return results, nil
 }
 
 func (platform *cliBackstopPlatform) ListSnapshots(localrollback.Volume) ([]string, error) {

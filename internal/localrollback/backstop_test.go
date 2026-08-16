@@ -1,6 +1,7 @@
 package localrollback
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -89,6 +90,14 @@ func (*fakeVolumeSnapshotPlatform) VolumeForPath(string) (Volume, error) {
 
 func (platform *fakeVolumeSnapshotPlatform) IsExcluded(path string) (bool, error) {
 	return platform.excluded[filepath.Clean(path)], nil
+}
+
+func (platform *fakeVolumeSnapshotPlatform) IsExcludedBatch(_ context.Context, paths []string) ([]bool, error) {
+	results := make([]bool, len(paths))
+	for index, path := range paths {
+		results[index] = platform.excluded[filepath.Clean(path)]
+	}
+	return results, nil
 }
 
 func (platform *fakeVolumeSnapshotPlatform) ListSnapshots(Volume) ([]string, error) {

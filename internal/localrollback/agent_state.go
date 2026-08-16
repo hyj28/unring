@@ -13,6 +13,7 @@ import (
 var agentStateRelativeRoots = []string{
 	".claude",
 	".codex",
+	".cursor",
 	filepath.Join(".config", "opencode"),
 	filepath.Join(".local", "share", "opencode"),
 	filepath.Join(".cache", "opencode"),

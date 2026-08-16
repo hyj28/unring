@@ -144,6 +144,33 @@ Design: [docs/LOCAL-ROLLBACK-DESIGN.md §9](docs/LOCAL-ROLLBACK-DESIGN.md). Deci
       comparison; recognize explicitly restored original bytes without weakening conflicts
 - [x] M11.4 Quote control characters in human-readable paths without changing stored paths
 
+## M12 — Survivable session finalization
+
+Design: [docs/LOCAL-ROLLBACK-DESIGN.md §10](docs/LOCAL-ROLLBACK-DESIGN.md). Decisions 21–29.
+
+- [x] M12.1 Batch and order-validate post-session `tmutil isexcluded` checks while preserving
+      excluded-ancestor-only short-circuiting and reporting progress
+- [x] M12.2 Keep `SIGINT` and `SIGTERM` effective after the child exits, cancel sealing work,
+      and durably finish the session as discarded
+- [x] M12.3 Bound automatic retention and per-group change rendering with complete stored
+      records and explicit commands for viewing withheld detail
+- [x] M12.4 Make incomplete and empty scans unambiguous in `run`, `log`, and `restore`, bound
+      change rendering per watched root, compact retention accounting, define repeated-signal
+      behavior, and distinguish displayed no-decision, explicit-discard, and abnormal outcomes
+- [x] M12.5 Keep signal handling continuous through retention and finalization, make retention
+      cancellation-aware, normalize and isolate `tmutil` paths with per-path fallback, publish
+      interruption before completeness, and bound agent/outside presentation roots fairly
+- [x] M12.6 Start signal ownership before baseline capture and pre-child retention, treat closed
+      output pipes as durable interruption, report retention progress, and never diff a watched
+      root whose post-session walk did not finish
+- [x] M12.7 Preserve the post-session evidence scan after a child signal, handle terminal hangup,
+      retain independently observed wide changes for clone-unavailable roots, and disclose
+      incomplete roots during live review and restore execution
+- [x] M12.8 Parse tmutil's real two-space status separator without trimming path whitespace,
+      and distinguish the documented non-interactive default discard from abnormal endings
+- [x] M12.9 Keep routine OS-classified permission gaps in the widened background scan fully
+      disclosed without labelling an otherwise normal session as an abnormal end
+
 ---
 
 ## Explicitly out of scope for v1

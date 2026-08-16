@@ -69,6 +69,9 @@ link group honestly.
 The change list is wider than the clone scope: unring scans the home directory before and
 after the child runs, excluding `~/Library`, `node_modules`, `.git`, `.cache`, and `~/go/pkg`.
 The scan is metadata-only and its progress is announced because it can take several seconds.
+If a watched-root walk cannot finish, that root is omitted from the diff and named as
+unavailable; a partial walk is never interpreted as evidence that its unvisited files were
+deleted.
 A replacement `--watch-only` scope also replaces this wider scan; the clone diff already
 covers exactly those explicitly selected roots. Changes elsewhere are not reported or
 written to the audit record, even when the whole-volume snapshot contains them, so the
@@ -112,6 +115,34 @@ is not macOS, unring prints a prominent coverage warning and still runs. The clo
 change list continue to work. Local snapshots are purgeable under disk pressure; `unring
 snapshots` reports whether each recorded backstop still exists.
 
+The post-child Time Machine inclusion check passes changed paths to `tmutil isexcluded` in
+validated batches instead of starting one process per path. Every returned line must name
+the corresponding requested path in the same order; short, reordered, or malformed output
+is rejected rather than attributed to the wrong file. Echoed paths are compared after Unicode
+normalization because macOS may return decomposed filenames. Paths whose whitespace or line
+breaks make a multi-path response unsafe are checked alone; any unusable batch falls back to
+one check and one independently attributed result per path. The parser consumes tmutil's
+two-space status separator without trimming the echoed path, so a path's own leading or
+trailing spaces remain significant. The terminal reports scan and batch progress.
+
+`SIGINT`, `SIGTERM`, `SIGHUP`, and a closed output pipe remain handled from the pre-session filesystem
+scan and automatic retention, through the child, post-session scanning, interceptor sealing,
+and finalization. A signal cancels the active phase, selects discard, and records an abnormal
+outcome that later `log` and `restore` commands can inspect. Automatic retention reports
+periodic progress even when it runs before the child. A second signal is acknowledged but does
+not bypass durable discard finalization; the first signal determines the exit status.
+When the first signal arrives during the child, the evidence-producing post-session filesystem
+scan starts with a fresh cancellation context; a signal arriving during that scan still stops it.
+Interrupted human-readable listings say that coverage is
+incomplete without calling a canceled post-session walk a snapshot failure, while `log
+--json` retains the exact diagnostic cause.
+
+Widened background-scan paths that macOS permanently refuses through TCC remain explicit
+coverage gaps in live review, stored review, and JSON. When those OS-classified permission
+refusals are the only incomplete file coverage, they do not label an otherwise normal session
+as an abnormal end. Permission failures inside a watched root, an unscanned watched root,
+interruption, persistence failure, and every other incomplete state remain abnormal.
+
 After the child exits, inspect and restore file changes at any later time:
 
 ```sh
@@ -130,7 +161,13 @@ unring prune --confirm <preview-token>       # remove exactly the previewed sess
 The `unring restore` and detailed `unring log <session-id>` output repeat the session's
 recorded change-list scope. A clean stored change list therefore does not hide whether
 `--watch-only`, a failed widened scan, or the normal home-and-clone boundary left changes
-elsewhere unreported.
+elsewhere unreported. A completed no-change scan prints an explicit zero. Human change rows
+are bounded independently for each watched root, each declared agent-state root, and each
+top-level outside-watch presentation root, so one noisy root cannot hide another;
+`restore <session-id>` remains the complete recorded listing. The history outcome labels
+distinguish a successful file-only session that needed no decision from an explicit discard
+and an abnormal interrupted end. A reviewable session discarded by the documented
+non-interactive default has its own `default discard` label; it is not reported as abnormal.
 
 A clone-covered path changed after the session is refused by default. Its pre-session
 snapshot is written alongside the current file, and only `--force` permits replacement.
@@ -149,6 +186,9 @@ Expired and abandoned tokens are collected by later prune invocations. Reported
 snapshot bytes are unring's retention accounting, not a promise of immediately increased
 free space: APFS clones can release references to shared blocks without changing free space
 until the other references are removed.
+Automatic retention groups removed session IDs by reason and states the accounting caveat
+once for the shown set; its total, withheld count, detail command, and complete recorded
+retention events remain unchanged.
 Age expiry removes both the stored session record and clone restore data. When only the byte
 cap binds, unring removes the clone data but keeps the audit record of database, outbound,
 and file activity, marking that record as no longer retained for clone restore.
@@ -180,7 +220,7 @@ before unring can truthfully report either `already restored` or a byte-level co
 
 Snapshot-only paths from the same recorded APFS snapshot are restored under one read-only
 mount per command, with one unmount after every selected path has been attempted. The
-declared agent-own-state roots are `~/.claude`, `~/.codex`, `~/.config/opencode`,
+declared agent-own-state roots are `~/.claude`, `~/.codex`, `~/.cursor`, `~/.config/opencode`,
 `~/.local/share/opencode`, and `~/.cache/opencode`. Their changes remain in live output,
 the manifest, and stored listings under a separate label. Their logical and physically
 resolved roots are persisted
@@ -192,6 +232,11 @@ Unsupported special files such as Unix sockets also remain recorded, but render 
 informational file-type note rather than as an actionable `FILE NOT SNAPSHOTTED` alarm.
 Records created before agent-state roots were stored disclose that their grouping is inferred
 from the current environment whenever that grouping is listed or used by `restore --all`.
+Live and stored session reviews show at most 50 ordinary changes and 50 agent-own-state
+changes, disclose each group's withheld count, and point to `unring restore <session-id>`
+for the complete recorded list. Automatic retention uses the same 50-item human-output
+bound, announces the total and withheld count, and records every removal in the current
+session even when its detail is not printed.
 
 If this task needs PostgreSQL coverage, point `DATABASE_URL` at the real development
 database first:

@@ -415,7 +415,7 @@ func renderedLineCount(view string) int {
 func reviewDecisionWithSignal(
 	input io.Reader,
 	output io.Writer,
-	signals <-chan os.Signal,
+	interruptContext context.Context,
 	summary pgproxy.Summary,
 	httpsSummary httpsproxy.Summary,
 	ghSummary ghshim.Summary,
@@ -426,7 +426,7 @@ func reviewDecisionWithSignal(
 	done := make(chan struct{})
 	go func() {
 		select {
-		case <-signals:
+		case <-interruptContext.Done():
 			interrupted <- struct{}{}
 			cancel()
 		case <-done:

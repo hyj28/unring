@@ -570,8 +570,10 @@ func summaryFromManifest(value manifest, retained bool) Summary {
 	return Summary{
 		Watched: watched, Uncaptured: manifestFailures(value), Changes: value.Changes,
 		AgentStateRoots:     append([]string(nil), value.AgentStateRoots...),
+		Unscanned:           append([]CaptureFailure(nil), value.Unscanned...),
 		PostSessionFailures: append([]CaptureFailure(nil), value.PostSessionFailures...),
-		Complete:            value.Complete, Error: value.Error, Storage: value.Storage,
+		Complete:            value.Complete, Interrupted: value.Interrupted,
+		InterruptedPhase: value.InterruptedPhase, Error: value.Error, Storage: value.Storage,
 		LogicalBytes: value.LogicalBytes, StorageBytes: value.StorageBytes,
 		StorageExact: value.StorageExact, CopiedBytes: value.CopiedBytes,
 		RetentionCap: value.RetentionCap, Retained: retained,

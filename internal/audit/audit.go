@@ -2,6 +2,7 @@
 package audit
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -56,23 +57,24 @@ type Unintercepted struct {
 
 // Record is the structured, per-session audit document.
 type Record struct {
-	Version       int                   `json:"version"`
-	ID            string                `json:"id"`
-	StartedAt     time.Time             `json:"started_at"`
-	EndedAt       time.Time             `json:"ended_at,omitempty"`
-	Command       []string              `json:"command"`
-	Decision      string                `json:"decision"`
-	Outcome       string                `json:"outcome"`
-	ExitCode      int                   `json:"exit_code"`
-	Error         string                `json:"error,omitempty"`
-	Postgres      pgproxy.Summary       `json:"postgres"`
-	HTTPS         httpsproxy.Summary    `json:"https"`
-	GH            ghshim.Summary        `json:"gh"`
-	Outbound      bool                  `json:"outbound_enabled"`
-	Files         localrollback.Summary `json:"files"`
-	Approvals     []Approval            `json:"irreversible_actions"`
-	Unintercepted []Unintercepted       `json:"unintercepted"`
-	BlindSpots    []string              `json:"structural_blind_spots"`
+	Version        int                   `json:"version"`
+	ID             string                `json:"id"`
+	StartedAt      time.Time             `json:"started_at"`
+	EndedAt        time.Time             `json:"ended_at,omitempty"`
+	Command        []string              `json:"command"`
+	Decision       string                `json:"decision"`
+	Outcome        string                `json:"outcome"`
+	CompletionKind string                `json:"completion_kind,omitempty"`
+	ExitCode       int                   `json:"exit_code"`
+	Error          string                `json:"error,omitempty"`
+	Postgres       pgproxy.Summary       `json:"postgres"`
+	HTTPS          httpsproxy.Summary    `json:"https"`
+	GH             ghshim.Summary        `json:"gh"`
+	Outbound       bool                  `json:"outbound_enabled"`
+	Files          localrollback.Summary `json:"files"`
+	Approvals      []Approval            `json:"irreversible_actions"`
+	Unintercepted  []Unintercepted       `json:"unintercepted"`
+	BlindSpots     []string              `json:"structural_blind_spots"`
 }
 
 // Store owns the on-disk audit log beneath unring's per-user state directory.
@@ -224,6 +226,12 @@ func (s *Store) saveLocked(record Record) error {
 // List returns all readable records, newest first. Its error joins warnings for
 // records that were skipped; callers can still use the non-nil result.
 func (s *Store) List() ([]Record, error) {
+	return s.ListContext(context.Background())
+}
+
+// ListContext returns readable records while allowing callers to cancel a
+// long retention-oriented scan of the audit directory.
+func (s *Store) ListContext(ctx context.Context) ([]Record, error) {
 	entries, err := os.ReadDir(s.logDir)
 	if err != nil {
 		return nil, fmt.Errorf("list audit records: %w", err)
@@ -231,6 +239,9 @@ func (s *Store) List() ([]Record, error) {
 	records := make([]Record, 0, len(entries))
 	var unreadable []error
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return records, errors.Join(errors.Join(unreadable...), err)
+		}
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
@@ -240,6 +251,9 @@ func (s *Store) List() ([]Record, error) {
 			continue
 		}
 		records = append(records, record)
+	}
+	if err := ctx.Err(); err != nil {
+		return records, errors.Join(errors.Join(unreadable...), err)
 	}
 	sort.Slice(records, func(i, j int) bool {
 		return records[i].StartedAt.After(records[j].StartedAt)

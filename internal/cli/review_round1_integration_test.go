@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,10 @@ func (*reviewRoundCLIPlatform) VolumeForPath(string) (localrollback.Volume, erro
 }
 
 func (*reviewRoundCLIPlatform) IsExcluded(string) (bool, error) { return false, nil }
+
+func (*reviewRoundCLIPlatform) IsExcludedBatch(_ context.Context, paths []string) ([]bool, error) {
+	return make([]bool, len(paths)), nil
+}
 
 func (platform *reviewRoundCLIPlatform) ListSnapshots(localrollback.Volume) ([]string, error) {
 	if platform.created && platform.present {

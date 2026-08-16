@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -25,7 +26,7 @@ func TestAutomaticRetentionStopsOnHardAuditListFailure(t *testing.T) {
 	defer restoreLogs()
 	var output strings.Builder
 	summary := localrollback.Summary{}
-	applyAutomaticRetention(store, "", 0, 1, &summary, &output)
+	applyAutomaticRetention(context.Background(), store, "", 0, 1, &summary, &output)
 	if !strings.Contains(output.String(), "cannot inspect stored sessions") {
 		t.Fatalf("hard audit failure was not reported:\n%s", output.String())
 	}
