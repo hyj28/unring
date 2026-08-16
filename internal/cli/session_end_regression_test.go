@@ -297,8 +297,18 @@ func TestLiveAndRestoreAllDiscloseUnscannedSibling(t *testing.T) {
 	if len(record.Files.Unscanned) != 1 || record.Files.Unscanned[0].Path != unscanned {
 		t.Fatalf("unscanned roots = %#v, want independent sibling", record.Files.Unscanned)
 	}
+	if record.CompletionKind != completionKindAbnormalDiscard {
+		t.Fatalf("unscanned-root completion kind = %q, want %q", record.CompletionKind, completionKindAbnormalDiscard)
+	}
 	if len(record.Files.Changes) != 1 || record.Files.Changes[0].Path != kept || record.Files.Changes[0].Kind != "modified" {
 		t.Fatalf("scanned sibling changes = %#v, want one independent modified file", record.Files.Changes)
+	}
+	var logOut, logErr strings.Builder
+	if code := Main([]string{"log"}, strings.NewReader(""), &logOut, &logErr); code != 0 {
+		t.Fatalf("log exit = %d: %s", code, logErr.String())
+	}
+	if line := outputLineContaining(logOut.String(), record.ID); !strings.Contains(line, "abnormal end") {
+		t.Fatalf("unscanned-root displayed outcome = %q, want abnormal end", line)
 	}
 	var restoreOut, restoreErr strings.Builder
 	if code := Main([]string{"restore", "--all", record.ID}, strings.NewReader(""), &restoreOut, &restoreErr); code != 0 {
@@ -368,7 +378,7 @@ func TestSignalDuringFilesystemWalkDoesNotClaimSnapshotFailure(t *testing.T) {
 		t.Fatalf("records = %#v, %v, want independent literal one", records, err)
 	}
 	record := records[0]
-	if !record.Files.Interrupted || record.Outcome != "discarded" {
+	if !record.Files.Interrupted || record.Outcome != "discarded" || record.CompletionKind != completionKindAbnormalDiscard {
 		t.Fatalf("walk interruption record = %#v, want interrupted discard", record)
 	}
 	if len(record.Files.Changes) != 0 {
@@ -1094,6 +1104,73 @@ func TestNonInteractiveDefaultDiscardWithDatabaseActivityIsNotAbnormal(t *testin
 	if !strings.Contains(logOut.String(), "Outcome:  discarded by the non-interactive default") ||
 		strings.Contains(logOut.String(), "abnormal end") {
 		t.Fatalf("non-interactive default detail is misleading:\n%s", logOut.String())
+	}
+}
+
+func TestRoutinePermissionOnlyCoverageGapDoesNotDisplayAsAbnormal(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	home := t.TempDir()
+	project := filepath.Join(home, "project")
+	restricted := filepath.Join(home, ".Trash")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(restricted, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(restricted, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(restricted, 0o700) })
+	if _, err := os.ReadDir(restricted); !os.IsPermission(err) {
+		t.Fatalf("test permission seam returned %v, want an OS permission refusal", err)
+	}
+	t.Setenv("HOME", home)
+	t.Chdir(project)
+
+	session := &reviewablePostgresSession{
+		unconfiguredPostgresSession: newUnconfiguredPostgresSession(),
+	}
+	previousFactory := unconfiguredPostgresSessionFactory
+	unconfiguredPostgresSessionFactory = func() postgresSession { return session }
+	defer func() { unconfiguredPostgresSessionFactory = previousFactory }()
+
+	var stdout, stderr strings.Builder
+	if code := Main([]string{
+		"run", "--snapshot-cap-bytes", strconv.FormatInt(1<<40, 10),
+		"--watch", project, "--", "/usr/bin/true",
+	}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("permission-gap run exit = %d\nstdout:\n%s\nstderr:\n%s",
+			code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "FILE COVERAGE INCOMPLETE:") ||
+		!strings.Contains(stderr.String(), restricted) {
+		t.Fatalf("permission gap disclosure was weakened:\n%s", stderr.String())
+	}
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %#v, %v, want independent literal one", records, err)
+	}
+	record := records[0]
+	if record.Files.Complete || !localrollback.HasOnlyRoutinePermissionScanFailures(record.Files) {
+		t.Fatalf("stored permission gap = %#v, want incomplete routine widened-scan refusal", record.Files)
+	}
+	if record.Outcome != "discarded" || record.CompletionKind != completionKindDefaultDiscard {
+		t.Fatalf("stored outcome = %q, completion kind = %q, want discarded and %q",
+			record.Outcome, record.CompletionKind, completionKindDefaultDiscard)
+	}
+	var logOut, logErr strings.Builder
+	if code := Main([]string{"log"}, strings.NewReader(""), &logOut, &logErr); code != 0 {
+		t.Fatalf("log exit = %d: %s", code, logErr.String())
+	}
+	line := outputLineContaining(logOut.String(), record.ID)
+	if !strings.Contains(line, "default discard") || strings.Contains(line, "abnormal end") {
+		t.Fatalf("permission-only displayed outcome = %q, want default discard", line)
 	}
 }
 

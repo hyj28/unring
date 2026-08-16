@@ -49,9 +49,12 @@ type Entry struct {
 
 // CaptureFailure identifies a path that was not protected by the snapshot.
 type CaptureFailure struct {
-	Path  string `json:"path"`
-	Error string `json:"error"`
+	Path     string `json:"path"`
+	Error    string `json:"error"`
+	Category string `json:"category,omitempty"`
 }
+
+const CaptureFailureCategoryRoutinePermission = "routine_permission_refusal"
 
 // IsUnsupportedFileTypeFailure identifies the declared informational coverage
 // class for special files that cannot be restored meaningfully per path.
@@ -74,6 +77,39 @@ func HasOnlyUnsupportedFileTypeFailures(summary Summary) bool {
 	}
 	wantError := formatFailures("post-session coverage incomplete", summary.PostSessionFailures)
 	return summary.Error == wantError
+}
+
+// HasOnlyRoutinePermissionScanFailures reports an incomplete widened scan whose
+// only gaps are OS-classified permission refusals. The coverage remains
+// incomplete and fully disclosed; this classification only prevents permanent
+// background TCC restrictions from making an otherwise normal session outcome
+// appear abnormal.
+func HasOnlyRoutinePermissionScanFailures(summary Summary) bool {
+	if summary.Complete || summary.Interrupted || len(summary.Unscanned) != 0 ||
+		len(summary.ScanFailures) == 0 || len(summary.PostSessionFailures) == 0 {
+		return false
+	}
+	for _, failure := range summary.Uncaptured {
+		if !IsUnsupportedFileTypeFailure(failure) {
+			return false
+		}
+	}
+	scanFailures := make(map[string]CaptureFailure, len(summary.ScanFailures))
+	for _, failure := range summary.ScanFailures {
+		if failure.Category != CaptureFailureCategoryRoutinePermission {
+			return false
+		}
+		scanFailures[failure.Path] = failure
+	}
+	if len(scanFailures) != len(summary.PostSessionFailures) {
+		return false
+	}
+	for _, failure := range summary.PostSessionFailures {
+		if recorded, ok := scanFailures[failure.Path]; !ok || recorded != failure {
+			return false
+		}
+	}
+	return summary.Error == formatFailures("post-session coverage incomplete", summary.PostSessionFailures)
 }
 
 // Change is one created, modified, or deleted path.
@@ -670,6 +706,10 @@ func (s *Session) sealContext(ctx context.Context, now time.Time, progress func(
 			after[path] = entry
 		}
 		for _, failure := range failures {
+			// A gap inside a watched root is session-specific even when the OS
+			// reports it as a permission refusal. Only the wider background scan
+			// may classify such a gap as routine for outcome presentation.
+			failure.Category = ""
 			scanFailures = append(scanFailures, failure)
 			diffExcluded[failure.Path] = true
 			rootDiffExcluded[index][failure.Path] = true
@@ -1613,7 +1653,7 @@ func scanRootWithNamesContext(ctx context.Context, root string, excluded, exclud
 	if !info.IsDir() {
 		entry, err := entryFromInfo(root, info)
 		if err != nil {
-			return entries, []CaptureFailure{{Path: root, Error: err.Error()}}, nil
+			return entries, []CaptureFailure{failureFromError(root, err)}, nil
 		}
 		entries[root] = entry
 		return entries, nil, nil
@@ -1625,7 +1665,7 @@ func scanRootWithNamesContext(ctx context.Context, root string, excluded, exclud
 			return err
 		}
 		if walkErr != nil {
-			failures = append(failures, CaptureFailure{Path: path, Error: walkErr.Error()})
+			failures = append(failures, failureFromError(path, walkErr))
 			if directoryEntry != nil && directoryEntry.IsDir() {
 				return filepath.SkipDir
 			}
@@ -1642,18 +1682,26 @@ func scanRootWithNamesContext(ctx context.Context, root string, excluded, exclud
 		}
 		info, infoErr := directoryEntry.Info()
 		if infoErr != nil {
-			failures = append(failures, CaptureFailure{Path: path, Error: infoErr.Error()})
+			failures = append(failures, failureFromError(path, infoErr))
 			return nil
 		}
 		entry, entryErr := entryFromInfo(path, info)
 		if entryErr != nil {
-			failures = append(failures, CaptureFailure{Path: path, Error: entryErr.Error()})
+			failures = append(failures, failureFromError(path, entryErr))
 			return nil
 		}
 		entries[path] = entry
 		return nil
 	})
 	return entries, failures, err
+}
+
+func failureFromError(path string, err error) CaptureFailure {
+	failure := CaptureFailure{Path: path, Error: err.Error()}
+	if os.IsPermission(err) {
+		failure.Category = CaptureFailureCategoryRoutinePermission
+	}
+	return failure
 }
 
 func isExcluded(path string, excluded []string) bool {
@@ -1941,10 +1989,13 @@ func storageDescription(methods map[string]bool) string {
 }
 
 func mergeFailures(groups ...[]CaptureFailure) []CaptureFailure {
-	byPath := make(map[string]string)
+	byPath := make(map[string]CaptureFailure)
 	for _, group := range groups {
 		for _, failure := range group {
-			byPath[failure.Path] = failure.Error
+			if existing, ok := byPath[failure.Path]; ok && existing.Category != failure.Category {
+				failure.Category = ""
+			}
+			byPath[failure.Path] = failure
 		}
 	}
 	paths := make([]string, 0, len(byPath))
@@ -1954,7 +2005,7 @@ func mergeFailures(groups ...[]CaptureFailure) []CaptureFailure {
 	sort.Strings(paths)
 	out := make([]CaptureFailure, 0, len(paths))
 	for _, path := range paths {
-		out = append(out, CaptureFailure{Path: path, Error: byPath[path]})
+		out = append(out, byPath[path])
 	}
 	return out
 }

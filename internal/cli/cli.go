@@ -811,7 +811,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		if *forceDiscard {
 			completionKind = completionKindExplicitDiscard
 		}
-		if interrupted || result.Err != nil || result.ExitCode != 0 || !fileSummary.Complete {
+		if interrupted || result.Err != nil || result.ExitCode != 0 || fileCoverageEndedAbnormally(fileSummary) {
 			completionKind = completionKindAbnormalDiscard
 		}
 		if result.Err != nil {
@@ -951,7 +951,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		if defaultDiscard {
 			completionKind = completionKindDefaultDiscard
 		}
-		if interrupted || result.Err != nil || result.ExitCode != 0 || interceptionErr != nil || !fileSummary.Complete {
+		if interrupted || result.Err != nil || result.ExitCode != 0 || interceptionErr != nil || fileCoverageEndedAbnormally(fileSummary) {
 			completionKind = completionKindAbnormalDiscard
 		}
 	}
@@ -1623,6 +1623,10 @@ func printCaptureFailure(output io.Writer, prefix string, failure localrollback.
 
 func hasActionableFileCoverageFailure(summary localrollback.Summary) bool {
 	return !localrollback.HasOnlyUnsupportedFileTypeFailures(summary)
+}
+
+func fileCoverageEndedAbnormally(summary localrollback.Summary) bool {
+	return !summary.Complete && !localrollback.HasOnlyRoutinePermissionScanFailures(summary)
 }
 
 func printStoredChange(output io.Writer, change localrollback.Change, interrupted bool) {

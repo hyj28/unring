@@ -137,6 +137,35 @@ func TestUnsupportedOnlyComparisonUsesPostSessionFailureSet(t *testing.T) {
 	}
 }
 
+func TestRoutinePermissionClassificationIsStrictlyLimitedToWidenedScanFailures(t *testing.T) {
+	permission := CaptureFailure{
+		Path:     "/literal/home/.Trash",
+		Error:    "open /literal/home/.Trash: operation not permitted",
+		Category: CaptureFailureCategoryRoutinePermission,
+	}
+	permissionError := "post-session coverage incomplete: /literal/home/.Trash: open /literal/home/.Trash: operation not permitted"
+	routine := Summary{
+		Complete:            false,
+		PostSessionFailures: []CaptureFailure{permission},
+		ScanFailures:        []CaptureFailure{permission},
+		Error:               permissionError,
+	}
+	if !HasOnlyRoutinePermissionScanFailures(routine) {
+		t.Fatalf("literal routine permission gap was classified abnormal: %#v", routine)
+	}
+	for _, summary := range []Summary{
+		{Complete: false, Interrupted: true, PostSessionFailures: []CaptureFailure{permission}, ScanFailures: []CaptureFailure{permission}, Error: permissionError},
+		{Complete: false, Unscanned: []CaptureFailure{{Path: "/literal/project", Error: "input/output error"}}, PostSessionFailures: []CaptureFailure{permission}, ScanFailures: []CaptureFailure{permission}, Error: permissionError},
+		{Complete: false, Uncaptured: []CaptureFailure{{Path: "/literal/project", Error: "permission denied"}}, PostSessionFailures: []CaptureFailure{permission}, ScanFailures: []CaptureFailure{permission}, Error: permissionError},
+		{Complete: false, PostSessionFailures: []CaptureFailure{{Path: "/literal/home/.Trash", Error: permission.Error}}, ScanFailures: []CaptureFailure{permission}, Error: permissionError},
+		{Complete: false, PostSessionFailures: []CaptureFailure{permission}, ScanFailures: []CaptureFailure{permission}, Error: permissionError + "; write manifest: no space left on device"},
+	} {
+		if HasOnlyRoutinePermissionScanFailures(summary) {
+			t.Fatalf("actionable incomplete summary was classified routine: %#v", summary)
+		}
+	}
+}
+
 func TestAgentStateRootsResolveSymlinkedHome(t *testing.T) {
 	physicalHome := t.TempDir()
 	logicalHome := filepath.Join(t.TempDir(), "home")

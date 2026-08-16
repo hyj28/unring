@@ -146,7 +146,7 @@ Design: [docs/LOCAL-ROLLBACK-DESIGN.md §9](docs/LOCAL-ROLLBACK-DESIGN.md). Deci
 
 ## M12 — Survivable session finalization
 
-Design: [docs/LOCAL-ROLLBACK-DESIGN.md §10](docs/LOCAL-ROLLBACK-DESIGN.md). Decisions 21–28.
+Design: [docs/LOCAL-ROLLBACK-DESIGN.md §10](docs/LOCAL-ROLLBACK-DESIGN.md). Decisions 21–29.
 
 - [x] M12.1 Batch and order-validate post-session `tmutil isexcluded` checks while preserving
       excluded-ancestor-only short-circuiting and reporting progress
@@ -168,6 +168,8 @@ Design: [docs/LOCAL-ROLLBACK-DESIGN.md §10](docs/LOCAL-ROLLBACK-DESIGN.md). Dec
       incomplete roots during live review and restore execution
 - [x] M12.8 Parse tmutil's real two-space status separator without trimming path whitespace,
       and distinguish the documented non-interactive default discard from abnormal endings
+- [x] M12.9 Keep routine OS-classified permission gaps in the widened background scan fully
+      disclosed without labelling an otherwise normal session as an abnormal end
 
 ---
 

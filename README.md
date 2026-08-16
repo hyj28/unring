@@ -137,6 +137,12 @@ Interrupted human-readable listings say that coverage is
 incomplete without calling a canceled post-session walk a snapshot failure, while `log
 --json` retains the exact diagnostic cause.
 
+Widened background-scan paths that macOS permanently refuses through TCC remain explicit
+coverage gaps in live review, stored review, and JSON. When those OS-classified permission
+refusals are the only incomplete file coverage, they do not label an otherwise normal session
+as an abnormal end. Permission failures inside a watched root, an unscanned watched root,
+interruption, persistence failure, and every other incomplete state remain abnormal.
+
 After the child exits, inspect and restore file changes at any later time:
 
 ```sh
