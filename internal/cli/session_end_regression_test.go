@@ -1,10 +1,13 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -173,8 +176,12 @@ func TestSignalDuringFilesystemWalkDoesNotClaimSnapshotFailure(t *testing.T) {
 	}
 	started := make(chan struct{})
 	var once sync.Once
+	childFinished := filepath.Join(t.TempDir(), "child-finished")
 	restoreHook := localrollback.SetScanPathHookForTest(func(ctx context.Context, _ string) {
 		if ctx.Done() == nil {
+			return
+		}
+		if _, err := os.Stat(childFinished); err != nil {
 			return
 		}
 		once.Do(func() { close(started) })
@@ -185,7 +192,7 @@ func TestSignalDuringFilesystemWalkDoesNotClaimSnapshotFailure(t *testing.T) {
 	exited := make(chan int, 1)
 	go func() {
 		exited <- Main([]string{
-			"run", "--watch-only", root, "--", "/usr/bin/true",
+			"run", "--watch-only", root, "--", "/usr/bin/touch", childFinished,
 		}, strings.NewReader(""), &stdout, &stderr)
 	}()
 	select {
@@ -216,6 +223,16 @@ func TestSignalDuringFilesystemWalkDoesNotClaimSnapshotFailure(t *testing.T) {
 	if !record.Files.Interrupted || record.Outcome != "discarded" {
 		t.Fatalf("walk interruption record = %#v, want interrupted discard", record)
 	}
+	if len(record.Files.Changes) != 0 {
+		t.Fatalf("interrupted unchanged tree recorded %d changes, want independent literal 0: %#v",
+			len(record.Files.Changes), record.Files.Changes)
+	}
+	if len(record.Files.Unscanned) != 1 || record.Files.Unscanned[0].Path != root {
+		t.Fatalf("interrupted unscanned roots = %#v, want independently selected watched root", record.Files.Unscanned)
+	}
+	if strings.Contains(stdout.String(), "deleted") {
+		t.Fatalf("live output fabricated a deletion for an unchanged tree:\n%s", stdout.String())
+	}
 	for _, failure := range record.Files.Uncaptured {
 		if strings.Contains(failure.Error, context.Canceled.Error()) {
 			t.Fatalf("walk cancellation was stored as uncaptured snapshot: %#v", record.Files.Uncaptured)
@@ -228,12 +245,83 @@ func TestSignalDuringFilesystemWalkDoesNotClaimSnapshotFailure(t *testing.T) {
 	if strings.Contains(logOut.String(), "context canceled") || strings.Contains(logOut.String(), "FILE NOT SNAPSHOTTED") {
 		t.Fatalf("walk cancellation leaked internal or false snapshot wording:\n%s", logOut.String())
 	}
+	if !strings.Contains(logOut.String(), "WATCHED ROOT CHANGE LIST UNAVAILABLE") {
+		t.Fatalf("log detail omitted the unscanned watched root:\n%s", logOut.String())
+	}
 	var jsonOut, jsonErr strings.Builder
 	if code := Main([]string{"log", "--json", record.ID}, strings.NewReader(""), &jsonOut, &jsonErr); code != 0 {
 		t.Fatalf("JSON log exit = %d: %s", code, jsonErr.String())
 	}
 	if !strings.Contains(jsonOut.String(), context.Canceled.Error()) {
 		t.Fatalf("structured record omitted precise walk cancellation:\n%s", jsonOut.String())
+	}
+}
+
+func TestSignalDuringPreSessionFilesystemScanEndsAsDiscardWithoutStartingChild(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "baseline.txt"), []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	childMarker := filepath.Join(t.TempDir(), "child-started")
+	started := make(chan struct{})
+	var once sync.Once
+	restoreHook := localrollback.SetScanPathHookForTest(func(ctx context.Context, _ string) {
+		if ctx.Done() == nil {
+			return
+		}
+		once.Do(func() { close(started) })
+		<-ctx.Done()
+	})
+	defer restoreHook()
+
+	var stdout, stderr strings.Builder
+	exited := make(chan int, 1)
+	go func() {
+		exited <- Main([]string{
+			"run", "--watch-only", root, "--", "/usr/bin/touch", childMarker,
+		}, strings.NewReader(""), &stdout, &stderr)
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("pre-session filesystem scan did not start")
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-exited:
+		if code != 128+int(syscall.SIGINT) {
+			t.Fatalf("exit = %d, want independent signal literal %d", code, 128+int(syscall.SIGINT))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("signal did not cancel the pre-session filesystem scan")
+	}
+	if _, err := os.Stat(childMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("child marker stat = %v, want child not started", err)
+	}
+	if !strings.Contains(stderr.String(), "interrupt received during the pre-session filesystem scan") {
+		t.Fatalf("pre-session signal was not acknowledged:\n%s", stderr.String())
+	}
+	assertLatestSessionInterruptedDiscard(t, stateDir)
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %#v, %v, want independent literal one", records, err)
+	}
+	var logOut, logErr strings.Builder
+	if code := Main([]string{"log", records[0].ID}, strings.NewReader(""), &logOut, &logErr); code != 0 {
+		t.Fatalf("log detail exit = %d: %s", code, logErr.String())
+	}
+	if !strings.Contains(logOut.String(), "interrupted during pre-session filesystem scan") ||
+		strings.Contains(logOut.String(), context.Canceled.Error()) ||
+		strings.Contains(logOut.String(), "the post-session scan was interrupted") {
+		t.Fatalf("pre-session interruption detail was inaccurate:\n%s", logOut.String())
 	}
 }
 
@@ -301,6 +389,67 @@ func TestSecondPostChildSignalKeepsDurableDiscardInProgress(t *testing.T) {
 	}
 }
 
+func TestPostSessionProgressStopsBeforeInterruptAcknowledgement(t *testing.T) {
+	t.Setenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP", "")
+	t.Setenv("DATABASE_URL", "")
+	stateDir := t.TempDir()
+	home := t.TempDir()
+	project := t.TempDir()
+	t.Setenv("UNRING_STATE_DIR", stateDir)
+	t.Setenv("HOME", home)
+	t.Chdir(project)
+	platform := &cancelableBatchPlatform{
+		cliBackstopPlatform: cliBackstopPlatform{excluded: map[string]bool{}},
+		started:             make(chan struct{}),
+		canceled:            make(chan struct{}),
+		release:             make(chan struct{}),
+	}
+	restorePlatform := localrollback.SetVolumeSnapshotPlatformForTest(platform)
+	defer restorePlatform()
+	previousInterval := sealProgressInterval
+	sealProgressInterval = 10 * time.Millisecond
+	defer func() { sealProgressInterval = previousInterval }()
+	outFile := filepath.Join(home, "progress-order.txt")
+	var stdout, stderr strings.Builder
+	exited := make(chan int, 1)
+	go func() {
+		exited <- Main([]string{
+			"run", "--watch", project, "--", "/bin/sh", "-c", `printf changed > "$1"`, "sh", outFile,
+		}, strings.NewReader(""), &stdout, &stderr)
+	}()
+	select {
+	case <-platform.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("post-child batch did not start")
+	}
+	time.Sleep(35 * time.Millisecond)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-platform.canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("signal did not cancel batch")
+	}
+	time.Sleep(35 * time.Millisecond)
+	close(platform.release)
+	select {
+	case code := <-exited:
+		if code != 128+int(syscall.SIGINT) {
+			t.Fatalf("exit = %d, want independent signal literal %d", code, 128+int(syscall.SIGINT))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("interrupted run did not finish")
+	}
+	output := stderr.String()
+	progressIndex := strings.LastIndex(output, "is still running")
+	acknowledgementIndex := strings.Index(output, "interrupt received during the post-session scan")
+	if progressIndex < 0 || acknowledgementIndex < 0 || progressIndex > acknowledgementIndex {
+		t.Fatalf("progress/acknowledgement order = %d/%d, want progress strictly before stop message:\n%s",
+			progressIndex, acknowledgementIndex, output)
+	}
+}
+
 func TestSignalDuringAutomaticRetentionIsRecordedAsInterruptedDiscard(t *testing.T) {
 	stateDir := t.TempDir()
 	configureStorageHygieneTest(t, stateDir)
@@ -344,6 +493,154 @@ func TestSignalDuringAutomaticRetentionIsRecordedAsInterruptedDiscard(t *testing
 		t.Fatalf("retention signal was not acknowledged:\n%s", stderr.String())
 	}
 	assertLatestSessionInterruptedDiscard(t, stateDir)
+}
+
+func TestSignalDuringPreChildAutomaticRetentionEndsAsDiscardWithoutStartingChild(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	started := make(chan struct{})
+	previousHook := automaticRetentionTestHook
+	automaticRetentionTestHook = func(ctx context.Context) {
+		close(started)
+		<-ctx.Done()
+	}
+	defer func() { automaticRetentionTestHook = previousHook }()
+	childMarker := filepath.Join(t.TempDir(), "child-started")
+	root := t.TempDir()
+	var stdout, stderr strings.Builder
+	exited := make(chan int, 1)
+	go func() {
+		exited <- Main([]string{
+			"run", "--watch-only", root, "--", "/usr/bin/touch", childMarker,
+		}, strings.NewReader(""), &stdout, &stderr)
+	}()
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("pre-child automatic retention did not start")
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case code := <-exited:
+		if code != 128+int(syscall.SIGTERM) {
+			t.Fatalf("exit = %d, want independent signal literal %d", code, 128+int(syscall.SIGTERM))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("signal did not cancel pre-child automatic retention")
+	}
+	if _, err := os.Stat(childMarker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("child marker stat = %v, want child not started", err)
+	}
+	if !strings.Contains(stderr.String(), "termination signal received during automatic retention before the child starts") {
+		t.Fatalf("pre-child retention signal was not acknowledged:\n%s", stderr.String())
+	}
+	assertLatestSessionInterruptedDiscard(t, stateDir)
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %#v, %v, want independent literal one", records, err)
+	}
+	sealed, err := localrollback.LoadSealedSummary(stateDir, records[0].ID)
+	if err != nil {
+		t.Fatalf("pre-child retention interruption left an unsealed manifest: %v", err)
+	}
+	if !sealed.Interrupted || sealed.InterruptedPhase != "automatic retention before the child started" {
+		t.Fatalf("sealed pre-child interruption = %#v, want exact retention phase", sealed)
+	}
+	var restoreOut, restoreErr strings.Builder
+	if code := Main([]string{"restore", records[0].ID}, strings.NewReader(""), &restoreOut, &restoreErr); code != 0 {
+		t.Fatalf("restore listing exit = %d, want literal 0: %s", code, restoreErr.String())
+	}
+	if !strings.Contains(restoreOut.String(), "interrupted during automatic retention before the child started") {
+		t.Fatalf("restore listing omitted pre-child interruption phase:\n%s", restoreOut.String())
+	}
+}
+
+func TestAutomaticRetentionReportsProgressBeforeChildStarts(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	previousHook := automaticRetentionTestHook
+	previousInterval := automaticRetentionProgressInterval
+	automaticRetentionProgressInterval = 10 * time.Millisecond
+	childMarker := filepath.Join(t.TempDir(), "child-started")
+	var calls int
+	automaticRetentionTestHook = func(context.Context) {
+		calls++
+		if calls == 1 {
+			time.Sleep(35 * time.Millisecond)
+			if _, err := os.Stat(childMarker); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("child marker during pre-child retention = %v, want child not started", err)
+			}
+		}
+	}
+	defer func() {
+		automaticRetentionTestHook = previousHook
+		automaticRetentionProgressInterval = previousInterval
+	}()
+	_, stderr := runMainSession(t, t.TempDir(), "/usr/bin/touch", childMarker)
+	if !strings.Contains(stderr, "automatic retention is still running") {
+		t.Fatalf("pre-child retention emitted no progress:\n%s", stderr)
+	}
+}
+
+func TestClosedOutputPipeRecordsInterruptedDiscard(t *testing.T) {
+	binary := buildTestBinary(t)
+	stateDir := t.TempDir()
+	root := t.TempDir()
+	command := exec.Command(binary,
+		"run", "--snapshot-cap-bytes", strconv.FormatInt(1<<40, 10),
+		"--watch-only", root, "--", "/bin/sh", "-c",
+		`i=0; while [ "$i" -lt 100 ]; do printf x > "$1/file-$i"; i=$((i+1)); done`, "sh", root,
+	)
+	command.Env = append(os.Environ(),
+		"UNRING_STATE_DIR="+stateDir,
+		"UNRING_TEST_DISABLE_VOLUME_BACKSTOP=1",
+		"DATABASE_URL=",
+	)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(stdout)
+	for line := 0; line < 4; line++ {
+		if _, err := reader.ReadString('\n'); err != nil {
+			t.Fatalf("read output line %d before closing pipe: %v", line+1, err)
+		}
+	}
+	if err := stdout.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitErr := command.Wait()
+	var exitErr *exec.ExitError
+	if !errors.As(waitErr, &exitErr) || exitErr.ExitCode() != 128+int(syscall.SIGPIPE) {
+		t.Fatalf("closed-pipe exit = %v, want independent signal literal %d; stderr:\n%s",
+			waitErr, 128+int(syscall.SIGPIPE), stderr.String())
+	}
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %#v, %v, want independent literal one", records, err)
+	}
+	record := records[0]
+	if record.Outcome != "discarded" || record.CompletionKind != completionKindAbnormalDiscard || record.EndedAt.IsZero() {
+		t.Fatalf("closed-pipe record = %#v, want ended abnormal discard", record)
+	}
+	if record.ExitCode != 128+int(syscall.SIGPIPE) {
+		t.Fatalf("recorded exit = %d, want independent signal literal %d", record.ExitCode, 128+int(syscall.SIGPIPE))
+	}
 }
 
 func TestSignalDuringFinalizeIsRecordedAsInterruptedDiscard(t *testing.T) {

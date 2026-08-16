@@ -320,6 +320,54 @@ func TestCanceledFilesystemWalkPublishesInterruptedManifestWithoutUncapturedSnap
 	}
 }
 
+func TestPartlyCanceledFilesystemWalkDoesNotFabricateDeletions(t *testing.T) {
+	stateDir := t.TempDir()
+	root := t.TempDir()
+	for _, name := range []string{"alpha.txt", "bravo.txt", "charlie.txt"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("unchanged"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	session, _, err := StartScope(stateDir, "partly-canceled-filesystem-walk", Scope{
+		Watched: []string{root},
+	}, 1<<30, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	visited := 0
+	restoreHook := SetScanPathHookForTest(func(hookContext context.Context, _ string) {
+		if hookContext != ctx {
+			return
+		}
+		visited++
+		if visited == 2 {
+			cancel()
+		}
+	})
+	defer restoreHook()
+	summary := session.SealContext(ctx, time.Unix(2, 0), nil)
+	if visited != 2 {
+		t.Fatalf("walk visited %d paths before cancellation, want independent literal 2", visited)
+	}
+	if len(summary.Changes) != 0 {
+		t.Fatalf("recorded %d changes for an unchanged tree, want independent literal 0: %#v", len(summary.Changes), summary.Changes)
+	}
+	if len(summary.Unscanned) != 1 || summary.Unscanned[0].Path != root {
+		t.Fatalf("unscanned roots = %#v, want the independently selected watched root", summary.Unscanned)
+	}
+	stored, err := LoadSealedSummary(stateDir, "partly-canceled-filesystem-walk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Changes) != 0 {
+		t.Fatalf("stored manifest recorded %d fabricated changes, want independent literal 0: %#v", len(stored.Changes), stored.Changes)
+	}
+	if len(stored.Unscanned) != 1 || stored.Unscanned[0].Path != root {
+		t.Fatalf("stored unscanned roots = %#v, want the independently selected watched root", stored.Unscanned)
+	}
+}
+
 func formatReviewIndex(index int) string {
 	const digits = "0123456789"
 	return string([]byte{

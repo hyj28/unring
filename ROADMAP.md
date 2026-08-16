@@ -160,6 +160,9 @@ Design: [docs/LOCAL-ROLLBACK-DESIGN.md §10](docs/LOCAL-ROLLBACK-DESIGN.md). Dec
 - [x] M12.5 Keep signal handling continuous through retention and finalization, make retention
       cancellation-aware, normalize and isolate `tmutil` paths with per-path fallback, publish
       interruption before completeness, and bound agent/outside presentation roots fairly
+- [x] M12.6 Start signal ownership before baseline capture and pre-child retention, treat closed
+      output pipes as durable interruption, report retention progress, and never diff a watched
+      root whose post-session walk did not finish
 
 ---
 

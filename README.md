@@ -69,6 +69,9 @@ link group honestly.
 The change list is wider than the clone scope: unring scans the home directory before and
 after the child runs, excluding `~/Library`, `node_modules`, `.git`, `.cache`, and `~/go/pkg`.
 The scan is metadata-only and its progress is announced because it can take several seconds.
+If a watched-root walk cannot finish, that root is omitted from the diff and named as
+unavailable; a partial walk is never interpreted as evidence that its unvisited files were
+deleted.
 A replacement `--watch-only` scope also replaces this wider scan; the clone diff already
 covers exactly those explicitly selected roots. Changes elsewhere are not reported or
 written to the audit record, even when the whole-volume snapshot contains them, so the
@@ -121,11 +124,13 @@ breaks make a multi-path response unsafe are checked alone; any unusable batch f
 one check and one independently attributed result per path. The terminal reports scan and
 batch progress.
 
-`SIGINT` and `SIGTERM` remain active from child exit through scanning, automatic retention,
-interceptor sealing, and finalization. Either signal cancels the active phase, selects discard,
-and records an abnormal outcome that later `log` and `restore` commands can inspect. A second
-signal is acknowledged but does not bypass durable discard finalization; the first signal
-determines the exit status. Interrupted human-readable listings say that coverage is
+`SIGINT`, `SIGTERM`, and a closed output pipe remain handled from the pre-session filesystem
+scan and automatic retention, through the child, post-session scanning, interceptor sealing,
+and finalization. A signal cancels the active phase, selects discard, and records an abnormal
+outcome that later `log` and `restore` commands can inspect. Automatic retention reports
+periodic progress even when it runs before the child. A second signal is acknowledged but does
+not bypass durable discard finalization; the first signal determines the exit status.
+Interrupted human-readable listings say that coverage is
 incomplete without calling a canceled post-session walk a snapshot failure, while `log
 --json` retains the exact diagnostic cause.
 

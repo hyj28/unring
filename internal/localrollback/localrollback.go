@@ -111,10 +111,12 @@ type Summary struct {
 	Watched             []string         `json:"watched_paths"`
 	AgentStateRoots     []string         `json:"agent_state_roots,omitempty"`
 	Uncaptured          []CaptureFailure `json:"uncaptured_paths"`
+	Unscanned           []CaptureFailure `json:"unscanned_watched_roots,omitempty"`
 	PostSessionFailures []CaptureFailure `json:"post_session_coverage_failures,omitempty"`
 	Changes             []Change         `json:"changes"`
 	Complete            bool             `json:"complete"`
 	Interrupted         bool             `json:"post_session_scan_interrupted,omitempty"`
+	InterruptedPhase    string           `json:"interrupted_phase,omitempty"`
 	Error               string           `json:"error,omitempty"`
 	Storage             string           `json:"storage"`
 	LogicalBytes        int64            `json:"logical_bytes"`
@@ -161,6 +163,7 @@ type manifest struct {
 	Changes             []Change         `json:"changes,omitempty"`
 	Complete            bool             `json:"complete"`
 	Interrupted         bool             `json:"post_session_scan_interrupted,omitempty"`
+	InterruptedPhase    string           `json:"interrupted_phase,omitempty"`
 	Error               string           `json:"error,omitempty"`
 	Storage             string           `json:"storage"`
 	LogicalBytes        int64            `json:"logical_bytes"`
@@ -175,6 +178,7 @@ type manifest struct {
 	ScanExcludedNames   []string         `json:"scan_excluded_names,omitempty"`
 	ScanFailures        []CaptureFailure `json:"scan_failures,omitempty"`
 	PostSessionFailures []CaptureFailure `json:"post_session_coverage_failures,omitempty"`
+	Unscanned           []CaptureFailure `json:"unscanned_watched_roots,omitempty"`
 	ScanBeforeFiles     int              `json:"scan_before_files,omitempty"`
 	ScanAfterFiles      int              `json:"scan_after_files,omitempty"`
 	ScanBeforeMillis    int64            `json:"scan_before_ms,omitempty"`
@@ -351,23 +355,30 @@ func RetentionCapForState(stateDir string) (int64, error) {
 // platform's recursive fast path, then falls back to per-entry capture so that
 // one unreadable path does not erase coverage for the rest of a tree.
 func Start(stateDir, sessionID string, watched []string, capBytes int64, now time.Time) (*Session, Summary, error) {
-	return start(stateDir, sessionID, watched, nil, nil, AgentStateRoots(""), ChangeListScopeCloneOnly, watched, "", nil, nil, "", capBytes, now)
+	return start(context.Background(), stateDir, sessionID, watched, nil, nil, AgentStateRoots(""), ChangeListScopeCloneOnly, watched, "", nil, nil, "", capBytes, now)
 }
 
 // StartWithExclusions captures watched paths while omitting physically resolved
 // config exclusions in addition to unring's own state directory.
 func StartWithExclusions(stateDir, sessionID string, watched, excluded []string, capBytes int64, now time.Time) (*Session, Summary, error) {
-	return start(stateDir, sessionID, watched, excluded, nil, AgentStateRoots(""), ChangeListScopeCloneOnly, watched, "", nil, nil, "", capBytes, now)
+	return start(context.Background(), stateDir, sessionID, watched, excluded, nil, AgentStateRoots(""), ChangeListScopeCloneOnly, watched, "", nil, nil, "", capBytes, now)
 }
 
 // StartScope captures a previously resolved scope, including any explicit
 // watches that configuration exclusions made uncapturable.
 func StartScope(stateDir, sessionID string, scope Scope, capBytes int64, now time.Time) (*Session, Summary, error) {
+	return StartScopeContext(context.Background(), stateDir, sessionID, scope, capBytes, now)
+}
+
+// StartScopeContext captures the pre-session snapshot and baseline while
+// allowing an interrupted run to stop before its child is launched.
+func StartScopeContext(ctx context.Context, stateDir, sessionID string, scope Scope, capBytes int64, now time.Time) (*Session, Summary, error) {
 	agentStateRoots := scope.AgentStateRoots
 	if len(agentStateRoots) == 0 {
 		agentStateRoots = AgentStateRoots("")
 	}
 	return start(
+		ctx,
 		stateDir, sessionID, scope.Watched, scope.Excluded, scope.Uncaptured,
 		agentStateRoots,
 		scope.ChangeListScope, scope.ChangeListRoots,
@@ -377,6 +388,7 @@ func StartScope(stateDir, sessionID string, scope Scope, capBytes int64, now tim
 }
 
 func start(
+	ctx context.Context,
 	stateDir, sessionID string,
 	watched, excluded []string,
 	preflightFailures []CaptureFailure,
@@ -389,6 +401,9 @@ func start(
 	capBytes int64,
 	now time.Time,
 ) (*Session, Summary, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, Summary{}, err
+	}
 	if sessionID == "" || strings.ContainsAny(sessionID, `/\\`) {
 		return nil, Summary{}, errors.New("start file snapshot: invalid session id")
 	}
@@ -454,9 +469,12 @@ func start(
 	var failures []CaptureFailure
 	methods := make(map[string]bool)
 	for index, root := range roots {
+		if err := ctx.Err(); err != nil {
+			return nil, Summary{}, err
+		}
 		relSnapshot := filepath.Join("roots", fmt.Sprintf("%06d", index))
 		destination := filepath.Join(temporary, relSnapshot)
-		rootState, rootFailures, rootMethods, logicalBytes, copiedBytes, captureErr := captureRoot(root, destination, m.Excluded)
+		rootState, rootFailures, rootMethods, logicalBytes, copiedBytes, captureErr := captureRootContext(ctx, root, destination, m.Excluded)
 		rootState.Snapshot = relSnapshot
 		m.Roots = append(m.Roots, rootState)
 		failures = append(failures, rootFailures...)
@@ -480,12 +498,18 @@ func start(
 		m.ScanFailures = append(m.ScanFailures, CaptureFailure{Path: "home directory", Error: scanError})
 	} else if scanRoot != "" {
 		scanStarted := time.Now()
-		scanBefore, m.ScanFailures, err = scanRootWithNames(scanRoot, m.ScanExcluded, m.ScanExcludedNames)
+		scanBefore, m.ScanFailures, err = scanRootWithNamesContext(ctx, scanRoot, m.ScanExcluded, m.ScanExcludedNames)
 		m.ScanBeforeMillis = time.Since(scanStarted).Milliseconds()
 		m.ScanBeforeFiles = len(scanBefore)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, Summary{}, ctx.Err()
+			}
 			m.ScanFailures = append(m.ScanFailures, CaptureFailure{Path: scanRoot, Error: err.Error()})
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, Summary{}, err
 	}
 	failures = mergeFailures(failures)
 	m.Storage = storageDescription(methods)
@@ -579,13 +603,19 @@ func (s *Session) Seal(now time.Time) Summary {
 // SealContext seals the durable manifest even when ctx interrupts the scan.
 // The resulting incomplete summary is safe to record as a discarded session.
 func (s *Session) SealContext(ctx context.Context, now time.Time, progress func(SealProgress)) Summary {
+	return s.sealContext(ctx, now, progress, "post-session filesystem scan")
+}
+
+// SealInterruptedContext publishes a definite incomplete manifest when a run
+// is interrupted after snapshot capture but before its child starts.
+func (s *Session) SealInterruptedContext(ctx context.Context, now time.Time, phase string) Summary {
+	return s.sealContext(ctx, now, nil, phase)
+}
+
+func (s *Session) sealContext(ctx context.Context, now time.Time, progress func(SealProgress), interruptedPhase string) Summary {
 	availableBefore, measuredBefore, measureBeforeErr := filesystemAvailableBytes(s.dir)
-	before := make(map[string]Entry)
 	diffExcluded := make(map[string]bool)
 	for _, root := range s.manifest.Roots {
-		for path, entry := range root.Before {
-			before[path] = entry
-		}
 		for path := range root.Uncaptured {
 			diffExcluded[path] = true
 		}
@@ -594,6 +624,7 @@ func (s *Session) SealContext(ctx context.Context, now time.Time, progress func(
 	rootAfter := make([]map[string]Entry, len(s.manifest.Roots))
 	rootScanned := make([]bool, len(s.manifest.Roots))
 	rootDiffExcluded := make([]map[string]bool, len(s.manifest.Roots))
+	s.manifest.Unscanned = nil
 	initialUncaptured := make([]map[string]bool, len(s.manifest.Roots))
 	for index, root := range s.manifest.Roots {
 		initialUncaptured[index] = make(map[string]bool, len(root.Uncaptured))
@@ -603,6 +634,7 @@ func (s *Session) SealContext(ctx context.Context, now time.Time, progress func(
 	}
 	var scanFailures []CaptureFailure
 	var coverageGaps []CaptureFailure
+	unscannedRoots := make(map[string]bool)
 	for index := range s.manifest.Roots {
 		root := &s.manifest.Roots[index]
 		if !root.Existed || root.Source == "" {
@@ -616,6 +648,8 @@ func (s *Session) SealContext(ctx context.Context, now time.Time, progress func(
 			}
 			failure := CaptureFailure{Path: root.Path, Error: message}
 			scanFailures = append(scanFailures, failure)
+			s.manifest.Unscanned = append(s.manifest.Unscanned, failure)
+			unscannedRoots[root.Path] = true
 			diffExcluded[failure.Path] = true
 			root.Uncaptured[failure.Path] = failure.Error
 			continue
@@ -624,6 +658,8 @@ func (s *Session) SealContext(ctx context.Context, now time.Time, progress func(
 		if err != nil {
 			failure := CaptureFailure{Path: root.Path, Error: err.Error()}
 			scanFailures = append(scanFailures, failure)
+			s.manifest.Unscanned = append(s.manifest.Unscanned, failure)
+			unscannedRoots[root.Path] = true
 			diffExcluded[failure.Path] = true
 			if ctx.Err() == nil {
 				root.Uncaptured[failure.Path] = failure.Error
@@ -647,7 +683,19 @@ func (s *Session) SealContext(ctx context.Context, now time.Time, progress func(
 			root.Uncaptured[failure.Path] = failure.Error
 		}
 	}
-	changes := diff(before, after, diffExcluded, s.manifest.Roots, s.dir)
+	// A partial walk cannot establish absence. Diff only roots whose after-scan
+	// completed, otherwise every unvisited baseline entry would be fabricated
+	// as a deletion. The unavailable root remains explicit in Unscanned.
+	beforeScanned := make(map[string]Entry)
+	for index, root := range s.manifest.Roots {
+		if !rootScanned[index] {
+			continue
+		}
+		for path, entry := range root.Before {
+			beforeScanned[path] = entry
+		}
+	}
+	changes := diff(beforeScanned, after, diffExcluded, s.manifest.Roots, s.dir)
 	coveragePrefixes := failurePrefixes(coverageGaps)
 	coverageMessages := failureMessages(coverageGaps)
 	for index := range changes {
@@ -707,6 +755,9 @@ func (s *Session) SealContext(ctx context.Context, now time.Time, progress func(
 	}
 	for _, change := range wideChanges {
 		change, cloneCovered := mapWideChangeToClonePath(change, s.manifest.Roots)
+		if coveredBy(change.Path, unscannedRoots) {
+			continue
+		}
 		if _, exists := changeIndexes[change.Path]; exists {
 			continue
 		}
@@ -734,6 +785,7 @@ func (s *Session) SealContext(ctx context.Context, now time.Time, progress func(
 	if ctx.Err() != nil {
 		s.manifest.Complete = false
 		s.manifest.Interrupted = true
+		s.manifest.InterruptedPhase = interruptedPhase
 		s.manifest.StorageExact = false
 		s.manifest.Error = joinText(s.manifest.Error, "measure retained snapshot after interrupted seal: "+ctx.Err().Error())
 	}
@@ -778,9 +830,11 @@ func (s *Session) SealContext(ctx context.Context, now time.Time, progress func(
 	}
 	s.summary.Changes = changes
 	s.summary.Uncaptured = manifestFailures(s.manifest)
+	s.summary.Unscanned = append([]CaptureFailure(nil), s.manifest.Unscanned...)
 	s.summary.PostSessionFailures = append([]CaptureFailure(nil), s.manifest.PostSessionFailures...)
 	s.summary.Complete = s.manifest.Complete
 	s.summary.Interrupted = s.manifest.Interrupted
+	s.summary.InterruptedPhase = s.manifest.InterruptedPhase
 	s.summary.Error = s.manifest.Error
 	s.summary.StorageBytes = s.manifest.StorageBytes
 	s.summary.StorageExact = s.manifest.StorageExact
@@ -1146,6 +1200,10 @@ func (s *Session) Snapshot() Summary {
 }
 
 func captureRoot(root, destination string, excluded []string) (rootManifest, []CaptureFailure, map[string]bool, int64, int64, error) {
+	return captureRootContext(context.Background(), root, destination, excluded)
+}
+
+func captureRootContext(ctx context.Context, root, destination string, excluded []string) (rootManifest, []CaptureFailure, map[string]bool, int64, int64, error) {
 	state := rootManifest{Path: root, Before: make(map[string]Entry), Uncaptured: make(map[string]string)}
 	methods := make(map[string]bool)
 	source, resolveErr := filepath.EvalSymlinks(root)
@@ -1178,25 +1236,31 @@ func captureRoot(root, destination string, excluded []string) (rootManifest, []C
 	// metadata guards and admit a baseline only when the captured membership,
 	// type, link target, and file size match that stable source state. Snapshot
 	// bytes and the source metadata baseline therefore describe the same instant.
-	sourceGuardBefore, beforeFailures, err := scanMappedRoot(source, root, excluded)
+	sourceGuardBefore, beforeFailures, err := scanMappedRootContext(ctx, source, root, excluded)
 	if err != nil {
 		return state, beforeFailures, methods, 0, 0, err
 	}
 
 	var captureFailures []CaptureFailure
 	var copiedBytes int64
+	if err := ctx.Err(); err != nil {
+		return state, beforeFailures, methods, 0, 0, err
+	}
 	if info.IsDir() && !isExcluded(source, excluded) && !containsExcludedPath(source, excluded) {
 		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 			return state, beforeFailures, methods, 0, 0, err
 		}
 		if method, err := cloneDirectory(source, destination); err == nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return state, beforeFailures, methods, 0, 0, ctxErr
+			}
 			methods[method] = true
 		} else {
 			if err := removeSnapshotTree(destination); err != nil {
 				return state, beforeFailures, methods, 0, 0, fmt.Errorf("remove failed recursive clone: %w", err)
 			}
 			var fallbackMethods map[string]bool
-			captureFailures, fallbackMethods, copiedBytes, err = captureIndividually(source, destination, excluded)
+			captureFailures, fallbackMethods, copiedBytes, err = captureIndividuallyContext(ctx, source, destination, excluded)
 			captureFailures = translateFailures(captureFailures, source, root)
 			if err != nil {
 				return state, mergeFailures(beforeFailures, captureFailures), methods, 0, copiedBytes, err
@@ -1207,7 +1271,7 @@ func captureRoot(root, destination string, excluded []string) (rootManifest, []C
 		}
 	} else {
 		var fallbackMethods map[string]bool
-		captureFailures, fallbackMethods, copiedBytes, err = captureIndividually(source, destination, excluded)
+		captureFailures, fallbackMethods, copiedBytes, err = captureIndividuallyContext(ctx, source, destination, excluded)
 		captureFailures = translateFailures(captureFailures, source, root)
 		if err != nil {
 			return state, mergeFailures(beforeFailures, captureFailures), methods, 0, copiedBytes, err
@@ -1217,11 +1281,11 @@ func captureRoot(root, destination string, excluded []string) (rootManifest, []C
 		}
 	}
 
-	snapshotEntries, snapshotFailures, err := scanSnapshotRoot(destination, root)
+	snapshotEntries, snapshotFailures, err := scanSnapshotRootContext(ctx, destination, root)
 	if err != nil {
 		return state, mergeFailures(beforeFailures, captureFailures, snapshotFailures), methods, 0, copiedBytes, err
 	}
-	sourceGuardAfter, afterFailures, err := scanMappedRoot(source, root, excluded)
+	sourceGuardAfter, afterFailures, err := scanMappedRootContext(ctx, source, root, excluded)
 	if err != nil {
 		return state, mergeFailures(beforeFailures, captureFailures, snapshotFailures, afterFailures), methods, 0, copiedBytes, err
 	}
@@ -1284,7 +1348,11 @@ func translateFailures(failures []CaptureFailure, sourceRoot, reportedRoot strin
 }
 
 func scanSnapshotRoot(snapshotRoot, originalRoot string) (map[string]Entry, []CaptureFailure, error) {
-	entries, failures, err := scanRoot(snapshotRoot, nil)
+	return scanSnapshotRootContext(context.Background(), snapshotRoot, originalRoot)
+}
+
+func scanSnapshotRootContext(ctx context.Context, snapshotRoot, originalRoot string) (map[string]Entry, []CaptureFailure, error) {
+	entries, failures, err := scanRootWithNamesContext(ctx, snapshotRoot, nil, nil)
 	translated := make(map[string]Entry, len(entries))
 	for path, entry := range entries {
 		relative, relErr := filepath.Rel(snapshotRoot, path)
@@ -1418,6 +1486,10 @@ func manifestFailures(value manifest) []CaptureFailure {
 }
 
 func captureIndividually(root, destination string, excluded []string) ([]CaptureFailure, map[string]bool, int64, error) {
+	return captureIndividuallyContext(context.Background(), root, destination, excluded)
+}
+
+func captureIndividuallyContext(ctx context.Context, root, destination string, excluded []string) ([]CaptureFailure, map[string]bool, int64, error) {
 	methods := make(map[string]bool)
 	var failures []CaptureFailure
 	var copiedBytes int64
@@ -1438,6 +1510,9 @@ func captureIndividually(root, destination string, excluded []string) ([]Capture
 	}
 
 	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			failures = append(failures, CaptureFailure{Path: path, Error: walkErr.Error()})
 			if entry != nil && entry.IsDir() {
