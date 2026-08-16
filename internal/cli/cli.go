@@ -221,7 +221,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		return usageExitCode
 	}
 	signalChannel := make(chan os.Signal, 4)
-	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM, syscall.SIGPIPE)
+	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGPIPE)
 	postChildSignals := startPostChildSignalHandler(signalChannel, stderr)
 	postChildSignals.SetPhase("session initialization")
 	defer func() {
@@ -687,7 +687,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 		Abort:     proxy.Done(),
 		Approvals: approvalRequests,
 	})
-	postChildSignals.SetPhase("post-session scan")
+	scanContext := postChildSignals.ResetPhaseContext("post-session scan")
 	postChildSignals.SetForward(nil)
 	interrupted := result.Interrupted
 	observePostChildSignal := func() {
@@ -710,7 +710,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 	printScanFinishing(stderr, fileSummary)
 	startEvicted := append([]string(nil), fileSummary.Evicted...)
 	startRetentionEvents := append([]localrollback.RetentionEvent(nil), fileSummary.RetentionEvents...)
-	fileSummary = sealFileSession(postChildSignals.Context(), fileSession, postChildSignals.Progressf)
+	fileSummary = sealFileSession(scanContext, fileSession, postChildSignals.Progressf)
 	fileSealed = true
 	observePostChildSignal()
 	fileSummary.Evicted = append(startEvicted, fileSummary.Evicted...)
@@ -1247,11 +1247,12 @@ func (handler *postChildSignalHandler) run() {
 func (handler *postChildSignalHandler) record(received os.Signal) {
 	handler.mu.Lock()
 	forward := handler.forward
+	phase := handler.phase
+	cancelPhase := handler.cancel
 	if handler.first == nil {
 		handler.first = received
-		phase := handler.phase
-		handler.cancel()
 		handler.mu.Unlock()
+		cancelPhase()
 		forwardSignal(forward, received)
 		handler.outputGate.Lock()
 		defer handler.outputGate.Unlock()
@@ -1265,13 +1266,18 @@ func (handler *postChildSignalHandler) record(received os.Signal) {
 	if !handler.secondNamed {
 		handler.secondNamed = true
 		handler.mu.Unlock()
+		cancelPhase()
 		forwardSignal(forward, received)
 		handler.outputGate.Lock()
 		defer handler.outputGate.Unlock()
 		fmt.Fprintf(handler.output, "unring: second signal received (%s); safe discard finalization is already in progress and will not be skipped.\n", postChildSignalName(received))
+		if phase == "post-session scan" {
+			fmt.Fprintln(handler.output, "unring: the active post-session scan is also being stopped; the first signal still determines the exit status.")
+		}
 		return
 	}
 	handler.mu.Unlock()
+	cancelPhase()
 	forwardSignal(forward, received)
 }
 
@@ -1286,6 +1292,8 @@ func forwardSignal(destination chan<- os.Signal, received os.Signal) {
 }
 
 func (handler *postChildSignalHandler) Context() context.Context {
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
 	return handler.ctx
 }
 
@@ -1293,6 +1301,21 @@ func (handler *postChildSignalHandler) SetPhase(phase string) {
 	handler.mu.Lock()
 	handler.phase = phase
 	handler.mu.Unlock()
+}
+
+// ResetPhaseContext establishes a fresh cancellation boundary at a phase
+// transition. In particular, a child signal remains the run's disposition but
+// does not pre-cancel the evidence-producing post-session scan.
+func (handler *postChildSignalHandler) ResetPhaseContext(phase string) context.Context {
+	handler.mu.Lock()
+	previousCancel := handler.cancel
+	ctx, cancel := context.WithCancel(context.Background())
+	handler.ctx = ctx
+	handler.cancel = cancel
+	handler.phase = phase
+	handler.mu.Unlock()
+	previousCancel()
+	return ctx
 }
 
 func (handler *postChildSignalHandler) Phase() string {
@@ -1325,7 +1348,10 @@ func (handler *postChildSignalHandler) First() os.Signal {
 func (handler *postChildSignalHandler) Stop() os.Signal {
 	handler.once.Do(func() { close(handler.stop) })
 	<-handler.done
-	handler.cancel()
+	handler.mu.Lock()
+	cancel := handler.cancel
+	handler.mu.Unlock()
+	cancel()
 	return handler.First()
 }
 
@@ -1391,6 +1417,8 @@ func postChildSignalName(signal os.Signal) string {
 		return "interrupt"
 	case syscall.SIGTERM:
 		return "termination signal"
+	case syscall.SIGHUP:
+		return "hangup signal"
 	default:
 		return signal.String()
 	}
@@ -1408,7 +1436,9 @@ func exitCodeForSignal(signal os.Signal) int {
 func printFileChanges(output io.Writer, sessionID string, summary localrollback.Summary, announceCompleteZero bool) {
 	if summary.Interrupted {
 		fmt.Fprintf(output, "File change list incomplete: the post-session scan was interrupted, so this session must not be treated as having no file changes. Run unring log --json %s for precise diagnostic details.\n", sessionID)
-		printUnscannedRoots(output, "", summary.Unscanned)
+	}
+	printUnscannedRoots(output, "", summary.Unscanned)
+	if summary.Interrupted {
 		if len(summary.Changes) == 0 {
 			return
 		}
@@ -2772,10 +2802,10 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 			if record.Files.Interrupted {
 				fmt.Fprintf(stdout, "INCOMPLETE: %s This session must not be treated as clean. Run unring log --json %s for precise diagnostic details.\n",
 					interruptedChangeListDetail(record.Files), record.ID)
-				printUnscannedRoots(stdout, "", record.Files.Unscanned)
 			} else {
 				fmt.Fprintln(stdout, "INCOMPLETE: the post-session scan did not produce a complete change list, and this session must not be treated as clean.")
 			}
+			printUnscannedRoots(stdout, "", record.Files.Unscanned)
 			return 0
 		}
 		fmt.Fprintf(stdout, "Session %s changed no watched files; the post-session scan completed.\n", record.ID)
@@ -2787,6 +2817,7 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	printStoredChangeListLimitation(stdout, record.Files, "", true)
+	printRestoreExecutionCoverage(stdout, record)
 	if restoreAll {
 		if len(selections) > 0 {
 			fmt.Fprintln(stderr, "unring: --all cannot be combined with selected paths")
@@ -2883,6 +2914,16 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		return internalErrorExitCode
 	}
 	return exitCode
+}
+
+func printRestoreExecutionCoverage(output io.Writer, record audit.Record) {
+	if record.Files.Interrupted {
+		fmt.Fprintf(output, "INCOMPLETE: %s Restore will use only the recorded changes from completed scans.\n",
+			interruptedChangeListDetail(record.Files))
+	} else if len(record.Files.Unscanned) > 0 {
+		fmt.Fprintln(output, "INCOMPLETE: at least one watched root's post-session change list is unavailable; restore will use only the recorded changes from completed scans.")
+	}
+	printUnscannedRoots(output, "", record.Files.Unscanned)
 }
 
 func snapshotsCommand(args []string, stdout, stderr io.Writer) int {

@@ -124,12 +124,14 @@ breaks make a multi-path response unsafe are checked alone; any unusable batch f
 one check and one independently attributed result per path. The terminal reports scan and
 batch progress.
 
-`SIGINT`, `SIGTERM`, and a closed output pipe remain handled from the pre-session filesystem
+`SIGINT`, `SIGTERM`, `SIGHUP`, and a closed output pipe remain handled from the pre-session filesystem
 scan and automatic retention, through the child, post-session scanning, interceptor sealing,
 and finalization. A signal cancels the active phase, selects discard, and records an abnormal
 outcome that later `log` and `restore` commands can inspect. Automatic retention reports
 periodic progress even when it runs before the child. A second signal is acknowledged but does
 not bypass durable discard finalization; the first signal determines the exit status.
+When the first signal arrives during the child, the evidence-producing post-session filesystem
+scan starts with a fresh cancellation context; a signal arriving during that scan still stops it.
 Interrupted human-readable listings say that coverage is
 incomplete without calling a canceled post-session walk a snapshot failure, while `log
 --json` retains the exact diagnostic cause.

@@ -368,6 +368,67 @@ func TestPartlyCanceledFilesystemWalkDoesNotFabricateDeletions(t *testing.T) {
 	}
 }
 
+func TestUnavailableCloneRootKeepsCompleteWideAndSiblingChanges(t *testing.T) {
+	stateDir := t.TempDir()
+	home := t.TempDir()
+	removedRoot := filepath.Join(home, "removed-project")
+	scannedRoot := filepath.Join(home, "scanned-project")
+	for _, root := range []string{removedRoot, scannedRoot} {
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removedOne := filepath.Join(removedRoot, "one.txt")
+	removedTwo := filepath.Join(removedRoot, "two.txt")
+	scannedFile := filepath.Join(scannedRoot, "kept.txt")
+	for path, contents := range map[string]string{
+		removedOne: "one", removedTwo: "two", scannedFile: "before",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	platform := &reviewRoundPlatform{excluded: map[string]bool{}}
+	restorePlatform := SetVolumeSnapshotPlatformForTest(platform)
+	defer restorePlatform()
+	session, _, err := StartScope(stateDir, "unavailable-root-wide-observation", Scope{
+		Watched:         []string{removedRoot, scannedRoot},
+		ChangeListScope: ChangeListScopeHomeAndClone,
+		ChangeListRoots: []string{home},
+		ScanRoot:        home,
+	}, 1<<30, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(removedRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(scannedFile, []byte("after-content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	summary := session.Seal(time.Unix(2, 0))
+	if len(summary.Unscanned) != 1 || summary.Unscanned[0].Path != removedRoot ||
+		!strings.Contains(summary.Unscanned[0].Error, "no longer resolves") {
+		t.Fatalf("unscanned roots = %#v, want independently removed project root", summary.Unscanned)
+	}
+	wantKinds := map[string]string{
+		removedRoot: "deleted", removedOne: "deleted", removedTwo: "deleted", scannedFile: "modified",
+	}
+	if len(summary.Changes) != 4 {
+		t.Fatalf("changes = %d, want independent literal 4: %#v", len(summary.Changes), summary.Changes)
+	}
+	for _, change := range summary.Changes {
+		wantKind, ok := wantKinds[change.Path]
+		if !ok || change.Kind != wantKind {
+			t.Fatalf("unexpected change %#v; literal expectations = %#v", change, wantKinds)
+		}
+		delete(wantKinds, change.Path)
+	}
+	if len(wantKinds) != 0 {
+		t.Fatalf("fully observed changes were hidden: %#v", wantKinds)
+	}
+}
+
 func formatReviewIndex(index int) string {
 	const digits = "0123456789"
 	return string([]byte{

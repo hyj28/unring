@@ -167,6 +167,136 @@ func TestPostChildSignalsCancelSealAndRecordDiscard(t *testing.T) {
 	}
 }
 
+func TestSignalDuringChildPreservesChangeListAndRestore(t *testing.T) {
+	for _, received := range []syscall.Signal{syscall.SIGTERM, syscall.SIGHUP} {
+		t.Run(received.String(), func(t *testing.T) {
+			stateDir := t.TempDir()
+			configureStorageHygieneTest(t, stateDir)
+			root := t.TempDir()
+			gone := filepath.Join(root, "gone.txt")
+			if err := os.WriteFile(gone, []byte("restore-me"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			childStarted := filepath.Join(t.TempDir(), "child-started")
+			var stdout, stderr strings.Builder
+			exited := make(chan int, 1)
+			go func() {
+				exited <- Main([]string{
+					"run", "--watch-only", root, "--", "/bin/sh", "-c",
+					`rm "$1"; : > "$2"; sleep 30`, "sh", gone, childStarted,
+				}, strings.NewReader(""), &stdout, &stderr)
+			}()
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				if _, err := os.Stat(childStarted); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("child did not reach the signal point")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err := syscall.Kill(os.Getpid(), received); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case code := <-exited:
+				if code != 128+int(received) {
+					t.Fatalf("exit = %d, want independent signal literal %d", code, 128+int(received))
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("run did not exit after %s", received)
+			}
+			store, err := audit.OpenStoreAt(stateDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			records, err := store.List()
+			if err != nil || len(records) != 1 {
+				t.Fatalf("records = %#v, %v, want independent literal one", records, err)
+			}
+			record := records[0]
+			if record.Outcome != "discarded" || record.CompletionKind != completionKindAbnormalDiscard {
+				t.Fatalf("child-signal record = %#v, want abnormal discard", record)
+			}
+			if !record.Files.Complete || record.Files.Interrupted || len(record.Files.Unscanned) != 0 {
+				t.Fatalf("child signal pre-cancelled the evidence scan: %#v", record.Files)
+			}
+			if len(record.Files.Changes) != 1 || record.Files.Changes[0].Path != gone || record.Files.Changes[0].Kind != "deleted" {
+				t.Fatalf("child-signal changes = %#v, want one literal deleted path", record.Files.Changes)
+			}
+			var restoreOut, restoreErr strings.Builder
+			if code := Main([]string{"restore", record.ID, gone}, strings.NewReader(""), &restoreOut, &restoreErr); code != 0 {
+				t.Fatalf("restore exit = %d: %s", code, restoreErr.String())
+			}
+			contents, err := os.ReadFile(gone)
+			if err != nil || string(contents) != "restore-me" {
+				t.Fatalf("restored contents = %q, %v, want independent literal", contents, err)
+			}
+		})
+	}
+}
+
+func TestLiveAndRestoreAllDiscloseUnscannedSibling(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	base := t.TempDir()
+	unscanned := filepath.Join(base, "a-unscanned")
+	scanned := filepath.Join(base, "b-scanned")
+	for _, root := range []string{unscanned, scanned} {
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(unscanned, "gone.txt"), []byte("gone"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	kept := filepath.Join(scanned, "kept.txt")
+	if err := os.WriteFile(kept, []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr strings.Builder
+	code := Main([]string{
+		"run", "--watch-only", unscanned, "--watch-only", scanned, "--", "/bin/sh", "-c",
+		`rm -rf "$1"; printf after-content > "$2"`, "sh", unscanned, kept,
+	}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run exit = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "WATCHED ROOT CHANGE LIST UNAVAILABLE: "+humanPath(unscanned)) ||
+		!strings.Contains(stdout.String(), humanPath(kept)) {
+		t.Fatalf("live review hid an unavailable or scanned sibling:\n%s", stdout.String())
+	}
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("records = %#v, %v, want independent literal one", records, err)
+	}
+	record := records[0]
+	if len(record.Files.Unscanned) != 1 || record.Files.Unscanned[0].Path != unscanned {
+		t.Fatalf("unscanned roots = %#v, want independent sibling", record.Files.Unscanned)
+	}
+	if len(record.Files.Changes) != 1 || record.Files.Changes[0].Path != kept || record.Files.Changes[0].Kind != "modified" {
+		t.Fatalf("scanned sibling changes = %#v, want one independent modified file", record.Files.Changes)
+	}
+	var restoreOut, restoreErr strings.Builder
+	if code := Main([]string{"restore", "--all", record.ID}, strings.NewReader(""), &restoreOut, &restoreErr); code != 0 {
+		t.Fatalf("restore --all exit = %d: %s", code, restoreErr.String())
+	}
+	if !strings.Contains(restoreOut.String(), "INCOMPLETE:") ||
+		!strings.Contains(restoreOut.String(), "WATCHED ROOT CHANGE LIST UNAVAILABLE: "+humanPath(unscanned)) ||
+		!strings.Contains(restoreOut.String(), "restored  "+humanPath(kept)) {
+		t.Fatalf("restore --all hid incomplete coverage or restored result:\n%s", restoreOut.String())
+	}
+	contents, err := os.ReadFile(kept)
+	if err != nil || string(contents) != "before" {
+		t.Fatalf("restore --all contents = %q, %v, want independent literal", contents, err)
+	}
+}
+
 func TestSignalDuringFilesystemWalkDoesNotClaimSnapshotFailure(t *testing.T) {
 	stateDir := t.TempDir()
 	configureStorageHygieneTest(t, stateDir)

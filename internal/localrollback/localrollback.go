@@ -634,7 +634,6 @@ func (s *Session) sealContext(ctx context.Context, now time.Time, progress func(
 	}
 	var scanFailures []CaptureFailure
 	var coverageGaps []CaptureFailure
-	unscannedRoots := make(map[string]bool)
 	for index := range s.manifest.Roots {
 		root := &s.manifest.Roots[index]
 		if !root.Existed || root.Source == "" {
@@ -649,7 +648,6 @@ func (s *Session) sealContext(ctx context.Context, now time.Time, progress func(
 			failure := CaptureFailure{Path: root.Path, Error: message}
 			scanFailures = append(scanFailures, failure)
 			s.manifest.Unscanned = append(s.manifest.Unscanned, failure)
-			unscannedRoots[root.Path] = true
 			diffExcluded[failure.Path] = true
 			root.Uncaptured[failure.Path] = failure.Error
 			continue
@@ -659,7 +657,6 @@ func (s *Session) sealContext(ctx context.Context, now time.Time, progress func(
 			failure := CaptureFailure{Path: root.Path, Error: err.Error()}
 			scanFailures = append(scanFailures, failure)
 			s.manifest.Unscanned = append(s.manifest.Unscanned, failure)
-			unscannedRoots[root.Path] = true
 			diffExcluded[failure.Path] = true
 			if ctx.Err() == nil {
 				root.Uncaptured[failure.Path] = failure.Error
@@ -755,9 +752,6 @@ func (s *Session) sealContext(ctx context.Context, now time.Time, progress func(
 	}
 	for _, change := range wideChanges {
 		change, cloneCovered := mapWideChangeToClonePath(change, s.manifest.Roots)
-		if coveredBy(change.Path, unscannedRoots) {
-			continue
-		}
 		if _, exists := changeIndexes[change.Path]; exists {
 			continue
 		}

@@ -163,6 +163,9 @@ Design: [docs/LOCAL-ROLLBACK-DESIGN.md §10](docs/LOCAL-ROLLBACK-DESIGN.md). Dec
 - [x] M12.6 Start signal ownership before baseline capture and pre-child retention, treat closed
       output pipes as durable interruption, report retention progress, and never diff a watched
       root whose post-session walk did not finish
+- [x] M12.7 Preserve the post-session evidence scan after a child signal, handle terminal hangup,
+      retain independently observed wide changes for clone-unavailable roots, and disclose
+      incomplete roots during live review and restore execution
 
 ---
 
