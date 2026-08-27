@@ -1,0 +1,66 @@
+name: Bug report
+description: Report incorrect behavior, a coverage gap, or a regression
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping make unring safer. If this could expose credentials or silently bypass a documented guard, please use [private vulnerability reporting](https://github.com/hyj28/unring/security/advisories/new) instead.
+  - type: input
+    id: version
+    attributes:
+      label: unring version
+      description: Paste the output of `unring --version`.
+      placeholder: unring v0.2.0
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS Apple Silicon
+        - macOS Intel
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What protection, review, or restore behavior did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Redact credentials, SQL literals, paths, and request URLs as needed.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest safe sequence of commands that reproduces the problem.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Relevant diagnostics
+      description: Add redacted audit output or logs. Do not post tokens, CA keys, or unredacted secrets.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues for this behavior.
+          required: true
+        - label: I removed credentials and sensitive data from this report.
+          required: true

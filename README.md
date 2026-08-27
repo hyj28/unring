@@ -1,20 +1,74 @@
 # unring
 
-> **Make everything your agent does undoable.**
+<p align="center">
+  <img src="docs/assets/unring-hero.svg" alt="unring — Make everything your agent does undoable" width="100%">
+</p>
 
-> **Current scope:** local file rollback plus transactional PostgreSQL by default;
-> GitHub and Slack through HTTPS adapters and the `gh` PATH shim are opt-in.
+<p align="center">
+  <a href="https://github.com/hyj28/unring/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/hyj28/unring/ci.yml?branch=main&amp;style=flat-square&amp;label=CI"></a>
+  <a href="https://github.com/hyj28/unring/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/hyj28/unring?display_name=tag&amp;sort=semver&amp;style=flat-square&amp;color=8b5cf6"></a>
+  <a href="https://github.com/hyj28/unring/blob/main/LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/hyj28/unring?style=flat-square&amp;color=22c55e"></a>
+  <a href="https://go.dev/"><img alt="Go 1.26+" src="https://img.shields.io/badge/Go-1.26%2B-00ADD8?style=flat-square&amp;logo=go&amp;logoColor=white"></a>
+  <a href="https://github.com/hyj28/unring/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/hyj28/unring?style=flat-square&amp;logo=github&amp;color=f59e0b"></a>
+</p>
 
-`unring` wraps an AI coding agent, snapshots the files it can change, and keeps database
-writes reversible. File changes need no end-of-session decision: restore individual
-paths later, when you have enough context to know something is wrong. PostgreSQL and
-opt-in outbound effects retain their existing commit/discard review.
+<p align="center">
+  <strong>A safety layer for AI coding agents.</strong><br>
+  Snapshot local files, hold PostgreSQL writes in a real transaction, and review opt-in outbound effects before they become permanent.
+</p>
 
-The name comes from *you can't unring a bell*. That is the whole point: now you can.
+<p align="center">
+  <a href="#quick-start"><strong>Quick start</strong></a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="docs/ADAPTERS.md">Build an adapter</a> ·
+  <a href="ROADMAP.md">Roadmap</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
 
-Outbound interception is deliberately off by default. A snapshot can give back what is
-yours, but it cannot recall data already sent to another service; use `--outbound` when
-that extra coverage is worth its prompts.
+---
+
+`unring` wraps a bounded agent run and gives its side effects somewhere safe to land.
+The agent still sees real database results and real errors; you decide what becomes
+permanent. The name comes from *you can't unring a bell*. That is the whole point:
+now you can.
+
+| Surface | What unring does | Recovery model |
+|:--|:--|:--|
+| **Local files** | APFS snapshot + copy-on-write clone, with explicit coverage gaps | Restore a path after the run |
+| **PostgreSQL** | Shares one real transaction across the agent's connections | One final `COMMIT` or `ROLLBACK` |
+| **GitHub, Slack, HTTPS** | Opt-in adapters, HTTPS interception, and a structured `gh` shim | Stage first; compensate where possible |
+
+> [!IMPORTANT]
+> unring is an accident guard, not a hostile-process sandbox. It reports what it could
+> not intercept instead of silently claiming coverage. Read [Honest limits](#honest-limits)
+> before relying on it for sensitive work.
+
+## Quick start
+
+```sh
+go install github.com/hyj28/unring/cmd/unring@latest
+
+# Wrap one bounded task from Claude Code, Codex, OpenCode, or another agent.
+unring run -- claude -p 'Implement the validation change, run its tests, then stop'
+```
+
+Need database protection? Export the real development database URL first. Want GitHub,
+Slack, and generic HTTPS review too? Add `--outbound`.
+
+```sh
+export DATABASE_URL='postgresql://user:password@localhost/app'
+unring run --outbound -- your-one-shot-agent-command
+```
+
+```text
+agent command ──▶ file snapshot ──▶ real, reversible work ──▶ review
+                                                             ├─ commit
+                                                             └─ discard / restore later
+```
+
+**macOS** gets the strongest file protection through APFS and Time Machine local
+snapshots. **Linux** is supported with an explicit lower protection tier. PostgreSQL
+14+ is optional; without `DATABASE_URL`, file snapshots and the audit log still work.
 
 ## Install
 
@@ -51,6 +105,11 @@ unring run -- claude -p 'Implement the requested validation change, run its test
 # Or use any other agent's bounded/non-interactive command:
 unring run -- your-one-shot-agent-command
 ```
+
+<details>
+<summary><strong>Operational details, coverage rules, and restore behavior</strong></summary>
+
+<br>
 
 Before the child starts, unring creates two independent layers of file protection. It asks
 Time Machine for a whole-volume local APFS snapshot, then clones the project tree plus
@@ -364,6 +423,8 @@ real server and fail instead of skipping:
 ```sh
 make test-integration
 ```
+
+</details>
 
 ## Audit log
 

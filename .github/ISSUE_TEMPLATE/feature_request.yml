@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose a new capability or a safer workflow
+title: "feature: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What agent workflow or irreversible effect is difficult to handle today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the user-visible behavior, including what commit and discard should mean.
+    validations:
+      required: true
+  - type: textarea
+    id: limits
+    attributes:
+      label: Failure and coverage boundaries
+      description: What could unring fail to see, stage, restore, or compensate?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What do you do today, and why is it insufficient?

@@ -1,0 +1,85 @@
+<svg width="1200" height="440" viewBox="0 0 1200 440" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">unring — reversible side effects for coding agents</title>
+  <desc id="desc">A dark technical banner with the unring wordmark, coverage labels, and a glowing bell surrounded by rollback rings.</desc>
+  <defs>
+    <linearGradient id="background" x1="34" y1="20" x2="1154" y2="430" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B1020"/>
+      <stop offset="0.52" stop-color="#111A31"/>
+      <stop offset="1" stop-color="#07131D"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="716" y1="92" x2="1038" y2="365" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8B5CF6"/>
+      <stop offset="0.5" stop-color="#22D3EE"/>
+      <stop offset="1" stop-color="#34D399"/>
+    </linearGradient>
+    <linearGradient id="wordmark" x1="83" y1="111" x2="520" y2="237" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#C8D7F5"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(906 220) rotate(90) scale(199)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22D3EE" stop-opacity="0.19"/>
+      <stop offset="1" stop-color="#22D3EE" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" stroke="#A5B4FC" stroke-opacity="0.055"/>
+    </pattern>
+    <filter id="softGlow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="frame"><rect width="1200" height="440" rx="28"/></clipPath>
+  </defs>
+
+  <g clip-path="url(#frame)">
+    <rect width="1200" height="440" fill="url(#background)"/>
+    <rect width="1200" height="440" fill="url(#grid)"/>
+    <circle cx="906" cy="220" r="199" fill="url(#glow)"/>
+    <circle cx="115" cy="26" r="210" fill="#8B5CF6" fill-opacity="0.07"/>
+    <path d="M0 354C185 303 339 394 508 349C690 301 801 327 980 376C1062 399 1135 395 1200 375V440H0V354Z" fill="#22D3EE" fill-opacity="0.035"/>
+
+    <g opacity="0.75">
+      <circle cx="906" cy="220" r="154" stroke="#22D3EE" stroke-opacity="0.19"/>
+      <circle cx="906" cy="220" r="126" stroke="#8B5CF6" stroke-opacity="0.22" stroke-dasharray="3 10"/>
+      <path d="M1044 286A154 154 0 0 1 778 329" stroke="url(#accent)" stroke-width="2" stroke-linecap="round"/>
+      <path d="M774 329L782 311M774 329L794 330" stroke="#34D399" stroke-width="2" stroke-linecap="round"/>
+      <path d="M791 107A126 126 0 0 1 1007 113" stroke="url(#accent)" stroke-width="2" stroke-linecap="round"/>
+      <path d="M1007 113L988 112M1007 113L1003 132" stroke="#8B5CF6" stroke-width="2" stroke-linecap="round"/>
+    </g>
+
+    <g transform="translate(834 132)" stroke="url(#accent)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" filter="url(#softGlow)">
+      <path d="M72 12C42 12 26 34 26 64V90C26 105 19 116 10 126H134C125 116 118 105 118 90V64C118 34 102 12 72 12Z"/>
+      <path d="M51 142C55 158 89 158 93 142"/>
+      <path d="M72 0V12"/>
+    </g>
+
+    <text x="78" y="92" fill="#7DD3FC" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="700" letter-spacing="3">REVERSIBLE AGENT EXECUTION</text>
+    <text x="73" y="205" fill="url(#wordmark)" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="112" font-weight="800" letter-spacing="-6">unring</text>
+    <text x="80" y="252" fill="#AEBFDC" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="22" font-weight="450">Make everything your agent does undoable.</text>
+
+    <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="700" letter-spacing="1">
+      <g transform="translate(79 310)">
+        <rect width="116" height="38" rx="19" fill="#8B5CF6" fill-opacity="0.12" stroke="#A78BFA" stroke-opacity="0.38"/>
+        <circle cx="21" cy="19" r="4" fill="#A78BFA"/>
+        <text x="34" y="24" fill="#DDD6FE">FILES</text>
+      </g>
+      <g transform="translate(208 310)">
+        <rect width="153" height="38" rx="19" fill="#22D3EE" fill-opacity="0.10" stroke="#67E8F9" stroke-opacity="0.34"/>
+        <circle cx="21" cy="19" r="4" fill="#67E8F9"/>
+        <text x="34" y="24" fill="#CFFAFE">POSTGRES</text>
+      </g>
+      <g transform="translate(374 310)">
+        <rect width="184" height="38" rx="19" fill="#34D399" fill-opacity="0.09" stroke="#6EE7B7" stroke-opacity="0.32"/>
+        <circle cx="21" cy="19" r="4" fill="#6EE7B7"/>
+        <text x="34" y="24" fill="#D1FAE5">HTTPS + GH</text>
+      </g>
+    </g>
+
+    <g transform="translate(79 386)" fill="#64748B" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12">
+      <text>SNAPSHOT</text><path d="M77 4H116" stroke="#334155"/><path d="M108 0L116 4L108 8" stroke="#475569" fill="none"/>
+      <text x="130">RUN</text><path d="M165 4H204" stroke="#334155"/><path d="M196 0L204 4L196 8" stroke="#475569" fill="none"/>
+      <text x="218">REVIEW</text><path d="M278 4H317" stroke="#334155"/><path d="M309 0L317 4L309 8" stroke="#475569" fill="none"/>
+      <text x="331" fill="#94A3B8">COMMIT / DISCARD</text>
+    </g>
+  </g>
+  <rect x="0.75" y="0.75" width="1198.5" height="438.5" rx="27.25" stroke="#94A3B8" stroke-opacity="0.16" stroke-width="1.5"/>
+</svg>

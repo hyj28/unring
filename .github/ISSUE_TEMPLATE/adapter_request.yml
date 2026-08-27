@@ -1,0 +1,38 @@
+name: Adapter request
+description: Request coverage for an external API or service
+title: "adapter: "
+labels:
+  - adapter
+  - enhancement
+body:
+  - type: input
+    id: service
+    attributes:
+      label: Service
+      placeholder: Linear, Stripe, Discord…
+    validations:
+      required: true
+  - type: textarea
+    id: operations
+    attributes:
+      label: Operations to cover
+      description: List the reads, stageable mutations, approval-required calls, and any known undo operations.
+    validations:
+      required: true
+  - type: textarea
+    id: api_docs
+    attributes:
+      label: API documentation
+      description: Link to authoritative request, idempotency, and undo documentation.
+    validations:
+      required: true
+  - type: textarea
+    id: compensation
+    attributes:
+      label: Honest undo boundary
+      description: What can be compensated after execution, and what visible effect would remain?
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: See [docs/ADAPTERS.md](../../docs/ADAPTERS.md) if you would like to implement this adapter.
