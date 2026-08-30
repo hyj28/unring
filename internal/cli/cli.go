@@ -478,7 +478,7 @@ func runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) (exitC
 			return internalErrorExitCode
 		}
 		ghSession, err = ghshim.Start(ghshim.Options{
-			Adapters: adapterSet, Stdin: stdin, Stdout: stdout, Stderr: stderr,
+			Adapters: adapterSet, Stdout: stdout, Stderr: stderr,
 			Approve: func(approvalContext context.Context, request ghshim.ApprovalRequest) (bool, error) {
 				reply := make(chan runner.ApprovalResult, 1)
 				work := runner.ApprovalRequest{
@@ -3721,18 +3721,6 @@ func promptDecisionWithSignal(
 		fmt.Fprintln(output, "\nSignal received: discarding the session.")
 		return pgproxy.DecisionRollback, true, false
 	}
-}
-
-func printSummary(output io.Writer, summary pgproxy.Summary) {
-	printSummaryWithHTTPS(output, summary, httpsproxy.Summary{Sealed: true})
-}
-
-func printSummaryWithHTTPS(
-	output io.Writer,
-	summary pgproxy.Summary,
-	httpsSummary httpsproxy.Summary,
-) {
-	printSummaryWithExternal(output, summary, httpsSummary, ghshim.Summary{Sealed: true})
 }
 
 func printSummaryWithExternal(

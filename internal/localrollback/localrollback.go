@@ -1233,10 +1233,6 @@ func (s *Session) Snapshot() Summary {
 	return copied
 }
 
-func captureRoot(root, destination string, excluded []string) (rootManifest, []CaptureFailure, map[string]bool, int64, int64, error) {
-	return captureRootContext(context.Background(), root, destination, excluded)
-}
-
 func captureRootContext(ctx context.Context, root, destination string, excluded []string) (rootManifest, []CaptureFailure, map[string]bool, int64, int64, error) {
 	state := rootManifest{Path: root, Before: make(map[string]Entry), Uncaptured: make(map[string]string)}
 	methods := make(map[string]bool)
@@ -1344,10 +1340,6 @@ func stableObservedEntries(before, after map[string]Entry) map[string]Entry {
 	return stable
 }
 
-func scanMappedRoot(sourceRoot, reportedRoot string, excluded []string) (map[string]Entry, []CaptureFailure, error) {
-	return scanMappedRootContext(context.Background(), sourceRoot, reportedRoot, excluded)
-}
-
 func scanMappedRootContext(ctx context.Context, sourceRoot, reportedRoot string, excluded []string) (map[string]Entry, []CaptureFailure, error) {
 	entries, failures, err := scanRootWithNamesContext(ctx, sourceRoot, excluded, nil)
 	translated := make(map[string]Entry, len(entries))
@@ -1379,10 +1371,6 @@ func translateFailures(failures []CaptureFailure, sourceRoot, reportedRoot strin
 		translated = append(translated, failure)
 	}
 	return translated
-}
-
-func scanSnapshotRoot(snapshotRoot, originalRoot string) (map[string]Entry, []CaptureFailure, error) {
-	return scanSnapshotRootContext(context.Background(), snapshotRoot, originalRoot)
 }
 
 func scanSnapshotRootContext(ctx context.Context, snapshotRoot, originalRoot string) (map[string]Entry, []CaptureFailure, error) {
@@ -1519,10 +1507,6 @@ func manifestFailures(value manifest) []CaptureFailure {
 	return mergeFailures(failures)
 }
 
-func captureIndividually(root, destination string, excluded []string) ([]CaptureFailure, map[string]bool, int64, error) {
-	return captureIndividuallyContext(context.Background(), root, destination, excluded)
-}
-
 func captureIndividuallyContext(ctx context.Context, root, destination string, excluded []string) ([]CaptureFailure, map[string]bool, int64, error) {
 	methods := make(map[string]bool)
 	var failures []CaptureFailure
@@ -1627,14 +1611,6 @@ func captureOne(source, destination string, info fs.FileInfo) (string, bool, err
 	default:
 		return "", false, fmt.Errorf("unsupported file type %s", info.Mode().Type())
 	}
-}
-
-func scanRoot(root string, excluded []string) (map[string]Entry, []CaptureFailure, error) {
-	return scanRootWithNamesContext(context.Background(), root, excluded, nil)
-}
-
-func scanRootWithNames(root string, excluded, excludedNames []string) (map[string]Entry, []CaptureFailure, error) {
-	return scanRootWithNamesContext(context.Background(), root, excluded, excludedNames)
 }
 
 func scanRootWithNamesContext(ctx context.Context, root string, excluded, excludedNames []string) (map[string]Entry, []CaptureFailure, error) {
@@ -2123,16 +2099,6 @@ func PlanRetentionWhileLocked(
 	if capBytes < 0 {
 		return RetentionPlan{}, errors.New("snapshot retention cap cannot be negative")
 	}
-	return planRetentionWhileLockedContext(context.Background(), stateDir, sessions, capBytes, maxAge, now)
-}
-
-func planRetentionWhileLocked(
-	stateDir string,
-	sessions []StoredSession,
-	capBytes int64,
-	maxAge time.Duration,
-	now time.Time,
-) (RetentionPlan, error) {
 	return planRetentionWhileLockedContext(context.Background(), stateDir, sessions, capBytes, maxAge, now)
 }
 

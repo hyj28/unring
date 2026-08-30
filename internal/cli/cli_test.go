@@ -157,7 +157,7 @@ rules:
 func TestReviewModelExpandsStatementDetails(t *testing.T) {
 	t.Parallel()
 
-	model := newReviewModel(pgproxy.Summary{
+	model := newReviewModelWithExternal(pgproxy.Summary{
 		Sealed:          true,
 		FullyReversible: true,
 		Changes:         pgproxy.ChangeSummary{Complete: true},
@@ -165,7 +165,7 @@ func TestReviewModelExpandsStatementDetails(t *testing.T) {
 			SQL: "UPDATE example\nSET value = 'changed'", CommandTags: []string{"UPDATE 2"},
 			Failed: true, Error: "constraint failed (SQLSTATE 23514)",
 		}},
-	})
+	}, httpsproxy.Summary{Sealed: true}, ghshim.Summary{Sealed: true})
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	view := updated.(reviewModel).View()
 	for _, want := range []string{
@@ -184,7 +184,7 @@ func TestReviewModelExpandsStatementDetails(t *testing.T) {
 func TestReviewModelSeparatesUninterceptedTraffic(t *testing.T) {
 	t.Parallel()
 
-	view := newReviewModel(pgproxy.Summary{
+	view := newReviewModelWithExternal(pgproxy.Summary{
 		Sealed:          true,
 		FullyReversible: true,
 		Changes:         pgproxy.ChangeSummary{Complete: true},
@@ -192,7 +192,7 @@ func TestReviewModelSeparatesUninterceptedTraffic(t *testing.T) {
 		Unintercepted: []pgproxy.UninterceptedItem{{
 			Statement: "mystery", Detail: "could not classify this traffic",
 		}},
-	}).View()
+	}, httpsproxy.Summary{Sealed: true}, ghshim.Summary{Sealed: true}).View()
 	statementSection := strings.Index(view, "STATEMENTS")
 	uninterceptedSection := strings.Index(view, "!!! UN-INTERCEPTED OR UNCLASSIFIED TRAFFIC !!!")
 	warning := strings.Index(view, "INTERCEPTION/COVERAGE WARNING")
@@ -209,11 +209,11 @@ func TestReviewModelKeepsUninterceptedWarningVisibleWhenSectionIsOffscreen(t *te
 	for index := range queries {
 		queries[index] = pgproxy.QueryRecord{SQL: fmt.Sprintf("SELECT %d", index)}
 	}
-	model := newReviewModel(pgproxy.Summary{
+	model := newReviewModelWithExternal(pgproxy.Summary{
 		Sealed: true, FullyReversible: true,
 		Changes: pgproxy.ChangeSummary{Complete: true}, Queries: queries,
 		Unintercepted: []pgproxy.UninterceptedItem{{Detail: "could not classify one batch"}},
-	})
+	}, httpsproxy.Summary{Sealed: true}, ghshim.Summary{Sealed: true})
 	model.offset = 20
 	view := model.View()
 	if !strings.Contains(view, "INTERCEPTION/COVERAGE WARNING") ||
@@ -224,7 +224,7 @@ func TestReviewModelKeepsUninterceptedWarningVisibleWhenSectionIsOffscreen(t *te
 
 func TestReviewReportsForwardedAndUninterceptedHTTPSSeparately(t *testing.T) {
 	t.Parallel()
-	model := newReviewModelWithHTTPS(pgproxy.Summary{
+	model := newReviewModelWithExternal(pgproxy.Summary{
 		Sealed: true, FullyReversible: true,
 		Changes: pgproxy.ChangeSummary{Complete: true},
 	}, httpsproxy.Summary{
@@ -236,7 +236,7 @@ func TestReviewReportsForwardedAndUninterceptedHTTPSSeparately(t *testing.T) {
 			Host:   "api.passthrough.test:443",
 			Detail: "CONNECT tunnel was passed through without TLS interception",
 		}},
-	})
+	}, ghshim.Summary{Sealed: true})
 	view := model.View()
 	for _, want := range []string{
 		"WARNING: THIS SESSION IS NOT FULLY REVERSIBLE",
@@ -271,7 +271,7 @@ func TestPlainReviewSeparatesSafeAndControlPlaneTrafficWithoutWarning(t *testing
 		},
 	}
 	var output bytes.Buffer
-	printSummaryWithHTTPS(&output, postgresSummary, httpsSummary)
+	printSummaryWithExternal(&output, postgresSummary, httpsSummary, ghshim.Summary{Sealed: true})
 	text := output.String()
 	for _, want := range []string{
 		"One decision applies to the whole session; partial commit is not available.",
@@ -304,7 +304,7 @@ func TestPlainReviewNamesForwardingFailureCause(t *testing.T) {
 		}},
 	}
 	var output bytes.Buffer
-	printSummaryWithHTTPS(&output, postgresSummary, httpsSummary)
+	printSummaryWithExternal(&output, postgresSummary, httpsSummary, ghshim.Summary{Sealed: true})
 	want := "[forwarding failed: response body relay failed: unexpected EOF] GET https://api.anthropic.com/api/claude_cli/bootstrap?entrypoint=sd"
 	if !strings.Contains(output.String(), want) {
 		t.Fatalf("plain review hid forwarding cause %q:\n%s", want, output.String())
@@ -325,7 +325,7 @@ func TestTelemetryOnlyReviewDoesNotWarnButApprovedMutationDoes(t *testing.T) {
 		}},
 	}
 	var output bytes.Buffer
-	printSummaryWithHTTPS(&output, postgresSummary, telemetry)
+	printSummaryWithExternal(&output, postgresSummary, telemetry, ghshim.Summary{Sealed: true})
 	if strings.Contains(output.String(), "WARNING: THIS SESSION IS NOT FULLY REVERSIBLE") {
 		t.Fatalf("telemetry-only session received irreversible warning:\n%s", output.String())
 	}
@@ -335,7 +335,7 @@ func TestTelemetryOnlyReviewDoesNotWarnButApprovedMutationDoes(t *testing.T) {
 		StatusCode: http.StatusCreated, Disposition: httpsproxy.RequestDispositionApproved,
 	})
 	output.Reset()
-	printSummaryWithHTTPS(&output, postgresSummary, telemetry)
+	printSummaryWithExternal(&output, postgresSummary, telemetry, ghshim.Summary{Sealed: true})
 	if !strings.Contains(output.String(), "WARNING: THIS SESSION IS NOT FULLY REVERSIBLE") {
 		t.Fatalf("approved irreversible mutation was not warned:\n%s", output.String())
 	}
@@ -363,9 +363,11 @@ func TestReviewClearlyDistinguishesStagedSentAndUninterceptedHTTPS(t *testing.T)
 		Changes: pgproxy.ChangeSummary{Complete: true},
 	}
 
-	view := newReviewModelWithHTTPS(postgresSummary, httpsSummary).View()
+	view := newReviewModelWithExternal(
+		postgresSummary, httpsSummary, ghshim.Summary{Sealed: true},
+	).View()
 	var plain bytes.Buffer
-	printSummaryWithHTTPS(&plain, postgresSummary, httpsSummary)
+	printSummaryWithExternal(&plain, postgresSummary, httpsSummary, ghshim.Summary{Sealed: true})
 	for label, text := range map[string]string{"TUI": view, "plain": plain.String()} {
 		for _, want := range []string{
 			"PENDING HTTPS — WILL BE SENT IF YOU COMMIT",
@@ -674,12 +676,12 @@ func TestSummaryWarnsWhenSessionIsNotFullyReversible(t *testing.T) {
 	t.Parallel()
 
 	var output bytes.Buffer
-	printSummary(&output, pgproxy.Summary{
+	printSummaryWithExternal(&output, pgproxy.Summary{
 		FullyReversible: false,
 		IrreversibleActions: []pgproxy.IrreversibleAction{
 			{SQL: "VACUUM"},
 		},
-	})
+	}, httpsproxy.Summary{Sealed: true}, ghshim.Summary{Sealed: true})
 	text := output.String()
 	if !strings.Contains(text, "NOT FULLY REVERSIBLE") ||
 		!strings.Contains(text, "VACUUM") ||

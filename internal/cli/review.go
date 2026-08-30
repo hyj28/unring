@@ -40,14 +40,6 @@ type reviewModel struct {
 	decided  bool
 }
 
-func newReviewModel(summary pgproxy.Summary) reviewModel {
-	return newReviewModelWithHTTPS(summary, httpsproxy.Summary{Sealed: true})
-}
-
-func newReviewModelWithHTTPS(summary pgproxy.Summary, httpsSummary httpsproxy.Summary) reviewModel {
-	return newReviewModelWithExternal(summary, httpsSummary, ghshim.Summary{Sealed: true})
-}
-
 func newReviewModelWithExternal(
 	summary pgproxy.Summary,
 	httpsSummary httpsproxy.Summary,

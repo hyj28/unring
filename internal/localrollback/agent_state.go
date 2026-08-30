@@ -58,11 +58,6 @@ func resolvedAgentStateRoot(root string) string {
 	return resolved
 }
 
-// IsAgentStatePath reports whether path is within a declared agent-state root.
-func IsAgentStatePath(path, home string) bool {
-	return IsAgentStatePathWithin(path, AgentStateRoots(home))
-}
-
 // IsAgentStatePathWithin reports whether path is within one of the persisted
 // resolved agent-state roots.
 func IsAgentStatePathWithin(path string, roots []string) bool {

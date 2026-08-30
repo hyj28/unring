@@ -74,7 +74,6 @@ type Options struct {
 	Adapters   *adapter.Set
 	Approve    func(context.Context, ApprovalRequest) (bool, error)
 	Executable string
-	Stdin      io.Reader
 	Stdout     io.Writer
 	Stderr     io.Writer
 }
@@ -90,7 +89,6 @@ type Session struct {
 	listener                   net.Listener
 	adapters                   *adapter.Set
 	approve                    func(context.Context, ApprovalRequest) (bool, error)
-	stdin                      io.Reader
 	stdout                     io.Writer
 	stderr                     io.Writer
 	approvalContext            context.Context
@@ -180,7 +178,7 @@ func Start(options Options) (*Session, error) {
 		directory: directory, socket: socket, token: hex.EncodeToString(secret[:]),
 		realGH: realGH, originalPath: os.Getenv("PATH"), listener: listener,
 		adapters: options.Adapters, approve: options.Approve,
-		stdin: options.Stdin, stdout: options.Stdout, stderr: options.Stderr,
+		stdout: options.Stdout, stderr: options.Stderr,
 		originalNetworkEnvironment: selectedEnvironment(os.Environ(), directNetworkEnvironmentKeys),
 		approvalContext:            approvalContext, cancelApprovals: cancelApprovals,
 		serveDone: make(chan struct{}), sealedDone: make(chan struct{}),

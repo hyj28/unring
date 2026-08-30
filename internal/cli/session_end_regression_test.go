@@ -1562,7 +1562,7 @@ func countChangeRows(output, pathFragment string) int {
 func TestCursorIsADeclaredAgentStateRoot(t *testing.T) {
 	home := t.TempDir()
 	path := filepath.Join(home, ".cursor", "extensions", "literal-extension")
-	if !localrollback.IsAgentStatePath(path, home) {
+	if !localrollback.IsAgentStatePathWithin(path, localrollback.AgentStateRoots(home)) {
 		t.Fatalf("%s was not recognized through the declared root list", path)
 	}
 	want := filepath.Join(home, ".cursor")
