@@ -1472,7 +1472,7 @@ func printFileChanges(output io.Writer, sessionID string, summary localrollback.
 		}
 	}
 	fmt.Fprintf(output,
-		"Files changed: %d created, %d modified, %d deleted. No file decision is needed now.\n",
+		"Files changed: %d created, %d modified, %d deleted. The files are left as the child left them; reverting them is a separate explicit step.\n",
 		created, modified, deleted)
 	agentStateRoots, inferredAgentStateRoots := agentStateGroupingRoots(summary.AgentStateRoots)
 	if inferredAgentStateRoots {
@@ -2213,6 +2213,7 @@ func logCommand(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout, "No unring sessions have been recorded.")
 			return 0
 		}
+		printHumanLogFileDecisionDisclosure(stdout)
 		fmt.Fprintln(stdout, "SESSION ID                                  STARTED               OUTCOME          COMMAND")
 		for _, record := range records {
 			fmt.Fprintf(stdout, "%-43s %-21s %-16s %s\n",
@@ -2544,7 +2545,7 @@ func retentionSpace(removal localrollback.RetentionRemoval) string {
 
 func printRetentionRemoval(output io.Writer, verb string, removal localrollback.RetentionRemoval) {
 	if verb == "retention removed" && !removal.Expired {
-		fmt.Fprintf(output, "unring: retention evicted oldest snapshot %s; the audit record remains available.\n", removal.SessionID)
+		fmt.Fprintf(output, "unring: retention evicted snapshot %s to meet the byte cap; the audit record remains available.\n", removal.SessionID)
 		return
 	}
 	target := retentionTarget(removal)
@@ -2903,6 +2904,7 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintln(stdout, "INCOMPLETE: the post-session scan did not produce a complete change list, and this session must not be treated as clean.")
 			}
 			printUnscannedRoots(stdout, "", record.Files.Unscanned)
+			printEmptyIncompleteRestoreAvailability(stdout, store.StateDir(), record)
 			return 0
 		}
 		fmt.Fprintf(stdout, "Session %s changed no watched files; the post-session scan completed.\n", record.ID)
@@ -3098,6 +3100,76 @@ func printRestoreExecutionCoverage(output io.Writer, record audit.Record) {
 		fmt.Fprintln(output, "INCOMPLETE: at least one watched root's post-session change list is unavailable. Only observed changes from completed scans are in the change list.")
 	}
 	printUnscannedRoots(output, "", record.Files.Unscanned)
+}
+
+const displayedRecordedBaselineRootLimit = 5
+
+type recordedBaselineAvailability struct {
+	state string
+	roots []string
+	err   error
+}
+
+const (
+	recordedBaselineRetained = "retained"
+	recordedBaselineUnsealed = "unsealed"
+	recordedBaselineAbsent   = "absent"
+	recordedBaselineUnknown  = "unknown"
+)
+
+func printEmptyIncompleteRestoreAvailability(output io.Writer, stateDir string, record audit.Record) {
+	availability := inspectRecordedBaselineAvailability(stateDir, record.ID)
+	switch availability.state {
+	case recordedBaselineAbsent:
+		fmt.Fprintln(output, "Clone snapshot data is not present; its recorded baseline data is gone, so named-path recovery is unavailable.")
+		return
+	case recordedBaselineUnsealed:
+		fmt.Fprintln(output, "Clone snapshot data is still on disk, but capture did not seal, so unring cannot use it for restore. It remains in snapshot storage until retention or prune removes it.")
+		return
+	case recordedBaselineUnknown:
+		fmt.Fprintf(output, "Clone snapshot availability is unknown, so no named-path recovery command is offered: %v.\n", availability.err)
+		return
+	}
+	roots := availability.roots
+	if len(roots) == 0 {
+		fmt.Fprintln(output, "Clone snapshot data is retained, but its manifest contains no recorded baseline root, so no named-path recovery command is offered.")
+		return
+	}
+	fmt.Fprintln(output, "Clone snapshot data is retained. Naming a path can recover its recorded baseline when snapshot coverage was recorded for that path.")
+	shown := roots
+	if len(shown) > displayedRecordedBaselineRootLimit {
+		shown = shown[:displayedRecordedBaselineRootLimit]
+	}
+	humanRoots := make([]string, 0, len(shown))
+	for _, root := range shown {
+		humanRoots = append(humanRoots, humanPath(root))
+	}
+	if omitted := len(roots) - len(shown); omitted > 0 {
+		fmt.Fprintf(output, "Recorded baseline roots: %s (+%d more; disclosed snapshot coverage gaps remain unavailable).\n",
+			strings.Join(humanRoots, ", "), omitted)
+	} else {
+		fmt.Fprintf(output, "Recorded baseline roots: %s (disclosed snapshot coverage gaps remain unavailable).\n",
+			strings.Join(humanRoots, ", "))
+	}
+	fmt.Fprintf(output, "Named paths still work: unring restore %s <path> [...]\n", record.ID)
+	fmt.Fprintf(output, "If current contents differ from the recorded baseline, that command is refused; overwrite explicitly with: unring restore --force %s <path> [...]\n", record.ID)
+}
+
+func inspectRecordedBaselineAvailability(stateDir, sessionID string) recordedBaselineAvailability {
+	info, err := localrollback.InspectRecordedBaselines(stateDir, sessionID)
+	if err == nil {
+		if !info.Sealed {
+			return recordedBaselineAvailability{state: recordedBaselineUnsealed}
+		}
+		return recordedBaselineAvailability{state: recordedBaselineRetained, roots: info.Roots}
+	}
+	snapshotPath := filepath.Join(stateDir, "snapshots", sessionID)
+	if _, statErr := os.Stat(snapshotPath); errors.Is(statErr, os.ErrNotExist) {
+		return recordedBaselineAvailability{state: recordedBaselineAbsent}
+	} else if statErr != nil {
+		return recordedBaselineAvailability{state: recordedBaselineUnknown, err: errors.Join(err, statErr)}
+	}
+	return recordedBaselineAvailability{state: recordedBaselineUnknown, err: err}
 }
 
 func snapshotsCommand(args []string, stdout, stderr io.Writer) int {
@@ -3363,6 +3435,7 @@ func printAuditRecord(output io.Writer, record audit.Record) {
 	fmt.Fprintf(output, "Command:  %s\n", humanCommand(record.Command))
 	fmt.Fprintf(output, "Decision: %s\n", record.Decision)
 	fmt.Fprintf(output, "Outcome:  %s\n", displayedOutcomeDetail(record))
+	printHumanLogFileDecisionDisclosure(output)
 	fmt.Fprintf(output, "Exit code: %d\n", record.ExitCode)
 	fmt.Fprintf(output, "Outbound interception: %t\n", record.Outbound)
 	if record.Error != "" {
@@ -3384,6 +3457,12 @@ func printAuditRecord(output io.Writer, record audit.Record) {
 			}
 		}
 	}
+}
+
+const humanLogFileDecisionDisclosure = "File note: OUTCOME does not describe file rollback. A session leaves files as the child left them; reverting files requires a separate unring restore."
+
+func printHumanLogFileDecisionDisclosure(output io.Writer) {
+	fmt.Fprintln(output, humanLogFileDecisionDisclosure)
 }
 
 func humanAuditError(record audit.Record) string {

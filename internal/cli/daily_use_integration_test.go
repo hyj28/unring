@@ -912,8 +912,9 @@ func TestSnapshotRetentionEvictsOldestAndReportsUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second retained session: %v\n%s", err, secondOutput)
 	}
-	if !strings.Contains(string(secondOutput), "retention evicted oldest snapshot "+firstID) {
-		t.Fatalf("retention output did not name oldest session:\n%s", secondOutput)
+	if !strings.Contains(string(secondOutput), "retention evicted snapshot "+firstID+" to meet the byte cap") ||
+		strings.Contains(string(secondOutput), "oldest snapshot") {
+		t.Fatalf("retention output did not name the selected byte-cap eviction precisely:\n%s", secondOutput)
 	}
 
 	usage := exec.Command(binary, "snapshots")

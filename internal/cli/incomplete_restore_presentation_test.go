@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -167,6 +168,322 @@ func TestRestoreCommandUsesRecordedBaselineWhenInterruptedChangeListIsEmpty(t *t
 	contents, err = os.ReadFile(path)
 	if err != nil || string(contents) != "must remain unchanged\n" {
 		t.Fatalf("refused restore --all contents = %q, %v; want independent unchanged literal", contents, err)
+	}
+}
+
+func TestEmptyInterruptedRestoreListingExplainsRetainedRecordedBaseline(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	root := t.TempDir()
+	path := filepath.Join(root, "retained-baseline.txt")
+	if err := os.WriteFile(path, []byte("before interruption\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record, err := audit.NewRecord([]string{"literal-retained-listing-command"}, time.Unix(210, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, _, err := localrollback.StartScope(stateDir, record.ID, localrollback.Scope{
+		Watched: []string{root},
+	}, 1<<30, time.Unix(210, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("after interruption\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	record.Files = session.SealContext(ctx, time.Unix(220, 0), nil)
+	if len(record.Files.Changes) != 0 || record.Files.Complete || !record.Files.Interrupted || !record.Files.Retained {
+		t.Fatalf("fixture summary = %#v, want literal retained interrupted empty change list", record.Files)
+	}
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr strings.Builder
+	if code := Main([]string{"restore", record.ID}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("retained incomplete restore listing exit = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	for _, literal := range []string{
+		"Clone snapshot data is retained",
+		"Recorded baseline roots: " + root,
+		"Named paths still work: unring restore " + record.ID + " <path> [...]",
+		"If current contents differ from the recorded baseline, that command is refused",
+		"unring restore --force " + record.ID + " <path> [...]",
+	} {
+		if !strings.Contains(stdout.String(), literal) {
+			t.Fatalf("retained incomplete restore listing omitted %q:\n%s", literal, stdout.String())
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("retained incomplete restore listing stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestEmptyInterruptedRestoreListingDoesNotOfferRootWithoutBaselineCoverage(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	root := filepath.Join(t.TempDir(), "not-captured")
+	record, err := audit.NewRecord([]string{"literal-uncovered-root-command"}, time.Unix(225, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, _, err := localrollback.StartScope(stateDir, record.ID, localrollback.Scope{
+		Watched: []string{root},
+	}, 1<<30, time.Unix(225, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	record.Files = session.SealContext(ctx, time.Unix(226, 0), nil)
+	if !record.Files.Retained || len(record.Files.Uncaptured) != 1 || record.Files.Uncaptured[0].Path != root {
+		t.Fatalf("fixture summary = %#v, want literal retained clone with uncovered root", record.Files)
+	}
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr strings.Builder
+	if code := Main([]string{"restore", record.ID}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("uncovered-root restore listing exit = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Clone snapshot data is retained, but its manifest contains no recorded baseline root") {
+		t.Fatalf("uncovered-root restore listing omitted precise retained limitation:\n%s", stdout.String())
+	}
+	for _, falseInvitation := range []string{"Naming a path recovers", "Named paths still work:", " <path> [...]"} {
+		if strings.Contains(stdout.String()+stderr.String(), falseInvitation) {
+			t.Fatalf("uncovered-root restore listing offered %q:\nstdout:\n%s\nstderr:\n%s", falseInvitation, stdout.String(), stderr.String())
+		}
+	}
+}
+
+func TestEmptyIncompleteRestoreListingOffersBaselineAfterWatchedRootIsRemoved(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	root := filepath.Join(t.TempDir(), "removed-watched-root")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "main.go")
+	if err := os.WriteFile(path, []byte("package retainedbaseline\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record, err := audit.NewRecord([]string{"literal-removed-root-command"}, time.Unix(227, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, _, err := localrollback.StartScope(stateDir, record.ID, localrollback.Scope{
+		Watched: []string{root},
+	}, 1<<30, time.Unix(227, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	record.Files = session.Seal(time.Unix(228, 0))
+	if len(record.Files.Changes) != 0 || record.Files.Complete || record.Files.Interrupted ||
+		!record.Files.Retained || len(record.Files.Unscanned) != 1 || record.Files.Unscanned[0].Path != root {
+		t.Fatalf("removed-root fixture summary = %#v, want literal retained incomplete empty list with one unscanned root", record.Files)
+	}
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr strings.Builder
+	if code := Main([]string{"restore", record.ID}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("removed-root restore listing exit = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	for _, literal := range []string{
+		"Clone snapshot data is retained",
+		"Recorded baseline roots: " + root,
+		"Named paths still work: unring restore " + record.ID + " <path> [...]",
+	} {
+		if !strings.Contains(stdout.String(), literal) {
+			t.Fatalf("removed-root restore listing omitted %q:\n%s", literal, stdout.String())
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Main([]string{"restore", record.ID, path}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("removed-root named baseline restore exit = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil || string(contents) != "package retainedbaseline\n" {
+		t.Fatalf("removed-root restored contents = %q, %v, want independent literal", contents, err)
+	}
+}
+
+func TestEmptyIncompleteRestoreListingDistinguishesUnsealedCloneOnDisk(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "baseline.txt"), []byte("still on disk\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record, err := audit.NewRecord([]string{"literal-unsealed-command"}, time.Unix(229, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, record.Files, err = localrollback.StartScope(stateDir, record.ID, localrollback.Scope{
+		Watched: []string{root},
+	}, 1<<30, time.Unix(229, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	snapshotPath := filepath.Join(stateDir, "snapshots", record.ID)
+	if info, err := os.Stat(snapshotPath); err != nil || !info.IsDir() {
+		t.Fatalf("unsealed fixture snapshot = %#v, %v, want directory on disk", info, err)
+	}
+	if _, err := localrollback.LoadSealedSummary(stateDir, record.ID); err == nil || !strings.Contains(err.Error(), "capture is still in progress") {
+		t.Fatalf("unsealed fixture LoadSealedSummary error = %v, want literal in-progress refusal", err)
+	}
+
+	var stdout, stderr strings.Builder
+	if code := Main([]string{"restore", record.ID}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("unsealed restore listing exit = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	for _, literal := range []string{"snapshot data is still on disk", "capture did not seal", "cannot use it for restore"} {
+		if !strings.Contains(stdout.String(), literal) {
+			t.Fatalf("unsealed restore listing omitted %q:\n%s", literal, stdout.String())
+		}
+	}
+	for _, falseClaim := range []string{"has been evicted", "data is gone", "Named paths still work:"} {
+		if strings.Contains(stdout.String()+stderr.String(), falseClaim) {
+			t.Fatalf("unsealed restore listing made false claim %q:\nstdout:\n%s\nstderr:\n%s", falseClaim, stdout.String(), stderr.String())
+		}
+	}
+}
+
+func TestEmptyInterruptedRestoreListingSaysEvictedCloneDataIsGone(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	root := t.TempDir()
+	record, err := audit.NewRecord([]string{"literal-evicted-listing-command"}, time.Unix(230, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, _, err := localrollback.StartScope(stateDir, record.ID, localrollback.Scope{
+		Watched: []string{root},
+	}, 1<<30, time.Unix(230, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	record.Files = session.SealContext(ctx, time.Unix(231, 0), nil)
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+	removal := localrollback.RetentionRemoval{
+		SessionID: record.ID, StorageBytes: record.Files.StorageBytes,
+		StorageExact: record.Files.StorageExact, HasSnapshot: true, CapRequired: true,
+	}
+	applied, err := applyRetentionRemovals(context.Background(), store, []localrollback.RetentionRemoval{removal}, nil, nil, nil, nil, "retention removed")
+	if err != nil || len(applied) != 1 || applied[0].SessionID != record.ID {
+		t.Fatalf("evicted fixture removal = %#v, %v, want one literal applied removal", applied, err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "snapshots", record.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("evicted fixture snapshot still exists: %v", err)
+	}
+	reloaded, err := store.LoadExact(record.ID)
+	if err != nil || reloaded.Files.Retained {
+		t.Fatalf("evicted fixture audit summary = %#v, %v, want retained false", reloaded.Files, err)
+	}
+
+	var stdout, stderr strings.Builder
+	if code := Main([]string{"restore", record.ID}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("evicted incomplete restore listing exit = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Clone snapshot data is not present; its recorded baseline data is gone") {
+		t.Fatalf("evicted incomplete restore listing omitted gone clone data:\n%s", stdout.String())
+	}
+	for _, falseInvitation := range []string{"Naming a path recovers", "Named paths still work:", " <path> [...]"} {
+		if strings.Contains(stdout.String()+stderr.String(), falseInvitation) {
+			t.Fatalf("evicted incomplete restore listing offered %q:\nstdout:\n%s\nstderr:\n%s", falseInvitation, stdout.String(), stderr.String())
+		}
+	}
+}
+
+func TestCompleteRestoreListingDoesNotOfferUnrecordedBaselineFallback(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	root := t.TempDir()
+	modified := filepath.Join(root, "modified.txt")
+	deleted := filepath.Join(root, "deleted.txt")
+	for _, path := range []string{modified, deleted} {
+		if err := os.WriteFile(path, []byte("literal baseline\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record, err := audit.NewRecord([]string{"literal-complete-listing-command"}, time.Unix(240, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, _, err := localrollback.StartScope(stateDir, record.ID, localrollback.Scope{
+		Watched: []string{root},
+	}, 1<<30, time.Unix(240, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(modified, []byte("literal modified contents\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(deleted); err != nil {
+		t.Fatal(err)
+	}
+	record.Files = session.Seal(time.Unix(250, 0))
+	if !record.Files.Complete || len(record.Files.Changes) != 2 {
+		t.Fatalf("fixture summary = %#v, want literal complete two-change list", record.Files)
+	}
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr strings.Builder
+	if code := Main([]string{"restore", record.ID}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("complete restore listing exit = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	for _, literal := range []string{modified, deleted, "Restore selected paths with: unring restore " + record.ID + " <path> [...]"} {
+		if !strings.Contains(stdout.String(), literal) {
+			t.Fatalf("complete restore listing omitted %q:\n%s", literal, stdout.String())
+		}
+	}
+	for _, incompleteOnly := range []string{"Naming a path recovers its recorded baseline", "Named paths still work:"} {
+		if strings.Contains(stdout.String(), incompleteOnly) {
+			t.Fatalf("complete restore listing included incomplete-only invitation %q:\n%s", incompleteOnly, stdout.String())
+		}
 	}
 }
 

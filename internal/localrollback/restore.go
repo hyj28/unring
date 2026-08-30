@@ -23,6 +23,15 @@ type RestoreResult struct {
 	Err     error
 }
 
+// RecordedBaselineInfo describes the pre-session baseline roots in a clone
+// manifest without treating post-session scan failures as capture failures.
+// Sealed is false when the clone directory exists but capture never published
+// an end time, in which case restore intentionally remains unavailable.
+type RecordedBaselineInfo struct {
+	Roots  []string
+	Sealed bool
+}
+
 // RestoreRecordedBaselines recovers the recorded pre-session state of each
 // explicitly selected path from a retained clone. Conflicting current state is
 // preserved by default and changed only when force is true. It is intentionally
@@ -192,6 +201,32 @@ func LoadSummary(stateDir, sessionID string) (Summary, error) {
 		return Summary{}, err
 	}
 	return summaryFromManifest(value, true), nil
+}
+
+// InspectRecordedBaselines reports roots whose pre-session capture produced a
+// recorded baseline. A later root-resolution or post-session scan failure does
+// not erase root.Before, so it must not hide a baseline that restore can use.
+func InspectRecordedBaselines(stateDir, sessionID string) (RecordedBaselineInfo, error) {
+	resolved, err := resolveSessionID(stateDir, sessionID)
+	if err != nil {
+		return RecordedBaselineInfo{}, err
+	}
+	unlock, err := acquireSnapshotLock(stateDir, resolved, unix.LOCK_SH)
+	if err != nil {
+		return RecordedBaselineInfo{}, err
+	}
+	defer unlock()
+	value, err := readManifest(filepath.Join(stateDir, "snapshots", resolved))
+	if err != nil {
+		return RecordedBaselineInfo{}, err
+	}
+	info := RecordedBaselineInfo{Sealed: !value.EndedAt.IsZero()}
+	for _, root := range value.Roots {
+		if len(root.Before) > 0 {
+			info.Roots = append(info.Roots, root.Path)
+		}
+	}
+	return info, nil
 }
 
 // LoadSealedSummary loads a durable file summary only after capture has ended.
