@@ -1485,7 +1485,11 @@ func printFileChanges(output io.Writer, sessionID string, summary localrollback.
 	printWatchedRootChangeGroups(output, regular, summary.Watched, summary.ChangeListRoots, sessionID, printChange)
 	if len(agentState) > 0 {
 		fmt.Fprintln(output, "AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
-		printDeclaredRootChangeGroups(output, agentState, agentStateRoots, sessionID, "agent own-state changes", "AGENT-STATE ROOT CHANGES", printChange)
+		if shouldCollapseAgentStateChanges(agentState) {
+			printCollapsedAgentStateChanges(output, agentState, agentStateRoots, sessionID, "", printChange)
+		} else {
+			printDeclaredRootChangeGroups(output, agentState, agentStateRoots, sessionID, "agent own-state changes", "AGENT-STATE ROOT CHANGES", printChange)
+		}
 	}
 	if summary.Retained && hasRestorableFileChange(summary.Changes) {
 		fmt.Fprintf(output, "Restore later with: unring restore %s\n", sessionID)
@@ -1578,7 +1582,11 @@ func printAuditFiles(output io.Writer, sessionID string, summary localrollback.S
 	printWatchedRootChangeGroups(output, regular, summary.Watched, summary.ChangeListRoots, sessionID, printChange)
 	if len(agentState) > 0 {
 		fmt.Fprintln(output, "  AGENT OWN-STATE CHANGES — reported, but skipped by restore --all unless explicitly included")
-		printDeclaredRootChangeGroups(output, agentState, agentStateRoots, sessionID, "agent own-state changes", "  AGENT-STATE ROOT CHANGES", printChange)
+		if shouldCollapseAgentStateChanges(agentState) {
+			printCollapsedAgentStateChanges(output, agentState, agentStateRoots, sessionID, "  ", printChange)
+		} else {
+			printDeclaredRootChangeGroups(output, agentState, agentStateRoots, sessionID, "agent own-state changes", "  AGENT-STATE ROOT CHANGES", printChange)
+		}
 	}
 	if summary.Interrupted {
 		fmt.Fprintf(output, "  INCOMPLETE: %s Run unring log --json %s for precise diagnostic details.\n",
@@ -1665,6 +1673,73 @@ func printBoundedChanges(
 		fmt.Fprintf(output,
 			"Showing %d of %d %s; %d withheld. Run unring restore %s to show every recorded change.\n",
 			shown, len(changes), group, withheld, sessionID)
+	}
+}
+
+const agentStateCollapseThreshold = 10
+
+func shouldCollapseAgentStateChanges(changes []localrollback.Change) bool {
+	return len(changes) > agentStateCollapseThreshold
+}
+
+func printCollapsedAgentStateChanges(
+	output io.Writer,
+	changes []localrollback.Change,
+	roots []string,
+	sessionID string,
+	prefix string,
+	printChange func(io.Writer, localrollback.Change),
+) {
+	groups := make([]watchedRootChangeGroup, 0, len(roots)+1)
+	rootIndexes := make(map[string]int)
+	for _, root := range roots {
+		root = filepath.Clean(root)
+		if _, exists := rootIndexes[root]; exists {
+			continue
+		}
+		rootIndexes[root] = len(groups)
+		groups = append(groups, watchedRootChangeGroup{root: root})
+	}
+	unmatched := -1
+	for _, change := range changes {
+		matchedRoot := ""
+		matchedIndex := -1
+		for root, index := range rootIndexes {
+			if pathWithinRoot(change.Path, root) && len(root) > len(matchedRoot) {
+				matchedRoot, matchedIndex = root, index
+			}
+		}
+		if matchedIndex < 0 {
+			if unmatched < 0 {
+				unmatched = len(groups)
+				groups = append(groups, watchedRootChangeGroup{})
+			}
+			matchedIndex = unmatched
+		}
+		groups[matchedIndex].changes = append(groups[matchedIndex].changes, change)
+	}
+	for _, group := range groups {
+		if len(group.changes) == 0 {
+			continue
+		}
+		if group.root == "" {
+			fmt.Fprintf(output, "%s%d changes outside the declared agent-state roots.\n", prefix, len(group.changes))
+		} else {
+			fmt.Fprintf(output, "%s%d changes under agent-state root %s.\n", prefix, len(group.changes), humanPath(group.root))
+		}
+	}
+	fmt.Fprintf(output, "%sList every recorded change with: unring restore %s\n", prefix, sessionID)
+
+	exceptionHeadingPrinted := false
+	for _, change := range changes {
+		if change.UnrestorableReason == "" && change.RestoreSource != localrollback.RestoreSourceNone {
+			continue
+		}
+		if !exceptionHeadingPrinted {
+			fmt.Fprintf(output, "%sAGENT OWN-STATE RESTORE EXCEPTIONS — not hidden by the collapsed count\n", prefix)
+			exceptionHeadingPrinted = true
+		}
+		printChange(output, change)
 	}
 }
 
@@ -2806,14 +2881,25 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		return internalErrorExitCode
 	}
 	record.Files = loadStoredFileSummary(store.StateDir(), record)
-	if len(record.Files.Changes) == 0 {
-		if !record.Files.Complete {
+	if restoreAll && len(selections) > 0 {
+		fmt.Fprintln(stderr, "unring: --all cannot be combined with selected paths")
+		return usageExitCode
+	}
+	if restoreAll && fileCoverageEndedAbnormally(record.Files) && len(record.Files.Changes) == 0 {
+		printStoredChangeListLimitation(stdout, record.Files, "", true)
+		printRestoreExecutionCoverage(stdout, record)
+		fmt.Fprintf(stderr, "unring: restore --all %s refused: the change list is incomplete. Restoring every recorded baseline would revert paths the session may never have touched. Named paths still work: unring restore %s <path> [...]\n",
+			record.ID, record.ID)
+		return internalErrorExitCode
+	}
+	if len(record.Files.Changes) == 0 && len(selections) == 0 {
+		if fileCoverageEndedAbnormally(record.Files) {
 			fmt.Fprintf(stdout, "UNRING FILE CHANGES %s\n", record.ID)
 			printStoredChangeListLimitation(stdout, record.Files, "  ", true)
 			if record.Files.Interrupted {
 				fmt.Fprintf(stdout, "INCOMPLETE: %s This session must not be treated as clean. Run unring log --json %s for precise diagnostic details.\n",
 					interruptedChangeListDetail(record.Files), record.ID)
-			} else {
+			} else if fileCoverageEndedAbnormally(record.Files) {
 				fmt.Fprintln(stdout, "INCOMPLETE: the post-session scan did not produce a complete change list, and this session must not be treated as clean.")
 			}
 			printUnscannedRoots(stdout, "", record.Files.Unscanned)
@@ -2829,11 +2915,10 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	printStoredChangeListLimitation(stdout, record.Files, "", true)
 	printRestoreExecutionCoverage(stdout, record)
+	if !restoreAll && !record.Files.Complete && record.Files.Retained {
+		fmt.Fprintln(stdout, "For another named path in the retained recorded baseline, unring can recover that baseline without inferring a change; conflicts are refused unless --force is supplied.")
+	}
 	if restoreAll {
-		if len(selections) > 0 {
-			fmt.Fprintln(stderr, "unring: --all cannot be combined with selected paths")
-			return usageExitCode
-		}
 		var skippedAgentState []localrollback.Change
 		agentStateRoots, inferredAgentStateRoots := agentStateGroupingRoots(record.Files.AgentStateRoots)
 		if inferredAgentStateRoots {
@@ -2854,6 +2939,26 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "Include them with: unring restore --all --include-agent-state %s\n", record.ID)
 		}
 	}
+	var baselineSelections []string
+	var selectionFailures []localrollback.RestoreResult
+	if !restoreAll {
+		observedSelections := make([]string, 0, len(selections))
+		for _, selection := range selections {
+			selected, selectionErr := localrollback.ChangesForRestore(record.Files.Changes, []string{selection})
+			if selectionErr != nil {
+				if !record.Files.Complete {
+					baselineSelections = append(baselineSelections, selection)
+				} else {
+					selectionFailures = append(selectionFailures, localrollback.RestoreResult{
+						Path: selection, Status: "unavailable", Err: selectionErr,
+					})
+				}
+				continue
+			}
+			observedSelections = append(observedSelections, selected[0].Path)
+		}
+		selections = observedSelections
+	}
 	selectedChanges, err := localrollback.ChangesForRestore(record.Files.Changes, selections)
 	if err != nil {
 		fmt.Fprintf(stderr, "unring: restore %s: %v\n", record.ID, err)
@@ -2871,10 +2976,39 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stderr, "unring: snapshot-only path: %s\n", humanPath(change.Path))
 	}
-	results, err := localrollback.RestoreRecorded(store.StateDir(), record.ID, record.Files, selections, force)
-	if err != nil {
-		fmt.Fprintf(stderr, "unring: restore %s: %v\n", record.ID, err)
-		return internalErrorExitCode
+	results := append([]localrollback.RestoreResult(nil), selectionFailures...)
+	if len(selections) > 0 {
+		var observedResults []localrollback.RestoreResult
+		observedResults, err = localrollback.RestoreRecorded(store.StateDir(), record.ID, record.Files, selections, force)
+		if err != nil {
+			for _, selection := range selections {
+				observedResults = append(observedResults, localrollback.RestoreResult{
+					Path: selection, Status: "error", Err: err,
+				})
+			}
+		}
+		results = append(results, observedResults...)
+	}
+	if len(baselineSelections) > 0 {
+		var baselineResults []localrollback.RestoreResult
+		if record.Files.Retained {
+			baselineResults, err = localrollback.RestoreRecordedBaselines(store.StateDir(), record.ID, baselineSelections, force)
+			if err != nil {
+				for _, selection := range baselineSelections {
+					baselineResults = append(baselineResults, localrollback.RestoreResult{
+						Path: selection, Status: "error", Err: err,
+					})
+				}
+			}
+		} else {
+			for _, selection := range baselineSelections {
+				baselineResults = append(baselineResults, localrollback.RestoreResult{
+					Path: selection, Status: "unavailable",
+					Err: errors.New("recorded baseline clone data is not retained"),
+				})
+			}
+		}
+		results = append(results, baselineResults...)
 	}
 	exitCode := 0
 	for _, result := range results {
@@ -2886,6 +3020,35 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "restored  %s\n", humanPath(result.Path))
 		case "already-restored":
 			fmt.Fprintf(stdout, "already restored  %s\n", humanPath(result.Path))
+		case "recorded-baseline-restored":
+			fmt.Fprintf(stdout, "recorded baseline written back  %s — change list incomplete; unring cannot confirm what the session did to this path\n", humanPath(result.Path))
+		case "recorded-baseline-already-present":
+			fmt.Fprintf(stdout, "recorded baseline already present  %s — change list incomplete; unring cannot confirm what the session did to this path\n", humanPath(result.Path))
+		case "recorded-baseline-refused":
+			exitCode = internalErrorExitCode
+			if result.Err != nil {
+				restoreEvent.Error = result.Err.Error()
+				fmt.Fprintf(stderr, "refused   %s: %v; recorded baseline not written\n", humanPath(result.Path), result.Err)
+				break
+			}
+			fmt.Fprintf(stderr, "refused   %s: current contents differ from the recorded baseline; the incomplete change list cannot distinguish session work from later user work, so the path was not overwritten\n", humanPath(result.Path))
+			if result.Sidecar != "" {
+				fmt.Fprintf(stderr, "recorded baseline written alongside: %s\n", humanPath(result.Sidecar))
+			}
+			fmt.Fprintln(stderr, "rerun with --force to write the recorded baseline over the current path explicitly")
+		case "recorded-absence-removed":
+			fmt.Fprintf(stdout, "removed   %s — recorded baseline says this path did not exist; change list incomplete, so unring cannot confirm what the session did to this path\n", humanPath(result.Path))
+		case "recorded-absence-already-absent":
+			fmt.Fprintf(stdout, "already absent  %s — recorded baseline says this path did not exist; change list incomplete, so unring cannot confirm what the session did to this path\n", humanPath(result.Path))
+		case "recorded-absence-refused":
+			exitCode = internalErrorExitCode
+			if result.Err != nil {
+				restoreEvent.Error = result.Err.Error()
+				fmt.Fprintf(stderr, "refused   %s: %v; not removed\n", humanPath(result.Path), result.Err)
+				break
+			}
+			fmt.Fprintf(stderr, "refused   %s: the recorded baseline says this path did not exist; restoring that absence means removing the current path, and the incomplete change list cannot confirm that the session created it; not removed\n", humanPath(result.Path))
+			fmt.Fprintln(stderr, "rerun with --force to remove the path explicitly")
 		case "refused":
 			exitCode = internalErrorExitCode
 			if result.Err != nil {
@@ -2929,10 +3092,10 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 
 func printRestoreExecutionCoverage(output io.Writer, record audit.Record) {
 	if record.Files.Interrupted {
-		fmt.Fprintf(output, "INCOMPLETE: %s Restore will use only the recorded changes from completed scans.\n",
+		fmt.Fprintf(output, "INCOMPLETE: %s Only observed changes from completed scans are in the change list.\n",
 			interruptedChangeListDetail(record.Files))
 	} else if len(record.Files.Unscanned) > 0 {
-		fmt.Fprintln(output, "INCOMPLETE: at least one watched root's post-session change list is unavailable; restore will use only the recorded changes from completed scans.")
+		fmt.Fprintln(output, "INCOMPLETE: at least one watched root's post-session change list is unavailable. Only observed changes from completed scans are in the change list.")
 	}
 	printUnscannedRoots(output, "", record.Files.Unscanned)
 }
@@ -3091,7 +3254,7 @@ func printRestoreListing(output io.Writer, record audit.Record) {
 		} else {
 			fmt.Fprintf(output, "INCOMPLETE: the post-session scan was interrupted; the paths below come only from sources whose scans completed, and this session must not be treated as clean. Run unring log --json %s for precise diagnostic details.\n", record.ID)
 		}
-	} else if !record.Files.Complete {
+	} else if fileCoverageEndedAbnormally(record.Files) {
 		fmt.Fprintln(output, "INCOMPLETE: the post-session scan did not produce a complete change list; the paths below may omit changes.")
 	}
 	printUnscannedRoots(output, "", record.Files.Unscanned)
