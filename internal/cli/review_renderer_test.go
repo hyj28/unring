@@ -8,6 +8,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/hyj28/unring/internal/ghshim"
+	"github.com/hyj28/unring/internal/httpsproxy"
 	"github.com/hyj28/unring/internal/pgproxy"
 )
 
@@ -16,10 +18,10 @@ func TestRendererKeepsStructuralDisclosureVisibleInPagedReview(t *testing.T) {
 	for index := range queries {
 		queries[index] = pgproxy.QueryRecord{SQL: fmt.Sprintf("SELECT %d", index)}
 	}
-	model := newReviewModel(pgproxy.Summary{
+	model := newReviewModelWithExternal(pgproxy.Summary{
 		Sealed: true, FullyReversible: true,
 		Changes: pgproxy.ChangeSummary{Complete: true}, Queries: queries,
-	})
+	}, httpsproxy.Summary{Sealed: true}, ghshim.Summary{Sealed: true})
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	view := updated.(reviewModel).View()
 	if lines := renderedLineCount(view); lines > 24 {
@@ -47,7 +49,7 @@ func TestRendererKeepsIrreversibilityAndBlindSpotWarningsTogether(t *testing.T) 
 	for index := range queries {
 		queries[index] = pgproxy.QueryRecord{SQL: fmt.Sprintf("UPDATE example SET n = %d", index)}
 	}
-	model := newReviewModel(pgproxy.Summary{
+	model := newReviewModelWithExternal(pgproxy.Summary{
 		Sealed:          true,
 		FullyReversible: false,
 		Changes:         pgproxy.ChangeSummary{Complete: true},
@@ -55,7 +57,7 @@ func TestRendererKeepsIrreversibilityAndBlindSpotWarningsTogether(t *testing.T) 
 			{Detail: "sequence advanced"},
 		},
 		Queries: queries,
-	})
+	}, httpsproxy.Summary{Sealed: true}, ghshim.Summary{Sealed: true})
 	updated, _ := model.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	view := updated.(reviewModel).View()
 	if lines := renderedLineCount(view); lines > 24 {

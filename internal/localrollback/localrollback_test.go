@@ -1,6 +1,7 @@
 package localrollback
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -130,7 +131,9 @@ func TestStateDirectoryExclusionUsesResolvedPath(t *testing.T) {
 	if len(session.manifest.Excluded) != 1 || session.manifest.Excluded[0] != want {
 		t.Fatalf("excluded = %#v, want resolved state path %q", session.manifest.Excluded, want)
 	}
-	entries, failures, err := scanRoot(filepath.Dir(want), session.manifest.Excluded)
+	entries, failures, err := scanRootWithNamesContext(
+		context.Background(), filepath.Dir(want), session.manifest.Excluded, nil,
+	)
 	if err != nil || len(failures) != 0 {
 		t.Fatalf("scan around resolved exclusion: failures=%#v err=%v", failures, err)
 	}

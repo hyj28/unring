@@ -44,7 +44,6 @@ type ApprovalResult struct {
 type Result struct {
 	ExitCode    int
 	Interrupted bool
-	SessionLost bool
 	Err         error
 }
 
@@ -93,7 +92,6 @@ func Run(options Options) Result {
 	allApprovals := approvals
 	var forceKill <-chan time.Time
 	var interrupted bool
-	var sessionLost bool
 	var supervisionErr error
 	type completedApproval struct {
 		id     uint64
@@ -126,7 +124,6 @@ func Run(options Options) Result {
 			return Result{
 				ExitCode:    exitCode,
 				Interrupted: interrupted,
-				SessionLost: sessionLost,
 				Err:         errors.Join(childWaitError(err), supervisionErr),
 			}
 		case <-childChanges:
@@ -191,7 +188,6 @@ func Run(options Options) Result {
 				approvalID++
 			}
 		case <-abort:
-			sessionLost = true
 			abort = nil
 			_ = signalProcessGroup(command.Process.Pid, syscall.SIGTERM)
 			forceKill = time.After(2 * time.Second)
