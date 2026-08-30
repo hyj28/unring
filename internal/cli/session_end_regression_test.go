@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,6 +41,8 @@ type reviewablePostgresSession struct {
 	*unconfiguredPostgresSession
 }
 
+const logFileDecisionDisclosure = "File note: OUTCOME does not describe file rollback. A session leaves files as the child left them; reverting files requires a separate unring restore."
+
 func (session *reviewablePostgresSession) Summary() pgproxy.Summary {
 	return pgproxy.Summary{
 		InterceptionStatus: pgproxy.InterceptionActive,
@@ -51,6 +54,216 @@ func (session *reviewablePostgresSession) Summary() pgproxy.Summary {
 			},
 		},
 		Sealed: true,
+	}
+}
+
+func TestEndSummarySaysChangedFilesRemainUntilExplicitRestore(t *testing.T) {
+	root := t.TempDir()
+	modified := filepath.Join(root, "modified.txt")
+	deleted := filepath.Join(root, "deleted.txt")
+	summary := localrollback.Summary{
+		Watched:  []string{root},
+		Complete: true,
+		Retained: true,
+		Changes: []localrollback.Change{
+			{Kind: "modified", Path: modified, RestoreSource: localrollback.RestoreSourceClone},
+			{Kind: "deleted", Path: deleted, RestoreSource: localrollback.RestoreSourceClone},
+		},
+	}
+	var output strings.Builder
+	printFileChanges(&output, "literal-file-state-session", summary, true)
+
+	for _, literal := range []string{
+		"Files changed: 0 created, 1 modified, 1 deleted. The files are left as the child left them; reverting them is a separate explicit step.",
+		"  modified " + modified,
+		"  deleted  " + deleted,
+		"Restore later with: unring restore literal-file-state-session",
+	} {
+		if !strings.Contains(output.String(), literal) {
+			t.Fatalf("changed-file summary omitted %q:\n%s", literal, output.String())
+		}
+	}
+	if strings.Contains(output.String(), "No file decision is needed now") {
+		t.Fatalf("changed-file summary retained ambiguous decision wording:\n%s", output.String())
+	}
+}
+
+func TestEndSummaryWithNoChangesDoesNotDiscussChildLeftFileState(t *testing.T) {
+	summary := localrollback.Summary{Complete: true, Retained: true}
+	var output strings.Builder
+	printFileChanges(&output, "literal-clean-session", summary, true)
+	if output.String() != "Files changed: 0 created, 0 modified, 0 deleted. The post-session scan completed.\n" {
+		t.Fatalf("clean file summary changed unexpectedly:\n%s", output.String())
+	}
+	for _, changedOnly := range []string{"left as the child left them", "reverting them is a separate explicit step", "Restore later with:"} {
+		if strings.Contains(output.String(), changedOnly) {
+			t.Fatalf("clean file summary included changed-only statement %q:\n%s", changedOnly, output.String())
+		}
+	}
+}
+
+func TestHumanLogKeepsOutcomeValuesAndDisclosesFileDistinctionOnce(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixtures := []struct {
+		started        int64
+		command        string
+		outcome        string
+		completionKind string
+		exitCode       int
+		wantDisplayed  string
+	}{
+		{started: 1000, command: "literal-discarded", outcome: "discarded", wantDisplayed: "discarded"},
+		{started: 1010, command: "literal-default", outcome: "discarded", completionKind: completionKindDefaultDiscard, wantDisplayed: "default discard"},
+		{started: 1020, command: "literal-interrupted", outcome: "discarded", completionKind: completionKindAbnormalDiscard, exitCode: 130, wantDisplayed: "interrupted"},
+		{started: 1030, command: "literal-committed", outcome: "committed", wantDisplayed: "committed"},
+	}
+	var records []audit.Record
+	for _, fixture := range fixtures {
+		record, err := audit.NewRecord([]string{fixture.command}, time.Unix(fixture.started, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		record.Outcome = fixture.outcome
+		record.CompletionKind = fixture.completionKind
+		record.ExitCode = fixture.exitCode
+		if err := store.Save(record); err != nil {
+			t.Fatal(err)
+		}
+		records = append(records, record)
+	}
+
+	var stdout, stderr strings.Builder
+	if code := Main([]string{"log"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("human log exit = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	if got := strings.Count(stdout.String(), logFileDecisionDisclosure); got != 1 {
+		t.Fatalf("human log file disclosure count = %d, want literal 1:\n%s", got, stdout.String())
+	}
+	for index, fixture := range fixtures {
+		line := outputLineContaining(stdout.String(), records[index].ID)
+		if !strings.Contains(line, fixture.wantDisplayed) || !strings.Contains(line, fixture.command) {
+			t.Fatalf("human log row = %q, want literals %q and %q", line, fixture.wantDisplayed, fixture.command)
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Main([]string{"log", records[0].ID}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("human log detail exit = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	if got := strings.Count(stdout.String(), logFileDecisionDisclosure); got != 1 {
+		t.Fatalf("human log detail file disclosure count = %d, want literal 1:\n%s", got, stdout.String())
+	}
+}
+
+func TestJSONLogDoesNotGainHumanFileDecisionDisclosure(t *testing.T) {
+	stateDir := t.TempDir()
+	configureStorageHygieneTest(t, stateDir)
+	record := audit.Record{
+		Version:   1,
+		ID:        "19700101T001640.000000000Z-literaljson",
+		StartedAt: time.Unix(1000, 0).UTC(),
+		Command:   []string{"literal-json-command"},
+		Decision:  "discard",
+		Outcome:   "discarded",
+	}
+	store, err := audit.OpenStoreAt(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(record); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr strings.Builder
+	if code := Main([]string{"log", "--json", record.ID}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("JSON log exit = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	const wantJSON = `{
+  "version": 1,
+  "id": "19700101T001640.000000000Z-literaljson",
+  "started_at": "1970-01-01T00:16:40Z",
+  "ended_at": "0001-01-01T00:00:00Z",
+  "command": [
+    "literal-json-command"
+  ],
+  "decision": "discard",
+  "outcome": "discarded",
+  "exit_code": 0,
+  "postgres": {
+    "interception_status": "",
+    "connections": 0,
+    "queries": null,
+    "fully_reversible": false,
+    "irreversible_actions": null,
+    "changes": {
+      "rows": null,
+      "schema": null,
+      "complete": false
+    },
+    "unintercepted": null,
+    "non_transactional_effects": null,
+    "sealed": false
+  },
+  "https": {
+    "connections": 0,
+    "requests": null,
+    "staged": null,
+    "approvals": null,
+    "unintercepted": null,
+    "sealed": false,
+    "finalized": false
+  },
+  "gh": {
+    "records": null,
+    "sealed": false
+  },
+  "outbound_enabled": false,
+  "files": {
+    "watched_paths": null,
+    "uncaptured_paths": null,
+    "changes": null,
+    "complete": false,
+    "storage": "",
+    "logical_bytes": 0,
+    "storage_bytes": 0,
+    "storage_bytes_exact": false,
+    "copied_bytes": 0,
+    "retention_cap_bytes": 0,
+    "retained": false,
+    "backstop": {
+      "checked": false,
+      "available": false
+    }
+  },
+  "irreversible_actions": null,
+  "unintercepted": null,
+  "structural_blind_spots": null
+}
+`
+	if stdout.String() != wantJSON {
+		t.Fatalf("JSON log bytes changed:\ngot:\n%s\nwant:\n%s", stdout.String(), wantJSON)
+	}
+	if strings.Contains(stdout.String()+stderr.String(), logFileDecisionDisclosure) {
+		t.Fatalf("JSON log included human-only file disclosure:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Main([]string{"log", "--json"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("JSON log list exit = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	const wantListJSONSHA256 = "b160d66ae5648b848eb6feba418f606508c31b8704428267d3fdc37be0130d89"
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(stdout.String()))); got != wantListJSONSHA256 {
+		t.Fatalf("JSON log list bytes changed: sha256 = %s, want literal %s\noutput:\n%s", got, wantListJSONSHA256, stdout.String())
+	}
+	if strings.Contains(stdout.String()+stderr.String(), logFileDecisionDisclosure) {
+		t.Fatalf("JSON log list included human-only file disclosure:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
 	}
 }
 

@@ -548,7 +548,7 @@ func TestRunEnforcesRetentionAtStartForUnsealedPriorSnapshot(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("start-time retention run exit = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "retention evicted oldest snapshot "+oldRecord.ID) {
+	if !strings.Contains(stderr.String(), "retention evicted snapshot "+oldRecord.ID+" to meet the byte cap") {
 		t.Fatalf("start-time retention did not announce killed session eviction:\n%s", stderr.String())
 	}
 	if _, err := os.Stat(filepath.Join(stateDir, "snapshots", oldRecord.ID)); !errors.Is(err, os.ErrNotExist) {
@@ -592,7 +592,7 @@ func TestDamagedAuditAndSnapshotDoNotDisableHealthyCapRetention(t *testing.T) {
 	for _, want := range []string{
 		"unreadable audit records were skipped",
 		"retention warning for damaged-snapshot",
-		"retention evicted oldest snapshot " + healthyOldID,
+		"retention evicted snapshot " + healthyOldID + " to meet the byte cap",
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("damaged-store retention missing %q:\n%s", want, stderr.String())
