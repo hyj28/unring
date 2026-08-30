@@ -1256,13 +1256,28 @@ func TestAgentStateAndOutsideChangesAreBoundedPerPresentationRoot(t *testing.T) 
 	printAuditFiles(&stored, "literal-root-fairness", summary)
 	for name, output := range map[string]string{"live": live.String(), "stored": stored.String()} {
 		for fragment, want := range map[string]int{
-			"/home/.claude/claude-noisy-":         50,
-			"/home/.cursor/cursor-important-":     5,
 			"/home/Downloads/download-noisy-":     50,
 			"/home/Documents/document-important-": 5,
 		} {
 			if got := countChangeRows(output, fragment); got != want {
 				t.Fatalf("%s %s rows = %d, want independent literal %d\n%s", name, fragment, got, want, output)
+			}
+		}
+		for fragment, want := range map[string]int{
+			"/home/.claude/claude-noisy-":     0,
+			"/home/.cursor/cursor-important-": 0,
+		} {
+			if got := countChangeRows(output, fragment); got != want {
+				t.Fatalf("%s collapsed %s rows = %d, want independent literal %d\n%s", name, fragment, got, want, output)
+			}
+		}
+		for _, literal := range []string{
+			"3000 changes under agent-state root /literal/home/.claude.",
+			"5 changes under agent-state root /literal/home/.cursor.",
+			"List every recorded change with: unring restore literal-root-fairness",
+		} {
+			if !strings.Contains(output, literal) {
+				t.Fatalf("%s collapsed agent-state output missing %q:\n%s", name, literal, output)
 			}
 		}
 	}
@@ -1304,16 +1319,16 @@ func TestSingleAutomaticRetentionRemovalUsesSingularSession(t *testing.T) {
 
 func assertBoundedChangeRendering(t *testing.T, output string) {
 	t.Helper()
-	if got := countChangeRows(output, "/cursor-"); got != 50 {
-		t.Fatalf("printed cursor changes = %d, want literal 50\n%s", got, output)
+	if got := countChangeRows(output, "/cursor-"); got != 0 {
+		t.Fatalf("printed cursor changes = %d, want literal 0 after agent-state collapse\n%s", got, output)
 	}
 	if got := countChangeRows(output, "/regular-"); got != 50 {
 		t.Fatalf("printed regular changes = %d, want literal 50\n%s", got, output)
 	}
 	for _, literal := range []string{
-		"Showing 50 of 55 agent own-state changes; 5 withheld",
+		"55 changes under agent-state root",
 		"Showing 50 of 55 changes under watched root",
-		"Run unring restore ",
+		"List every recorded change with: unring restore ",
 	} {
 		if !strings.Contains(output, literal) {
 			t.Fatalf("bounded change output missing %q:\n%s", literal, output)

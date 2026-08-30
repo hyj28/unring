@@ -23,6 +23,159 @@ type RestoreResult struct {
 	Err     error
 }
 
+// RestoreRecordedBaselines recovers the recorded pre-session state of each
+// explicitly selected path from a retained clone. Conflicting current state is
+// preserved by default and changed only when force is true. It is intentionally
+// separate from Restore: callers use it only when an incomplete change list
+// cannot say whether a path changed, but the durable root baseline can still
+// supply the state captured before the session.
+func RestoreRecordedBaselines(stateDir, sessionID string, selections []string, force bool) ([]RestoreResult, error) {
+	resolved, err := resolveSessionID(stateDir, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	unlock, err := acquireSnapshotLock(stateDir, resolved, unix.LOCK_SH)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	snapshotRoot := filepath.Join(stateDir, "snapshots", resolved)
+	value, err := readManifest(snapshotRoot)
+	if err != nil {
+		return nil, err
+	}
+	if value.EndedAt.IsZero() {
+		return nil, fmt.Errorf("snapshot %s is incomplete because capture is still in progress and cannot be restored", sessionID)
+	}
+
+	results := make([]RestoreResult, 0, len(selections))
+	seen := make(map[string]bool)
+	for _, selection := range selections {
+		path, entry, selectionErr := selectRecordedBaseline(value, selection)
+		if selectionErr != nil {
+			results = append(results, RestoreResult{Path: requestedAbsolutePath(selection), Status: "unavailable", Err: selectionErr})
+			continue
+		}
+		if seen[path] {
+			continue
+		}
+		seen[path] = true
+		results = append(results, restoreRecordedBaselineOne(snapshotRoot, value, path, entry, force))
+	}
+	return results, nil
+}
+
+func selectRecordedBaseline(value manifest, selection string) (string, *Entry, error) {
+	originalSelection := selection
+	absolute := selection
+	if !filepath.IsAbs(absolute) {
+		var err error
+		absolute, err = filepath.Abs(absolute)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+	absolute = filepath.Clean(absolute)
+	if entry, exists := recordedBaselineEntry(value, absolute); exists {
+		entryCopy := entry
+		return absolute, &entryCopy, nil
+	}
+	if !filepath.IsAbs(originalSelection) {
+		cleanSelection := filepath.Clean(originalSelection)
+		matched := ""
+		var matchedEntry Entry
+		for _, root := range value.Roots {
+			for candidate, entry := range root.Before {
+				if candidate != cleanSelection && !strings.HasSuffix(candidate, string(os.PathSeparator)+cleanSelection) {
+					continue
+				}
+				if matched != "" && matched != candidate {
+					return "", nil, fmt.Errorf("%q matches more than one path in the recorded baseline; use an absolute path", originalSelection)
+				}
+				matched, matchedEntry = candidate, entry
+			}
+		}
+		if matched != "" {
+			return matched, &matchedEntry, nil
+		}
+	}
+	root, found := manifestRootFor(value, absolute)
+	if !found {
+		return "", nil, fmt.Errorf("%q is outside the recorded snapshot roots for this session", selection)
+	}
+	if reason := recordedBaselineCoverageGap(value, root, absolute); reason != "" {
+		return "", nil, fmt.Errorf("%q has no recorded baseline because snapshot coverage was unavailable: %s", selection, reason)
+	}
+	return absolute, nil, nil
+}
+
+func recordedBaselineCoverageGap(value manifest, root rootManifest, path string) string {
+	for excluded := range root.Uncaptured {
+		if path == excluded || strings.HasPrefix(path, excluded+string(os.PathSeparator)) {
+			return root.Uncaptured[excluded]
+		}
+	}
+	for _, excluded := range value.Excluded {
+		if path == excluded || strings.HasPrefix(path, excluded+string(os.PathSeparator)) {
+			return "the path was excluded from the clone snapshot"
+		}
+	}
+	return ""
+}
+
+func recordedBaselineEntry(value manifest, path string) (Entry, bool) {
+	root, found := manifestRootFor(value, path)
+	if !found {
+		return Entry{}, false
+	}
+	entry, exists := root.Before[path]
+	return entry, exists
+}
+
+func requestedAbsolutePath(selection string) string {
+	if filepath.IsAbs(selection) {
+		return filepath.Clean(selection)
+	}
+	absolute, err := filepath.Abs(selection)
+	if err != nil {
+		return selection
+	}
+	return filepath.Clean(absolute)
+}
+
+func restoreRecordedBaselineOne(snapshotRoot string, value manifest, path string, before *Entry, force bool) RestoreResult {
+	change := Change{Kind: "created", Path: path}
+	if before != nil {
+		beforeCopy := *before
+		change.Kind = "modified"
+		change.Before = &beforeCopy
+		// An incomplete scan has no trustworthy After entry. Leaving After nil
+		// makes every existing non-baseline value a conflict, while restoreOne's
+		// byte-aware already-restored check still accepts an exact baseline.
+	}
+	result := restoreOne(snapshotRoot, value, change, force)
+	if before == nil {
+		switch result.Status {
+		case "restored":
+			result.Status = "recorded-absence-removed"
+		case "already-restored":
+			result.Status = "recorded-absence-already-absent"
+		case "refused":
+			result.Status = "recorded-absence-refused"
+		}
+		return result
+	}
+	switch result.Status {
+	case "restored":
+		result.Status = "recorded-baseline-restored"
+	case "already-restored":
+		result.Status = "recorded-baseline-already-present"
+	case "refused":
+		result.Status = "recorded-baseline-refused"
+	}
+	return result
+}
+
 // LoadSummary loads the durable file summary for a retained snapshot.
 func LoadSummary(stateDir, sessionID string) (Summary, error) {
 	resolved, err := resolveSessionID(stateDir, sessionID)
