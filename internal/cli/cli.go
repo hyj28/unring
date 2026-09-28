@@ -4178,12 +4178,26 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "the safe default is discard; use --commit or --discard for automation.")
 }
 
+// Version carries the release version for builds that set it explicitly with
+// -ldflags "-X github.com/hyj28/unring/internal/cli.Version=v1.2.3". Plain
+// `go build` cannot know the tag it was built from, so a release binary has to
+// be told. When this is empty the version falls back to the module build info,
+// which is already correct for `go install <module>/cmd/unring@v1.2.3` and
+// reports "devel" for an untagged local build.
+var Version string
+
 func versionString() string {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
+		if Version != "" {
+			return "unring " + Version
+		}
 		return "unring devel"
 	}
-	version := info.Main.Version
+	version := Version
+	if version == "" {
+		version = info.Main.Version
+	}
 	if version == "" || version == "(devel)" {
 		version = "devel"
 	}
