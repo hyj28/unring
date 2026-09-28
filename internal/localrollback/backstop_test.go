@@ -307,6 +307,64 @@ func TestVolumeRestoreChecksPurgeBeforeMountAndRestoresWhenPresent(t *testing.T)
 	}
 }
 
+func TestVolumeBackedDirectorySelectionReportsEveryDescendant(t *testing.T) {
+	home := t.TempDir()
+	stateDir := t.TempDir()
+	cloneRoot := filepath.Join(home, "watched")
+	if err := os.Mkdir(cloneRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(home, "archive")
+	nested := filepath.Join(directory, "nested")
+	if err := os.MkdirAll(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	first := filepath.Join(directory, "first.txt")
+	second := filepath.Join(nested, "second.txt")
+	writeRollbackTestFile(t, first, "literal volume first\n")
+	writeRollbackTestFile(t, second, "literal volume second\n")
+	platform := &fakeVolumeSnapshotPlatform{
+		supported: true, excluded: map[string]bool{},
+		snapshotFiles: map[string]string{
+			first: "literal volume first\n", second: "literal volume second\n",
+		},
+	}
+	restorePlatform := SetVolumeSnapshotPlatformForTest(platform)
+	defer restorePlatform()
+	session, _, err := StartScope(stateDir, "volume-directory", Scope{
+		Watched: []string{cloneRoot}, ScanRoot: home,
+	}, 1<<30, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(directory); err != nil {
+		t.Fatal(err)
+	}
+	summary := session.Seal(time.Unix(2, 0))
+	selected, err := ChangesForRestore(summary.Changes, []string{directory})
+	if err != nil || len(selected) != 4 {
+		t.Fatalf("volume directory fixture selection = %#v, %v; want four recorded paths", selected, err)
+	}
+	for _, change := range selected {
+		if change.RestoreSource != RestoreSourceVolume {
+			t.Fatalf("volume directory change = %#v, want snapshot-only source", change)
+		}
+	}
+
+	results, err := Restore(stateDir, "volume-directory", []string{directory}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUniqueRestorePaths(t, results, 4)
+	for _, result := range results {
+		if result.Status != "restored" {
+			t.Fatalf("volume descendant result = %#v, want restored", result)
+		}
+	}
+	assertRollbackTestFile(t, first, "literal volume first\n")
+	assertRollbackTestFile(t, second, "literal volume second\n")
+}
+
 func TestNoTimeMachineIsSupportedWithoutBackstop(t *testing.T) {
 	root := t.TempDir()
 	platform := &fakeVolumeSnapshotPlatform{

@@ -108,3 +108,172 @@ func TestRestoreRecordedBaselinesReachesInterruptedCloneWithoutClaimingAChange(t
 		t.Fatalf("mixed baseline restored contents = %q, %v; want independent literal", contents, err)
 	}
 }
+
+func TestRestoreRecordedBaselinesRecreatesNamedDirectorySubtree(t *testing.T) {
+	stateDir := t.TempDir()
+	root := t.TempDir()
+	directory := filepath.Join(root, "a")
+	nested := filepath.Join(directory, "b")
+	if err := os.MkdirAll(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	x := filepath.Join(directory, "x.txt")
+	y := filepath.Join(nested, "y.txt")
+	if err := os.WriteFile(x, []byte("literal interrupted x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(y, []byte("literal interrupted y\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, _, err := StartScope(stateDir, "interrupted-directory", Scope{Watched: []string{root}}, 1<<30, time.Unix(10, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(directory); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	summary := session.SealContext(ctx, time.Unix(20, 0), nil)
+	if summary.Complete || !summary.Interrupted || len(summary.Changes) != 0 {
+		t.Fatalf("interrupted directory fixture = %#v, want independently verified empty incomplete list", summary)
+	}
+
+	results, err := RestoreRecordedBaselines(stateDir, "interrupted-directory", []string{directory}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUniqueRestorePaths(t, results, 4)
+	assertRollbackTestFile(t, x, "literal interrupted x\n")
+	assertRollbackTestFile(t, y, "literal interrupted y\n")
+}
+
+func TestRestoreRecordedBaselinesChecksEveryNamedDirectoryDescendant(t *testing.T) {
+	stateDir := t.TempDir()
+	root := t.TempDir()
+	directory := filepath.Join(root, "a")
+	nested := filepath.Join(directory, "b")
+	if err := os.MkdirAll(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	x := filepath.Join(directory, "x.txt")
+	y := filepath.Join(nested, "y.txt")
+	if err := os.WriteFile(x, []byte("literal baseline x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(y, []byte("literal baseline y\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, _, err := StartScope(stateDir, "interrupted-directory-conflict", Scope{Watched: []string{root}}, 1<<30, time.Unix(10, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(x, []byte("literal current x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	summary := session.SealContext(ctx, time.Unix(20, 0), nil)
+	if summary.Complete || !summary.Interrupted || len(summary.Changes) != 0 {
+		t.Fatalf("interrupted conflict fixture = %#v, want independently verified empty incomplete list", summary)
+	}
+	newPath := filepath.Join(directory, "new.txt")
+	if err := os.WriteFile(newPath, []byte("literal later file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := RestoreRecordedBaselines(stateDir, "interrupted-directory-conflict", []string{directory}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUniqueRestorePaths(t, results, 5)
+	byPath := restoreResultsByPath(results)
+	if byPath[x].Status != "recorded-baseline-refused" || byPath[x].Sidecar == "" {
+		t.Fatalf("conflicting baseline descendant = %#v, want refused with sidecar", byPath[x])
+	}
+	if byPath[y].Status != "recorded-baseline-already-present" {
+		t.Fatalf("matching baseline descendant = %#v, want already present", byPath[y])
+	}
+	if byPath[newPath].Status != "recorded-baseline-unrecorded-present" {
+		t.Fatalf("unrecorded current descendant = %#v, want left untouched", byPath[newPath])
+	}
+	assertRollbackTestFile(t, x, "literal current x\n")
+	assertRollbackTestFile(t, byPath[x].Sidecar, "literal baseline x\n")
+	assertRollbackTestFile(t, newPath, "literal later file\n")
+}
+
+func TestForcedRecordedBaselineDirectoryLeavesAndReportsUnrecordedDescendant(t *testing.T) {
+	stateDir := t.TempDir()
+	root := t.TempDir()
+	directory := filepath.Join(root, "a")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	baseline := filepath.Join(directory, "baseline.txt")
+	if err := os.WriteFile(baseline, []byte("literal forced baseline\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, _, err := StartScope(stateDir, "forced-directory-unrecorded", Scope{Watched: []string{root}}, 1<<30, time.Unix(10, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	summary := session.SealContext(ctx, time.Unix(20, 0), nil)
+	if summary.Complete || !summary.Interrupted || len(summary.Changes) != 0 {
+		t.Fatalf("forced baseline fixture = %#v, want independent empty incomplete list", summary)
+	}
+	userFile := filepath.Join(directory, "later-user.txt")
+	if err := os.WriteFile(userFile, []byte("literal later user bytes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := RestoreRecordedBaselines(stateDir, "forced-directory-unrecorded", []string{directory}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPath := restoreResultsByPath(results)
+	if byPath[userFile].Status != "recorded-baseline-unrecorded-present" {
+		t.Fatalf("unrecorded descendant result = %#v, want left-untouched status", byPath[userFile])
+	}
+	assertRollbackTestFile(t, userFile, "literal later user bytes\n")
+}
+
+func TestForcedRecordedBaselineDirectoryReplacedByFileFailsTypeCheck(t *testing.T) {
+	stateDir := t.TempDir()
+	root := t.TempDir()
+	directory := filepath.Join(root, "D")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "child.txt"), []byte("literal baseline child\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, _, err := StartScope(stateDir, "forced-baseline-directory-file", Scope{Watched: []string{root}}, 1<<30, time.Unix(10, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(directory); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(directory, []byte("literal current replacement\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	summary := session.SealContext(ctx, time.Unix(20, 0), nil)
+	if summary.Complete || !summary.Interrupted || len(summary.Changes) != 0 {
+		t.Fatalf("forced replacement fixture = %#v, want empty incomplete list", summary)
+	}
+
+	results, err := RestoreRecordedBaselines(stateDir, "forced-baseline-directory-file", []string{directory}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPath := restoreResultsByPath(results)
+	if byPath[directory].Status != "error" || byPath[directory].Err == nil ||
+		!strings.Contains(byPath[directory].Err.Error(), "existing path has type") {
+		t.Fatalf("forced baseline replacement result = %#v, want type error", byPath[directory])
+	}
+	assertRollbackTestFile(t, directory, "literal current replacement\n")
+}

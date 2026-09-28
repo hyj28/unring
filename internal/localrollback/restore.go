@@ -33,12 +33,32 @@ type RecordedBaselineInfo struct {
 }
 
 // RestoreRecordedBaselines recovers the recorded pre-session state of each
-// explicitly selected path from a retained clone. Conflicting current state is
-// preserved by default and changed only when force is true. It is intentionally
+// explicitly selected path, including recorded descendants of selected
+// directories, from a retained clone. Conflicting current state is preserved
+// by default and changed only when force is true. It is intentionally
 // separate from Restore: callers use it only when an incomplete change list
 // cannot say whether a path changed, but the durable root baseline can still
 // supply the state captured before the session.
 func RestoreRecordedBaselines(stateDir, sessionID string, selections []string, force bool) ([]RestoreResult, error) {
+	return restoreRecordedBaselines(stateDir, sessionID, selections, nil, nil, force)
+}
+
+// RestoreRecordedBaselinesExcluding restores baseline descendants other than
+// paths already handled from the observed change list. agentStateRoots is the
+// caller's resolved legacy-compatible classification.
+func RestoreRecordedBaselinesExcluding(
+	stateDir, sessionID string,
+	selections, excludedPaths, agentStateRoots []string,
+	force bool,
+) ([]RestoreResult, error) {
+	return restoreRecordedBaselines(stateDir, sessionID, selections, excludedPaths, agentStateRoots, force)
+}
+
+func restoreRecordedBaselines(
+	stateDir, sessionID string,
+	selections, excludedPaths, agentStateRoots []string,
+	force bool,
+) ([]RestoreResult, error) {
 	resolved, err := resolveSessionID(stateDir, sessionID)
 	if err != nil {
 		return nil, err
@@ -56,66 +76,138 @@ func RestoreRecordedBaselines(stateDir, sessionID string, selections []string, f
 	if value.EndedAt.IsZero() {
 		return nil, fmt.Errorf("snapshot %s is incomplete because capture is still in progress and cannot be restored", sessionID)
 	}
+	effectiveAgentStateRoots := value.AgentStateRoots
+	if len(agentStateRoots) > 0 {
+		effectiveAgentStateRoots = agentStateRoots
+	}
+	excluded := make(map[string]bool, len(excludedPaths))
+	for _, path := range excludedPaths {
+		excluded[filepath.Clean(path)] = true
+	}
 
-	results := make([]RestoreResult, 0, len(selections))
+	selected := make([]Change, 0, len(selections))
 	seen := make(map[string]bool)
 	for _, selection := range selections {
-		path, entry, selectionErr := selectRecordedBaseline(value, selection)
+		baselines, selectionErr := selectRecordedBaselines(value, selection)
 		if selectionErr != nil {
-			results = append(results, RestoreResult{Path: requestedAbsolutePath(selection), Status: "unavailable", Err: selectionErr})
+			selected = append(selected, Change{
+				Kind: "unavailable", Path: requestedAbsolutePath(selection),
+				UnrestorableReason: selectionErr.Error(),
+			})
 			continue
 		}
-		if seen[path] {
-			continue
+		group := make([]Change, 0, len(baselines))
+		for _, baseline := range baselines {
+			if excluded[filepath.Clean(baseline.path)] {
+				continue
+			}
+			if seen[baseline.path] {
+				continue
+			}
+			seen[baseline.path] = true
+			change := Change{Kind: "created", Path: baseline.path}
+			if baseline.unrecordedPresent {
+				change.Kind = "unrecorded-present"
+				group = append(group, change)
+				continue
+			}
+			if IsAgentStatePathWithin(baseline.path, effectiveAgentStateRoots) &&
+				!explicitlySelectedAgentStatePath(baseline.path, selections, effectiveAgentStateRoots) {
+				change.Kind = "skipped"
+				group = append(group, change)
+				continue
+			}
+			if baseline.entry != nil {
+				entryCopy := *baseline.entry
+				change.Kind = "modified"
+				change.Before = &entryCopy
+			}
+			group = append(group, change)
 		}
-		seen[path] = true
-		results = append(results, restoreRecordedBaselineOne(snapshotRoot, value, path, entry, force))
+		selected = append(selected, orderRestoreChanges(group)...)
 	}
+	results := make([]RestoreResult, 0, len(selected))
+	execution := newRestoreExecution()
+	for _, change := range selected {
+		if change.Kind == "unrecorded-present" {
+			results = append(results, RestoreResult{Path: change.Path, Status: "recorded-baseline-unrecorded-present"})
+			continue
+		}
+		if change.Kind == "skipped" {
+			results = append(results, RestoreResult{Path: change.Path, Status: "skipped"})
+			continue
+		}
+		if change.Kind == "unavailable" {
+			results = append(results, RestoreResult{
+				Path: change.Path, Status: "unavailable", Err: errors.New(change.UnrestorableReason),
+			})
+			continue
+		}
+		results = append(results, restoreRecordedBaselineOne(snapshotRoot, value, change.Path, change.Before, force, execution))
+	}
+	finishRestoreExecution(execution, results)
 	return results, nil
 }
 
-func selectRecordedBaseline(value manifest, selection string) (string, *Entry, error) {
-	originalSelection := selection
-	absolute := selection
-	if !filepath.IsAbs(absolute) {
-		var err error
-		absolute, err = filepath.Abs(absolute)
-		if err != nil {
-			return "", nil, err
+type recordedBaselineSelection struct {
+	path              string
+	entry             *Entry
+	unrecordedPresent bool
+}
+
+func selectRecordedBaselines(value manifest, selection string) ([]recordedBaselineSelection, error) {
+	paths := make([]string, 0)
+	entries := make(map[string]Entry)
+	for _, root := range value.Roots {
+		for path, entry := range root.Before {
+			path = filepath.Clean(path)
+			paths = append(paths, path)
+			entries[path] = entry
 		}
 	}
-	absolute = filepath.Clean(absolute)
-	if entry, exists := recordedBaselineEntry(value, absolute); exists {
-		entryCopy := entry
-		return absolute, &entryCopy, nil
+	selectionRoot, matched, err := resolveSelectionRoot(paths, selection, "recorded baseline")
+	if err != nil {
+		return nil, err
 	}
-	if !filepath.IsAbs(originalSelection) {
-		cleanSelection := filepath.Clean(originalSelection)
-		matched := ""
-		var matchedEntry Entry
-		for _, root := range value.Roots {
-			for candidate, entry := range root.Before {
-				if candidate != cleanSelection && !strings.HasSuffix(candidate, string(os.PathSeparator)+cleanSelection) {
-					continue
+	if matched {
+		selected := make([]recordedBaselineSelection, 0)
+		for path, entry := range entries {
+			if !pathWithin(path, selectionRoot) {
+				continue
+			}
+			entryCopy := entry
+			selected = append(selected, recordedBaselineSelection{path: path, entry: &entryCopy})
+		}
+		if entry, exists := entries[selectionRoot]; exists && entry.Type == "directory" {
+			walkErr := filepath.WalkDir(selectionRoot, func(path string, _ fs.DirEntry, walkErr error) error {
+				if walkErr != nil {
+					return walkErr
 				}
-				if matched != "" && matched != candidate {
-					return "", nil, fmt.Errorf("%q matches more than one path in the recorded baseline; use an absolute path", originalSelection)
+				path = filepath.Clean(path)
+				if path == selectionRoot {
+					return nil
 				}
-				matched, matchedEntry = candidate, entry
+				if _, recorded := entries[path]; !recorded {
+					selected = append(selected, recordedBaselineSelection{path: path, unrecordedPresent: true})
+				}
+				return nil
+			})
+			if walkErr != nil && !errors.Is(walkErr, os.ErrNotExist) {
+				return nil, fmt.Errorf("inspect current descendants of %s: %w", selectionRoot, walkErr)
 			}
 		}
-		if matched != "" {
-			return matched, &matchedEntry, nil
-		}
+		return selected, nil
 	}
+
+	absolute := requestedAbsolutePath(selection)
 	root, found := manifestRootFor(value, absolute)
 	if !found {
-		return "", nil, fmt.Errorf("%q is outside the recorded snapshot roots for this session", selection)
+		return nil, fmt.Errorf("%q is outside the recorded snapshot roots for this session", selection)
 	}
 	if reason := recordedBaselineCoverageGap(value, root, absolute); reason != "" {
-		return "", nil, fmt.Errorf("%q has no recorded baseline because snapshot coverage was unavailable: %s", selection, reason)
+		return nil, fmt.Errorf("%q has no recorded baseline because snapshot coverage was unavailable: %s", selection, reason)
 	}
-	return absolute, nil, nil
+	return []recordedBaselineSelection{{path: absolute}}, nil
 }
 
 func recordedBaselineCoverageGap(value manifest, root rootManifest, path string) string {
@@ -132,15 +224,6 @@ func recordedBaselineCoverageGap(value manifest, root rootManifest, path string)
 	return ""
 }
 
-func recordedBaselineEntry(value manifest, path string) (Entry, bool) {
-	root, found := manifestRootFor(value, path)
-	if !found {
-		return Entry{}, false
-	}
-	entry, exists := root.Before[path]
-	return entry, exists
-}
-
 func requestedAbsolutePath(selection string) string {
 	if filepath.IsAbs(selection) {
 		return filepath.Clean(selection)
@@ -152,7 +235,7 @@ func requestedAbsolutePath(selection string) string {
 	return filepath.Clean(absolute)
 }
 
-func restoreRecordedBaselineOne(snapshotRoot string, value manifest, path string, before *Entry, force bool) RestoreResult {
+func restoreRecordedBaselineOne(snapshotRoot string, value manifest, path string, before *Entry, force bool, execution *restoreExecution) RestoreResult {
 	change := Change{Kind: "created", Path: path}
 	if before != nil {
 		beforeCopy := *before
@@ -162,7 +245,7 @@ func restoreRecordedBaselineOne(snapshotRoot string, value manifest, path string
 		// makes every existing non-baseline value a conflict, while restoreOne's
 		// byte-aware already-restored check still accepts an exact baseline.
 	}
-	result := restoreOne(snapshotRoot, value, change, force)
+	result := restoreOne(snapshotRoot, value, change, force, execution)
 	if before == nil {
 		switch result.Status {
 		case "restored":
@@ -243,9 +326,14 @@ func LoadSealedSummary(stateDir, sessionID string) (Summary, error) {
 	return summary, nil
 }
 
-// Restore applies selected file changes. Paths are exact absolute paths or
-// paths relative to the caller's current working directory.
+// Restore applies selected file changes. A selected directory includes every
+// recorded change below it. Paths are absolute or relative to the caller's
+// current working directory.
 func Restore(stateDir, sessionID string, selections []string, force bool) ([]RestoreResult, error) {
+	return restoreWithAgentStateRoots(stateDir, sessionID, selections, nil, force)
+}
+
+func restoreWithAgentStateRoots(stateDir, sessionID string, selections, agentStateRoots []string, force bool) ([]RestoreResult, error) {
 	resolved, err := resolveSessionID(stateDir, sessionID)
 	if err != nil {
 		return nil, err
@@ -266,13 +354,21 @@ func Restore(stateDir, sessionID string, selections []string, force bool) ([]Res
 	if err != nil {
 		return nil, err
 	}
+	effectiveAgentStateRoots := value.AgentStateRoots
+	if len(agentStateRoots) > 0 {
+		effectiveAgentStateRoots = agentStateRoots
+	}
+	selected, skipped := excludeImplicitAgentState(selected, selections, effectiveAgentStateRoots)
 	selected = orderRestoreChanges(selected)
 	rootDirectory := filepath.Join(stateDir, "snapshots", value.SessionID)
 	platform := currentSnapshotPlatform()
-	return restoreSelection(platform, selected, force, func(change Change) RestoreResult {
+	execution := newRestoreExecution()
+	results := restoreSelection(platform, selected, force, func(change Change) RestoreResult {
 		// Manifests written before restore-source tagging are clone-backed.
-		return restoreOne(rootDirectory, value, change, force)
-	}), nil
+		return restoreOne(rootDirectory, value, change, force, execution)
+	})
+	finishRestoreExecution(execution, results)
+	return append(results, skipped...), nil
 }
 
 // RestoreRecorded restores from an audit summary when available. It preserves
@@ -284,7 +380,7 @@ func RestoreRecorded(stateDir, sessionID string, summary Summary, selections []s
 	}
 	manifestPath := filepath.Join(stateDir, "snapshots", sessionID, "manifest.json")
 	if _, err := os.Stat(manifestPath); err == nil {
-		return Restore(stateDir, sessionID, selections, force)
+		return restoreWithAgentStateRoots(stateDir, sessionID, selections, summary.AgentStateRoots, force)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
@@ -292,6 +388,7 @@ func RestoreRecorded(stateDir, sessionID string, summary Summary, selections []s
 	if err != nil {
 		return nil, err
 	}
+	selected, skipped := excludeImplicitAgentState(selected, selections, summary.AgentStateRoots)
 	selected = orderRestoreChanges(selected)
 	unlock, err := acquireSnapshotLock(stateDir, sessionID, unix.LOCK_SH)
 	if err != nil {
@@ -299,12 +396,45 @@ func RestoreRecorded(stateDir, sessionID string, summary Summary, selections []s
 	}
 	defer unlock()
 	platform := currentSnapshotPlatform()
-	return restoreSelection(platform, selected, force, func(change Change) RestoreResult {
+	results := restoreSelection(platform, selected, force, func(change Change) RestoreResult {
 		return RestoreResult{
 			Path: change.Path, Status: "unavailable",
 			Err: errors.New("clone snapshot data was evicted; this path was not stored in the volume-snapshot restore layer"),
 		}
-	}), nil
+	})
+	return append(results, skipped...), nil
+}
+
+func excludeImplicitAgentState(changes []Change, selections, agentStateRoots []string) ([]Change, []RestoreResult) {
+	if len(agentStateRoots) == 0 {
+		return changes, nil
+	}
+	selected := make([]Change, 0, len(changes))
+	var skipped []RestoreResult
+	for _, change := range changes {
+		if IsAgentStatePathWithin(change.Path, agentStateRoots) &&
+			!explicitlySelectedAgentStatePath(change.Path, selections, agentStateRoots) {
+			skipped = append(skipped, RestoreResult{Path: change.Path, Status: "skipped"})
+			continue
+		}
+		selected = append(selected, change)
+	}
+	return selected, skipped
+}
+
+func explicitlySelectedAgentStatePath(path string, selections, agentStateRoots []string) bool {
+	for _, root := range agentStateRoots {
+		if !pathWithin(path, root) {
+			continue
+		}
+		for _, selection := range selections {
+			selectionRoot, matched, err := resolveSelectionRoot([]string{path}, selection, "agent own-state path")
+			if err == nil && matched && pathWithin(selectionRoot, root) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type volumeRestorePlan struct {
@@ -554,8 +684,17 @@ func restoreMountedSnapshotObject(snapshotPath, destination string, metadata *En
 		return err
 	}
 	if metadata.Type == "directory" {
-		if err := os.Mkdir(destination, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-			return err
+		if err := os.Mkdir(destination, 0o700); err != nil {
+			if !errors.Is(err, os.ErrExist) {
+				return err
+			}
+			info, inspectErr := os.Lstat(destination)
+			if inspectErr != nil {
+				return inspectErr
+			}
+			if !info.IsDir() {
+				return fmt.Errorf("restore directory %s: existing path has type %s", destination, info.Mode().Type())
+			}
 		}
 		return applyMetadata(destination, *metadata)
 	}
@@ -779,52 +918,92 @@ func selectChanges(changes []Change, selections []string) ([]Change, error) {
 	if len(selections) == 0 {
 		return nil, nil
 	}
+	paths := make([]string, 0, len(changes))
 	byAbsolute := make(map[string]Change, len(changes))
 	for _, change := range changes {
-		byAbsolute[filepath.Clean(change.Path)] = change
+		path := filepath.Clean(change.Path)
+		paths = append(paths, path)
+		byAbsolute[path] = change
 	}
-	selected := make([]Change, 0, len(selections))
+	selected := make([]Change, 0, len(changes))
 	seen := make(map[string]bool)
 	for _, selection := range selections {
-		originalSelection := selection
-		absolute := selection
-		if !filepath.IsAbs(absolute) {
-			var err error
-			absolute, err = filepath.Abs(absolute)
-			if err != nil {
-				return nil, err
-			}
+		selectionRoot, matched, err := resolveSelectionRoot(paths, selection, "changed path")
+		if err != nil {
+			return nil, err
 		}
-		change, exists := byAbsolute[filepath.Clean(absolute)]
-		if !exists && !filepath.IsAbs(originalSelection) {
-			cleanSelection := filepath.Clean(originalSelection)
-			for _, candidate := range changes {
-				if candidate.Path == cleanSelection || strings.HasSuffix(candidate.Path, string(os.PathSeparator)+cleanSelection) {
-					if exists {
-						return nil, fmt.Errorf("%q matches more than one changed path; use an absolute path", originalSelection)
-					}
-					change, exists = candidate, true
-				}
-			}
-		}
-		if !exists {
+		if !matched {
 			return nil, fmt.Errorf("%q is not a changed path in this session", selection)
 		}
-		if !seen[change.Path] {
-			selected = append(selected, change)
-			seen[change.Path] = true
+		for _, path := range paths {
+			if !pathWithin(path, selectionRoot) || seen[path] {
+				continue
+			}
+			selected = append(selected, byAbsolute[path])
+			seen[path] = true
 		}
 	}
 	return selected, nil
 }
 
-// ChangesForRestore resolves user selections exactly as Restore will, without
-// changing files or crossing the root privilege boundary.
+func resolveSelectionRoot(paths []string, selection, noun string) (string, bool, error) {
+	absolute := selection
+	if !filepath.IsAbs(absolute) {
+		var err error
+		absolute, err = filepath.Abs(absolute)
+		if err != nil {
+			return "", false, err
+		}
+	}
+	absolute = filepath.Clean(absolute)
+	for _, path := range paths {
+		if pathWithin(filepath.Clean(path), absolute) {
+			return absolute, true, nil
+		}
+	}
+	if filepath.IsAbs(selection) {
+		return absolute, false, nil
+	}
+
+	cleanSelection := filepath.Clean(selection)
+	candidates := make(map[string]bool)
+	for _, path := range paths {
+		for candidate := filepath.Clean(path); ; candidate = filepath.Dir(candidate) {
+			if candidate == cleanSelection || strings.HasSuffix(candidate, string(os.PathSeparator)+cleanSelection) {
+				candidates[candidate] = true
+			}
+			parent := filepath.Dir(candidate)
+			if parent == candidate {
+				break
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return absolute, false, nil
+	}
+	if len(candidates) > 1 {
+		return "", false, fmt.Errorf("%q matches more than one %s; use an absolute path", selection, noun)
+	}
+	for candidate := range candidates {
+		return candidate, true, nil
+	}
+	return absolute, false, nil
+}
+
+func pathWithin(path, root string) bool {
+	path = filepath.Clean(path)
+	root = filepath.Clean(root)
+	return path == root || strings.HasPrefix(path, root+string(os.PathSeparator))
+}
+
+// ChangesForRestore resolves user selections, including directory descendants,
+// exactly as Restore will, without changing files or crossing the root
+// privilege boundary.
 func ChangesForRestore(changes []Change, selections []string) ([]Change, error) {
 	return selectChanges(changes, selections)
 }
 
-func restoreOne(snapshotRoot string, value manifest, change Change, force bool) RestoreResult {
+func restoreOne(snapshotRoot string, value manifest, change Change, force bool, execution *restoreExecution) RestoreResult {
 	result := RestoreResult{Path: change.Path}
 	if err := verifyRestoreRoot(value, change.Path); err != nil {
 		result.Status, result.Err = "refused", err
@@ -835,16 +1014,29 @@ func restoreOne(snapshotRoot string, value manifest, change Change, force bool) 
 		result.Status, result.Err = "error", err
 		return result
 	}
-	alreadyRestored, err := pathMatchesBefore(snapshotRoot, value, change, current, exists)
+	createdDuringRestore := false
+	if execution != nil {
+		_, createdDuringRestore = execution.created[change.Path]
+	}
+	comparisonCurrent := current
+	if execution != nil {
+		if original, ok := execution.temporary[change.Path]; ok {
+			comparisonCurrent = original
+		}
+	}
+	alreadyRestored, err := pathMatchesBefore(snapshotRoot, value, change, comparisonCurrent, exists)
 	if err != nil {
 		result.Status, result.Err = "error", err
 		return result
 	}
-	if alreadyRestored {
+	if alreadyRestored && !createdDuringRestore {
 		result.Status = "already-restored"
 		return result
 	}
-	conflict := !matchesExpected(current, exists, change.After)
+	conflict := !matchesExpected(comparisonCurrent, exists, change.After)
+	if createdDuringRestore && change.Before != nil && change.Before.Type == "directory" {
+		conflict = false
+	}
 	if conflict && !force {
 		result.Status = "refused"
 		if change.Before != nil {
@@ -878,7 +1070,7 @@ func restoreOne(snapshotRoot string, value manifest, change Change, force bool) 
 			result.Status, result.Err = "error", err
 			return result
 		}
-		if err := restoreSnapshotObject(snapshotPath, change.Path, change.Before, value); err != nil {
+		if err := restoreSnapshotObject(snapshotPath, change.Path, change.Before, value, execution); err != nil {
 			result.Status, result.Err = "error", err
 			return result
 		}
@@ -890,25 +1082,93 @@ func restoreOne(snapshotRoot string, value manifest, change Change, force bool) 
 	return result
 }
 
-func restoreSnapshotObject(snapshotPath, destination string, metadata *Entry, value manifest) error {
+type restoreExecution struct {
+	created   map[string]Entry
+	temporary map[string]Entry
+	finalized map[string]bool
+}
+
+func newRestoreExecution() *restoreExecution {
+	return &restoreExecution{
+		created: make(map[string]Entry), temporary: make(map[string]Entry), finalized: make(map[string]bool),
+	}
+}
+
+func finishRestoreExecution(execution *restoreExecution, results []RestoreResult) {
+	if execution == nil {
+		return
+	}
+	entries := make(map[string]Entry, len(execution.created)+len(execution.temporary))
+	for path, entry := range execution.temporary {
+		entries[path] = entry
+	}
+	for path, entry := range execution.created {
+		entries[path] = entry
+	}
+	paths := make([]string, 0, len(entries))
+	for path := range entries {
+		if !execution.finalized[path] {
+			paths = append(paths, path)
+		}
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		leftDepth := strings.Count(filepath.Clean(paths[i]), string(os.PathSeparator))
+		rightDepth := strings.Count(filepath.Clean(paths[j]), string(os.PathSeparator))
+		if leftDepth != rightDepth {
+			return leftDepth > rightDepth
+		}
+		return paths[i] < paths[j]
+	})
+	for _, path := range paths {
+		if err := applyMetadata(path, entries[path]); err != nil {
+			attachRestoreFinalizationError(results, path, err)
+		}
+	}
+}
+
+func attachRestoreFinalizationError(results []RestoreResult, directory string, err error) {
+	for index := range results {
+		if results[index].Path != directory && !pathWithin(results[index].Path, directory) {
+			continue
+		}
+		results[index].Status = "error"
+		results[index].Err = errors.Join(results[index].Err, fmt.Errorf("apply restored directory metadata for %s: %w", directory, err))
+		return
+	}
+}
+
+func restoreSnapshotObject(snapshotPath, destination string, metadata *Entry, value manifest, execution *restoreExecution) error {
 	if metadata == nil {
 		return errors.New("snapshot metadata is absent")
 	}
-	createdParents, err := ensureParentDirectories(value, destination)
+	_, err := ensureParentDirectories(value, destination, execution)
 	if err != nil {
 		return err
 	}
-	var restoreErr error
 	if metadata.Type == "directory" {
-		if err := os.Mkdir(destination, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-			restoreErr = err
-		} else {
-			restoreErr = applyMetadata(destination, *metadata)
+		if err := os.Mkdir(destination, 0o700); err != nil {
+			if !errors.Is(err, os.ErrExist) {
+				return err
+			}
+			info, inspectErr := os.Lstat(destination)
+			if inspectErr != nil {
+				return inspectErr
+			}
+			if !info.IsDir() {
+				return fmt.Errorf("restore directory %s: existing path has type %s", destination, info.Mode().Type())
+			}
+		} else if execution != nil {
+			execution.created[destination] = *metadata
 		}
-	} else {
-		restoreErr = restoreSnapshotAtomically(snapshotPath, destination, metadata)
+		if err := applyMetadata(destination, *metadata); err != nil {
+			return err
+		}
+		if execution != nil {
+			execution.finalized[destination] = true
+		}
+		return nil
 	}
-	return errors.Join(restoreErr, applyCreatedParentMetadata(createdParents))
+	return restoreSnapshotAtomically(snapshotPath, destination, metadata)
 }
 
 func applyCreatedParentMetadata(created []restoredParent) error {
@@ -917,6 +1177,13 @@ func applyCreatedParentMetadata(created []restoredParent) error {
 		result = errors.Join(result, applyMetadata(created[index].path, created[index].entry))
 	}
 	return result
+}
+
+func applyCreatedParentMetadataOnError(execution *restoreExecution, created []restoredParent) error {
+	if execution != nil {
+		return nil
+	}
+	return applyCreatedParentMetadata(created)
 }
 
 func restoreSnapshotAtomically(snapshotPath, destination string, metadata *Entry) error {
@@ -944,7 +1211,7 @@ type restoredParent struct {
 	entry Entry
 }
 
-func ensureParentDirectories(value manifest, destination string) ([]restoredParent, error) {
+func ensureParentDirectories(value manifest, destination string, execution *restoreExecution) ([]restoredParent, error) {
 	root, found := manifestRootFor(value, destination)
 	if !found {
 		return nil, fmt.Errorf("snapshot has no root for %s", destination)
@@ -974,25 +1241,43 @@ func ensureParentDirectories(value manifest, destination string) ([]restoredPare
 			if !info.IsDir() {
 				return created, errors.Join(
 					fmt.Errorf("restore parent %s is not a directory", path),
-					applyCreatedParentMetadata(created),
+					applyCreatedParentMetadataOnError(execution, created),
 				)
+			}
+			if execution != nil {
+				current, currentErr := entryFromInfo(path, info)
+				if currentErr != nil {
+					return created, errors.Join(currentErr, applyCreatedParentMetadataOnError(execution, created))
+				}
+				mode := info.Mode()
+				if mode.Perm()&0o300 != 0o300 {
+					if _, recorded := execution.temporary[path]; !recorded {
+						execution.temporary[path] = current
+					}
+					if chmodErr := os.Chmod(path, restorableMode(current.Mode)|0o300); chmodErr != nil {
+						return created, errors.Join(chmodErr, applyCreatedParentMetadataOnError(execution, created))
+					}
+				}
 			}
 			continue
 		}
 		if !errors.Is(err, os.ErrNotExist) {
-			return created, errors.Join(err, applyCreatedParentMetadata(created))
+			return created, errors.Join(err, applyCreatedParentMetadataOnError(execution, created))
 		}
 		entry, exists := root.Before[path]
 		if !exists || entry.Type != "directory" {
 			return created, errors.Join(
 				fmt.Errorf("snapshot has no directory metadata for missing parent %s", path),
-				applyCreatedParentMetadata(created),
+				applyCreatedParentMetadataOnError(execution, created),
 			)
 		}
 		if err := os.Mkdir(path, 0o700); err != nil {
-			return created, errors.Join(err, applyCreatedParentMetadata(created))
+			return created, errors.Join(err, applyCreatedParentMetadataOnError(execution, created))
 		}
 		created = append(created, restoredParent{path: path, entry: entry})
+		if execution != nil {
+			execution.created[path] = entry
+		}
 	}
 	return created, nil
 }
