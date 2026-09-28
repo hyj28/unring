@@ -1,8 +1,8 @@
 # HTTP adapters
 
 Adapters are declarative YAML files that tell unring how to treat intercepted
-HTTPS requests. They contain no Go code and use no LLM. The GitHub and Slack
-adapters shipped with unring are ordinary files in
+HTTPS requests. They contain no Go code and use no LLM. The GitHub adapter
+shipped with unring is an ordinary file in
 [`internal/adapter/builtin`](../internal/adapter/builtin) and pass through the
 same loader as user files.
 
@@ -97,9 +97,9 @@ Rule fields:
 Every synthesized response must say that it is staged and not a real service
 response. It should include only the minimum fields the client needs to accept
 the call. Do not invent server IDs, timestamps, canonical URLs, version
-numbers, or any value a later call might consume. For example, the Slack
-response says `ok: true` and carries unring's staged marker, but deliberately
-does not claim a Slack `ts`, channel, or message object.
+numbers, or any value a later call might consume. A synthesized response should
+say `ok: true` and carry unring's staged marker while deliberately claiming no
+server-assigned identifier, timestamp, or resource object.
 
 On commit, unring sends the original method, URL, headers, and body and sets the
 `Idempotency-Key` header to the evaluated key. On discard, it deletes the
@@ -126,8 +126,8 @@ response.
 
 Templates resolve deterministic `${request...}` and `${response...}` fields from
 the original request and the real successful origin response. A missing field is an
-error; unring never guesses a resource identifier. The built-in Slack rule resolves
-the original channel and returned timestamp before calling `chat.delete`. A 2xx
+error; unring never guesses a resource identifier. The built-in GitHub rule resolves
+`${response.url}` from the real creation response before closing the issue. A 2xx
 response is required, and a JSON response containing `ok: false` is failure even when
 the HTTP status is 200.
 

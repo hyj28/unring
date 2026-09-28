@@ -36,7 +36,7 @@ now you can.
 |:--|:--|:--|
 | **Local files** | APFS snapshot + copy-on-write clone, with explicit coverage gaps | Restore a path after the run |
 | **PostgreSQL** | Shares one real transaction across the agent's connections | One final `COMMIT` or `ROLLBACK` |
-| **GitHub, Slack, HTTPS** | Opt-in adapters, HTTPS interception, and a structured `gh` shim | Stage first; compensate where possible |
+| **GitHub, HTTPS** | Opt-in adapters, HTTPS interception, and a structured `gh` shim | Stage first; compensate where possible |
 
 > [!IMPORTANT]
 > unring is an accident guard, not a hostile-process sandbox. It reports what it could
@@ -52,8 +52,8 @@ go install github.com/hyj28/unring/cmd/unring@latest
 unring run -- claude -p 'Implement the validation change, run its tests, then stop'
 ```
 
-Need database protection? Export the real development database URL first. Want GitHub,
-Slack, and generic HTTPS review too? Add `--outbound`.
+Need database protection? Export the real development database URL first. Want GitHub
+and generic HTTPS review too? Add `--outbound`.
 
 ```sh
 export DATABASE_URL='postgresql://user:password@localhost/app'
@@ -525,13 +525,13 @@ would create states that are difficult to reason about—for example, committing
   strongest outcome is a staged call that was discarded and therefore never reached
   its service. For a call that really ran, review says before the decision whether
   discard has a declared compensation, what it will attempt, and what may remain.
-  Unring durably records the attempt and never reports success from an HTTP error,
-  transport error, or a Slack `ok: false` response. A failed or impossible
+  Unring durably records the attempt and never reports success from an HTTP error, a
+  transport error, or a 200 response whose body reports failure. A failed or impossible
   compensation makes the session outcome unknown and prominently names the surviving
   effect.
-- Slack `chat.delete` can delete a message posted by the same bot token. It cannot
-  make a message unseen: someone may already have read or copied it, and permission
-  or service failures can leave it posted.
+- Deleting something that was already delivered does not make it unseen. Someone may
+  have read or copied it before the compensation ran, and permission or service
+  failures can leave the original in place.
 - GitHub's REST API cannot delete an issue. Unring's declared compensation closes a
   created issue; the issue and its history remain visible in the closed state. GitHub
   has a GraphQL `deleteIssue` mutation, but it requires administrator permission, so
@@ -623,7 +623,7 @@ would create states that are difficult to reason about—for example, committing
   calls. It does not revert filesystem changes (use git), statements already approved
   to run outside the transaction, or already-forwarded external effects. For a
   forwarded effect it only attempts the adapter's declared compensation, with the
-  Slack, GitHub, mail, and partial-failure boundaries above.
+  GitHub, mail, and partial-failure boundaries above.
 - Some effects genuinely cannot be undone. The value is that most side effects never
   happen at all; compensation is only the fallback.
 

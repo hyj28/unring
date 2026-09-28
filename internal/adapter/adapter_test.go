@@ -45,24 +45,8 @@ rules:
 	if err != nil {
 		t.Fatalf("Load(builtins + user) error: %v", err)
 	}
-	if got := len(set.Adapters()); got != 3 {
-		t.Fatalf("loaded adapters = %d, want 3", got)
-	}
-
-	slackBody := []byte(`{"channel":"C123","text":"hello"}`)
-	slackURL, _ := url.Parse("https://slack.com/api/chat.postMessage")
-	slack, matched, err := set.Classify(Request{
-		Method: http.MethodPost, URL: slackURL,
-		Header: http.Header{"Content-Type": []string{"application/json"}},
-		Body:   slackBody,
-	})
-	if err != nil || !matched {
-		t.Fatalf("classify Slack = %#v, %v, matched=%v", slack, err, matched)
-	}
-	hash := sha256.Sum256(slackBody)
-	if slack.Tier != TierStageable || slack.Adapter != "slack" ||
-		slack.IdempotencyKey != "slack-message:"+hex.EncodeToString(hash[:]) {
-		t.Fatalf("Slack classification = %#v", slack)
+	if got := len(set.Adapters()); got != 2 {
+		t.Fatalf("loaded adapters = %d, want 2", got)
 	}
 
 	githubURL, _ := url.Parse("https://api.github.com/repos/acme/widget/issues")
@@ -89,6 +73,10 @@ rules:
 		community.Adapter != "community-example" {
 		t.Fatalf("community classification = %#v, %v, matched=%v", community, err, matched)
 	}
+	communityHash := sha256.Sum256([]byte(`{"kind":"notification"}`))
+	if community.IdempotencyKey != "community:"+hex.EncodeToString(communityHash[:]) {
+		t.Fatalf("community idempotency key = %q", community.IdempotencyKey)
+	}
 
 	_, matched, err = set.Classify(Request{
 		Method: http.MethodPost, URL: communityURL,
@@ -105,10 +93,10 @@ rules:
 
 func TestUndoTemplatesResolveOnlyRealRequestAndResponseFields(t *testing.T) {
 	declaration := &Undo{
-		Method: "POST", URL: "https://slack.com/api/chat.delete",
+		Method: "POST", URL: "https://notify.example/api/messages.delete",
 		Body: `{"channel":"${request.body.channel}","ts":"${response.ts}"}`,
 	}
-	requestURL, _ := url.Parse("https://slack.com/api/chat.postMessage")
+	requestURL, _ := url.Parse("https://notify.example/api/messages.post")
 	rendered, err := RenderUndo(declaration, Request{
 		Method: http.MethodPost, URL: requestURL,
 		Header: http.Header{"Content-Type": []string{"application/json"}},
@@ -191,9 +179,9 @@ name: contradictory-marker
 rules:
   - name: post
     match:
-      hosts: [slack.com]
+      hosts: [notify.example]
       methods: [POST]
-      path: /api/chat.postMessage
+      path: /api/messages.post
     tier: stageable
     idempotency_key: 'request.body_sha256'
     response:

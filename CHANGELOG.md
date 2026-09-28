@@ -5,6 +5,45 @@ All notable changes to unring are documented here. Releases follow
 
 ## [Unreleased]
 
+### Removed
+
+- The built-in Slack adapter. Message recall is not a capability this project
+  carries for now. The staging and compensating-undo machinery is unchanged and
+  still exercised, through a test-local stageable adapter rather than a built-in
+  one: no shipped adapter declares the stageable tier any more.
+
+## [0.3.0] - 2026-09-28
+
+### Added
+
+- Naming a path recovers its recorded baseline from a retained clone when an
+  interrupted post-session scan left the change list empty, with conflict
+  protection, a preserved `.snapshot` sidecar, and an explicit `--force`.
+- Release builds can be told their version through ldflags; `make install` and
+  `make dist` derive it from `git describe`, so an unclean tree keeps its
+  `-dirty` marker.
+
+### Changed
+
+- The session summary and the human `unring log` now state that the
+  commit/discard decision does not revert files, and that reverting them is a
+  separate explicit step. `unring log --json` is unchanged.
+- A coverage gap consisting only of the permanent macOS permission refusals is no
+  longer announced as an abnormal session by `unring restore`.
+- Agent own-state groups larger than ten collapse to a per-root count in the
+  end-of-session summary; the explicit `unring restore <id>` listing stays
+  expanded.
+- `restore --all` refuses only when there is no observed change list to work
+  from, and one unrecognised path no longer aborts a whole batch.
+
+### Fixed
+
+- Restore no longer exits 0 without mentioning a path the user named.
+- An unsealed snapshot is no longer reported as evicted; absent, unsealed,
+  unknown and retained are distinct statements.
+- Retention no longer claims it evicted the oldest snapshot when cap eviction
+  skipped a store whose byte accounting is not exact.
+
 ## [0.2.0] - 2026-08-27
 
 ### Added
@@ -31,6 +70,7 @@ The first tagged release: transactional PostgreSQL interception, review and
 commit/discard, GitHub and Slack adapters, the `gh` PATH shim, compensating undo,
 and structured audit logging.
 
-[Unreleased]: https://github.com/hyj28/unring/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/hyj28/unring/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/hyj28/unring/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hyj28/unring/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/hyj28/unring/releases/tag/v0.1.0

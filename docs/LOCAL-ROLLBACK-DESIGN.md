@@ -16,7 +16,7 @@
 
 The first real use of v0.1.0 — wrapping an actual `claude` session — exposed a problem the
 design had not anticipated. Every call to an unrecognised service asks for approval, and
-only two adapters ship, so "unrecognised" means the entire world except GitHub and Slack.
+only one adapter ships, so "unrecognised" means the entire world except GitHub.
 One session produced nine prompts in a row.
 
 That is not merely annoying. **A user who answers `y` nine times without being able to
