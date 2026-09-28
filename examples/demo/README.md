@@ -1,6 +1,6 @@
 # Complete local demo
 
-This directory exercises every unring capability without a GitHub, Slack, agent,
+This directory exercises every unring capability without a GitHub, agent,
 or other external account. It starts a throwaway PostgreSQL cluster and a loopback
 HTTPS service with a generated one-day CA. The fake `gh` command only appends to a
 local file. Everything generated lives in `pgdata/`, `pg.log`, or `runtime/`, all of

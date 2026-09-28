@@ -178,6 +178,11 @@ Design: [docs/LOCAL-ROLLBACK-DESIGN.md §10](docs/LOCAL-ROLLBACK-DESIGN.md). Dec
 FSEvents acceleration · lazy database `BEGIN` · MySQL · teams, approval flows,
 multi-user · multi-agent concurrency control · web UI.
 
+Slack message recall was built under M6.4 and M8.2 and has since been removed: the
+built-in adapter no longer ships. The checked items above record work that really
+happened, not a capability the current release carries. The staging and
+compensating-undo machinery those milestones produced is unchanged.
+
 ## Open questions
 
 - Whether `discard` should hand feedback back to the agent for a retry

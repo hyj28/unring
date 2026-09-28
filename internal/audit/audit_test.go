@@ -48,7 +48,7 @@ func TestStorePersistsStructuredSessionAndLoadsByPrefix(t *testing.T) {
 				Method: "POST", URL: "https://api.example.test/events", StatusCode: 201,
 			}},
 			Staged: []httpsproxy.StagedRequest{{
-				Method: "POST", URL: "https://slack.com/api/chat.postMessage",
+				Method: "POST", URL: "https://notify.example/api/messages.post",
 				State: "sent", Body: "audit-must-not-store-this-staged-body",
 			}},
 			Approvals: []httpsproxy.ApprovalRecord{{

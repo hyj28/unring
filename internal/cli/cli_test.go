@@ -346,9 +346,9 @@ func TestReviewClearlyDistinguishesStagedSentAndUninterceptedHTTPS(t *testing.T)
 	httpsSummary := httpsproxy.Summary{
 		Sealed: true,
 		Staged: []httpsproxy.StagedRequest{{
-			Method: "POST", URL: "https://slack.com/api/chat.postMessage",
-			Adapter: "slack", Rule: "post-message", State: "pending",
-			IdempotencyKey: "slack-message:abc", Body: `{"text":"later"}`,
+			Method: "POST", URL: "https://notify.example/api/messages.post",
+			Adapter: "stageable-example", Rule: "post-message", State: "pending",
+			IdempotencyKey: "example-message:abc", Body: `{"text":"later"}`,
 		}},
 		Requests: []httpsproxy.RequestRecord{{
 			Method: "POST", URL: "https://api.github.com/repos/acme/widget/issues",
@@ -371,7 +371,7 @@ func TestReviewClearlyDistinguishesStagedSentAndUninterceptedHTTPS(t *testing.T)
 	for label, text := range map[string]string{"TUI": view, "plain": plain.String()} {
 		for _, want := range []string{
 			"PENDING HTTPS — WILL BE SENT IF YOU COMMIT",
-			"slack.com/api/chat.postMessage",
+			"notify.example/api/messages.post",
 			"HTTPS REQUESTS —",
 			"api.github.com/repos/acme/widget/issues",
 			"UN-INTERCEPTED OR UNCLASSIFIED TRAFFIC",
@@ -394,10 +394,10 @@ func TestReviewBeforeDecisionDistinguishesCompensableAndPermanentEffects(t *test
 		Sealed: true,
 		Requests: []httpsproxy.RequestRecord{
 			{
-				Method: "POST", URL: "https://slack.com/api/chat.postMessage",
+				Method: "POST", URL: "https://notify.example/api/messages.post",
 				StatusCode: 200,
 				Undo: &httpsproxy.UndoRecord{
-					Effect:      "delete the Slack message posted by this token",
+					Effect:      "delete the example message posted by this token",
 					StillExists: "someone may already have read it",
 					State:       "available",
 				},
@@ -422,7 +422,7 @@ func TestReviewBeforeDecisionDistinguishesCompensableAndPermanentEffects(t *test
 	printSummaryWithExternal(&plain, postgresSummary, httpsSummary, ghSummary)
 	for label, text := range map[string]string{"TUI": view, "plain": plain.String()} {
 		for _, want := range []string{
-			"delete the Slack message",
+			"delete the example message",
 			"someone may already have read it",
 			"cannot undo",
 			"close the created GitHub issue",
@@ -472,11 +472,11 @@ func TestFailedCompensationIsProminentAndNamesRemainingEffect(t *testing.T) {
 	var output bytes.Buffer
 	printCompensationFailures(&output, httpsproxy.Summary{
 		Requests: []httpsproxy.RequestRecord{{
-			Method: "POST", URL: "https://slack.com/api/chat.postMessage",
+			Method: "POST", URL: "https://notify.example/api/messages.post",
 			Undo: &httpsproxy.UndoRecord{
-				Effect:      "delete the Slack message",
-				StillExists: "the Slack message remains posted",
-				State:       "failed", Error: "Slack returned ok=false",
+				Effect:      "delete the example message",
+				StillExists: "the example message remains posted",
+				State:       "failed", Error: "the service returned ok=false",
 			},
 		}},
 	})
@@ -484,8 +484,8 @@ func TestFailedCompensationIsProminentAndNamesRemainingEffect(t *testing.T) {
 	for _, want := range []string{
 		"DISCARD COMPENSATION FAILED OR WAS IMPOSSIBLE",
 		"not claiming it was undone",
-		"Slack returned ok=false",
-		"WHAT REMAINS: the Slack message remains posted",
+		"the service returned ok=false",
+		"WHAT REMAINS: the example message remains posted",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("failed compensation output missing %q:\n%s", want, text)
@@ -506,9 +506,9 @@ func TestStagedReplayTransitionsArePersistedImmediatelyToAudit(t *testing.T) {
 	update := stagedAuditUpdater(session)
 
 	summary := httpsproxy.Summary{Sealed: true, Staged: []httpsproxy.StagedRequest{
-		{Method: "POST", URL: "https://slack.com/one", State: "sent"},
-		{Method: "POST", URL: "https://slack.com/two", State: "sending"},
-		{Method: "POST", URL: "https://slack.com/three", State: "pending"},
+		{Method: "POST", URL: "https://notify.example/one", State: "sent"},
+		{Method: "POST", URL: "https://notify.example/two", State: "sending"},
+		{Method: "POST", URL: "https://notify.example/three", State: "pending"},
 	}}
 	if err := update(summary); err != nil {
 		t.Fatalf("persist replay transition: %v", err)
@@ -534,18 +534,18 @@ func TestPartialCommitOutcomeListsSentUnknownAndDatabaseRollback(t *testing.T) {
 			Method: "POST", URL: "https://api.github.com/repos/acme/widget/issues",
 		}},
 		Staged: []httpsproxy.StagedRequest{
-			{Method: "POST", URL: "https://slack.com/one", State: "sent", ReplayStatusCode: 200},
-			{Method: "POST", URL: "https://slack.com/two", State: "unknown", ReplayStatusCode: 500,
+			{Method: "POST", URL: "https://notify.example/one", State: "sent", ReplayStatusCode: 200},
+			{Method: "POST", URL: "https://notify.example/two", State: "unknown", ReplayStatusCode: 500,
 				Error: "origin returned HTTP 500; delivery outcome is unknown"},
-			{Method: "POST", URL: "https://slack.com/three", State: "sent", ReplayStatusCode: 200},
+			{Method: "POST", URL: "https://notify.example/three", State: "sent", ReplayStatusCode: 200},
 		},
 	}, nil)
 	text := output.String()
 	for _, want := range []string{
 		"COMMIT DID NOT COMPLETE",
-		"[sent] POST https://slack.com/one",
-		"[unknown] POST https://slack.com/two",
-		"[sent] POST https://slack.com/three",
+		"[sent] POST https://notify.example/one",
+		"[unknown] POST https://notify.example/two",
+		"[sent] POST https://notify.example/three",
 		"Already-forwarded HTTPS requests remain as sent",
 		"Commit never runs discard compensation",
 		"POST https://api.github.com/repos/acme/widget/issues",

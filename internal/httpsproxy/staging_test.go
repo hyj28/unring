@@ -21,17 +21,17 @@ import (
 	"github.com/hyj28/unring/internal/adapter"
 )
 
-func TestSlackPostMessageIsStagedAndCommitOrDiscardControlsSending(t *testing.T) {
+func TestStageablePostIsStagedAndCommitOrDiscardControlsSending(t *testing.T) {
 	t.Run("commit", func(t *testing.T) {
 		recorder := &recordingTransport{}
 		proxy, client := startClassifiedProxy(t, recorder, nil)
 		body := []byte(`{"channel":"C123","text":"hello from unring"}`)
 		response := postThroughProxy(t, client,
-			"https://slack.com/api/chat.postMessage", body)
+			"https://notify.example/api/messages.post", body)
 		responseBody, err := io.ReadAll(response.Body)
 		_ = response.Body.Close()
 		if err != nil {
-			t.Fatalf("read synthesized Slack response: %v", err)
+			t.Fatalf("read synthesized stageable response: %v", err)
 		}
 		var decoded struct {
 			OK     bool   `json:"ok"`
@@ -42,7 +42,7 @@ func TestSlackPostMessageIsStagedAndCommitOrDiscardControlsSending(t *testing.T)
 			} `json:"unring"`
 		}
 		if err := json.Unmarshal(responseBody, &decoded); err != nil {
-			t.Fatalf("Slack client could not decode synthesized response: %v", err)
+			t.Fatalf("stageable client could not decode synthesized response: %v", err)
 		}
 		if response.StatusCode != http.StatusOK ||
 			response.Header.Get("X-Unring-Staged") != "true" ||
@@ -52,12 +52,12 @@ func TestSlackPostMessageIsStagedAndCommitOrDiscardControlsSending(t *testing.T)
 				response.StatusCode, response.Header, responseBody)
 		}
 		if got := recorder.Count(); got != 0 {
-			t.Fatalf("stageable Slack call reached origin before commit: %d requests", got)
+			t.Fatalf("stageable call reached origin before commit: %d requests", got)
 		}
 		summary := proxy.Summary()
 		if len(summary.Staged) != 1 || summary.Staged[0].State != "pending" ||
-			summary.Staged[0].Adapter != "slack" {
-			t.Fatalf("pending Slack summary = %#v", summary)
+			summary.Staged[0].Adapter != "stageable-example" {
+			t.Fatalf("pending stageable summary = %#v", summary)
 		}
 
 		sealProxy(t, proxy)
@@ -71,7 +71,7 @@ func TestSlackPostMessageIsStagedAndCommitOrDiscardControlsSending(t *testing.T)
 			t.Fatalf("commit sent %d requests, want 1", len(requests))
 		}
 		hash := sha256.Sum256(body)
-		wantKey := "slack-message:" + hex.EncodeToString(hash[:])
+		wantKey := "example-message:" + hex.EncodeToString(hash[:])
 		if got := requests[0].Header.Get("Idempotency-Key"); got != wantKey {
 			t.Fatalf("replay idempotency key = %q, want %q", got, wantKey)
 		}
@@ -87,7 +87,7 @@ func TestSlackPostMessageIsStagedAndCommitOrDiscardControlsSending(t *testing.T)
 		recorder := &recordingTransport{}
 		proxy, client := startClassifiedProxy(t, recorder, nil)
 		response := postThroughProxy(t, client,
-			"https://slack.com/api/chat.postMessage",
+			"https://notify.example/api/messages.post",
 			[]byte(`{"channel":"C123","text":"discard me"}`))
 		_ = response.Body.Close()
 		sealProxy(t, proxy)
@@ -97,7 +97,7 @@ func TestSlackPostMessageIsStagedAndCommitOrDiscardControlsSending(t *testing.T)
 			t.Fatalf("Finalize(discard) error: %v", err)
 		}
 		if got := recorder.Count(); got != 0 {
-			t.Fatalf("discard sent %d Slack requests, want 0", got)
+			t.Fatalf("discard sent %d stageable requests, want 0", got)
 		}
 		if state := proxy.Summary().Staged[0].State; state != "discarded" {
 			t.Fatalf("final staged state = %q, want discarded", state)
@@ -230,7 +230,7 @@ func TestStagedReplayIsNeverAutomaticallyRetried(t *testing.T) {
 func TestSynthesizedMarkerCannotBeOverriddenDuringEmission(t *testing.T) {
 	for iteration := 0; iteration < 1000; iteration++ {
 		proxy := &Proxy{}
-		requestURL, _ := url.Parse("https://slack.com/api/chat.postMessage")
+		requestURL, _ := url.Parse("https://notify.example/api/messages.post")
 		request := &http.Request{
 			Method: http.MethodPost, URL: requestURL, Header: make(http.Header),
 		}
@@ -299,17 +299,17 @@ func TestNon2xxReplayOutcomeIsUnknownNotSendFailed(t *testing.T) {
 	}
 }
 
-func TestSentSlackMessageIsNotCompensatedAfterPartialCommit(t *testing.T) {
-	adapters := loadBuiltinAdapters(t)
-	slackURL, _ := url.Parse("https://slack.com/api/chat.postMessage")
-	slackBody := []byte(`{"channel":"C123","text":"compensate me"}`)
+func TestSentStageableMessageIsNotCompensatedAfterPartialCommit(t *testing.T) {
+	adapters := loadAdaptersWithStageableFixture(t)
+	messageURL, _ := url.Parse("https://notify.example/api/messages.post")
+	messageBody := []byte(`{"channel":"C123","text":"compensate me"}`)
 	classification, matched, err := adapters.Classify(adapter.Request{
-		Method: http.MethodPost, URL: slackURL,
+		Method: http.MethodPost, URL: messageURL,
 		Header: http.Header{"Content-Type": []string{"application/json"}},
-		Body:   slackBody,
+		Body:   messageBody,
 	})
 	if err != nil || !matched || classification.Undo == nil {
-		t.Fatalf("classify Slack message = %#v, matched %v, err %v",
+		t.Fatalf("classify stageable message = %#v, matched %v, err %v",
 			classification, matched, err)
 	}
 
@@ -329,7 +329,7 @@ func TestSentSlackMessageIsNotCompensatedAfterPartialCommit(t *testing.T) {
 			status = http.StatusInternalServerError
 			responseBody = `{"error":"failed"}`
 		}
-		if request.URL.Path == "/api/chat.delete" {
+		if request.URL.Path == "/api/messages.delete" {
 			responseBody = `{"ok":true}`
 		}
 		return &http.Response{
@@ -342,7 +342,7 @@ func TestSentSlackMessageIsNotCompensatedAfterPartialCommit(t *testing.T) {
 		transport: transport,
 		summary: Summary{Sealed: true, Staged: []StagedRequest{
 			{
-				Method: http.MethodPost, URL: slackURL.String(), State: "pending",
+				Method: http.MethodPost, URL: messageURL.String(), State: "pending",
 				Undo: &UndoRecord{
 					Effect:      classification.Undo.Effect,
 					StillExists: classification.Undo.StillExists,
@@ -353,13 +353,13 @@ func TestSentSlackMessageIsNotCompensatedAfterPartialCommit(t *testing.T) {
 		}},
 		staged: []stagedCall{
 			{
-				method: http.MethodPost, url: slackURL, host: slackURL.Host,
+				method: http.MethodPost, url: messageURL, host: messageURL.Host,
 				header: http.Header{"Content-Type": []string{"application/json"}},
-				body:   slackBody, key: "slack-key", undo: classification.Undo,
+				body:   messageBody, key: "example-key", undo: classification.Undo,
 				input: adapter.Request{
-					Method: http.MethodPost, URL: slackURL,
+					Method: http.MethodPost, URL: messageURL,
 					Header: http.Header{"Content-Type": []string{"application/json"}},
-					Body:   slackBody,
+					Body:   messageBody,
 				},
 			},
 			{
@@ -379,7 +379,7 @@ func TestSentSlackMessageIsNotCompensatedAfterPartialCommit(t *testing.T) {
 	}
 	undo := proxy.Summary().Staged[0].Undo
 	if undo == nil || undo.State != "available" || undo.StatusCode != 0 {
-		t.Fatalf("commit path changed Slack compensation state = %#v", undo)
+		t.Fatalf("commit path changed stageable compensation state = %#v", undo)
 	}
 }
 
@@ -449,23 +449,23 @@ func TestFailedUndoNamesWhatStillExists(t *testing.T) {
 		summary: Summary{
 			Sealed: true,
 			Requests: []RequestRecord{{
-				Method: http.MethodPost, URL: "https://slack.com/api/chat.postMessage",
+				Method: http.MethodPost, URL: "https://notify.example/api/messages.post",
 				StatusCode: http.StatusOK,
 				Undo: &UndoRecord{
-					Method: http.MethodPost, URL: "https://slack.com/api/chat.delete",
-					Effect:      "delete the Slack message",
-					StillExists: "the Slack message remains posted",
+					Method: http.MethodPost, URL: "https://notify.example/api/messages.delete",
+					Effect:      "delete the example message",
+					StillExists: "the example message remains posted",
 					State:       "available",
 				},
 			}},
 		},
 		undoCalls: []undoCall{{
-			method: http.MethodPost, url: "https://slack.com/api/chat.delete",
+			method: http.MethodPost, url: "https://notify.example/api/messages.delete",
 			header: make(http.Header), body: []byte(`{}`), target: "request", index: 0,
 		}},
 	}
 	err := proxy.Finalize(context.Background(), false)
-	if err == nil || !strings.Contains(err.Error(), "the Slack message remains posted") {
+	if err == nil || !strings.Contains(err.Error(), "the example message remains posted") {
 		t.Fatalf("failed undo error = %v", err)
 	}
 	undo := proxy.Summary().Requests[0].Undo
@@ -474,7 +474,7 @@ func TestFailedUndoNamesWhatStillExists(t *testing.T) {
 	}
 }
 
-func TestDiscardDeletesSlackMessageThatReallyRan(t *testing.T) {
+func TestDiscardDeletesStageableMessageThatReallyRan(t *testing.T) {
 	var recorded recordedRequest
 	transport := testRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
 		body, _ := io.ReadAll(request.Body)
@@ -492,18 +492,18 @@ func TestDiscardDeletesSlackMessageThatReallyRan(t *testing.T) {
 		summary: Summary{
 			Sealed: true,
 			Requests: []RequestRecord{{
-				Method: http.MethodPost, URL: "https://slack.com/api/chat.postMessage",
+				Method: http.MethodPost, URL: "https://notify.example/api/messages.post",
 				StatusCode: http.StatusOK,
 				Undo: &UndoRecord{
-					Method: http.MethodPost, URL: "https://slack.com/api/chat.delete",
-					Effect:      "delete the Slack message posted by this token",
+					Method: http.MethodPost, URL: "https://notify.example/api/messages.delete",
+					Effect:      "delete the example message posted by this token",
 					StillExists: "someone may already have read it",
 					State:       "available",
 				},
 			}},
 		},
 		undoCalls: []undoCall{{
-			method: http.MethodPost, url: "https://slack.com/api/chat.delete",
+			method: http.MethodPost, url: "https://notify.example/api/messages.delete",
 			header: http.Header{"Authorization": []string{"Bearer secret"}},
 			body:   []byte(`{"channel":"C123","ts":"1712345678.000100"}`),
 			target: "request", index: 0,
@@ -512,13 +512,13 @@ func TestDiscardDeletesSlackMessageThatReallyRan(t *testing.T) {
 	if err := proxy.Finalize(context.Background(), false); err != nil {
 		t.Fatalf("Finalize(discard) compensation error: %v", err)
 	}
-	if recorded.URL != "https://slack.com/api/chat.delete" ||
+	if recorded.URL != "https://notify.example/api/messages.delete" ||
 		recorded.Header.Get("Authorization") != "Bearer secret" ||
 		!strings.Contains(string(recorded.body), `"ts":"1712345678.000100"`) {
-		t.Fatalf("Slack delete request = %#v", recorded)
+		t.Fatalf("stageable delete request = %#v", recorded)
 	}
 	if undo := proxy.Summary().Requests[0].Undo; undo.State != "succeeded" {
-		t.Fatalf("Slack delete outcome = %#v", undo)
+		t.Fatalf("stageable delete outcome = %#v", undo)
 	}
 }
 
@@ -659,7 +659,7 @@ func startClassifiedProxy(
 	approve func(context.Context, ApprovalRequest) (bool, error),
 ) (*Proxy, *http.Client) {
 	t.Helper()
-	adapters := loadBuiltinAdapters(t)
+	adapters := loadAdaptersWithStageableFixture(t)
 	authority, err := EnsureAuthority(t.TempDir())
 	if err != nil {
 		t.Fatalf("EnsureAuthority() error: %v", err)
@@ -685,15 +685,53 @@ func startClassifiedProxy(
 	return proxy, client
 }
 
-func loadBuiltinAdapters(t *testing.T) *adapter.Set {
+// stageableFixtureAdapter keeps the staging machinery covered now that no
+// built-in adapter declares the stageable tier. It deliberately mirrors the
+// shape the removed Slack built-in had: a synthetic response, an idempotency
+// key derived from the body, and an undo that needs a real response field.
+func stageableFixtureAdapter() adapter.Source {
+	return adapter.Source{
+		Name: "stageable-example.yaml",
+		Data: []byte(`
+version: 1
+name: stageable-example
+rules:
+  - name: post-message
+    match:
+      hosts:
+        - notify.example
+      methods:
+        - POST
+      path: /api/messages.post
+    tier: stageable
+    idempotency_key: '"example-message:" + request.body_sha256'
+    response:
+      status: 200
+      headers:
+        Content-Type: application/json
+        X-Unring-Staged: "true"
+      body: '{"ok":true,"unring":{"staged":true,"real_response":false}}'
+    undo:
+      method: POST
+      url: https://notify.example/api/messages.delete
+      headers:
+        Content-Type: application/json
+      body: '{"channel":"${request.body.channel}","ts":"${response.ts}"}'
+      effect: delete the example message posted by this token
+      still_exists: if deletion fails, the message remains posted; even after deletion, someone may already have read it
+`),
+	}
+}
+
+func loadAdaptersWithStageableFixture(t *testing.T) *adapter.Set {
 	t.Helper()
 	sources, err := adapter.BuiltinSources()
 	if err != nil {
 		t.Fatalf("BuiltinSources() error: %v", err)
 	}
-	adapters, err := adapter.Load(sources...)
+	adapters, err := adapter.Load(append(sources, stageableFixtureAdapter())...)
 	if err != nil {
-		t.Fatalf("Load(builtins) error: %v", err)
+		t.Fatalf("Load(builtins + stageable fixture) error: %v", err)
 	}
 	return adapters
 }

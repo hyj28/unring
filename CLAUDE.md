@@ -15,7 +15,7 @@ These come from the brief and are not open for quiet re-litigation in a PR:
 2. **No LLM anywhere in the classification path.** Adapters, then heuristics, then
    stop and ask. Unknown means *ask*, never *guess*.
 3. **Built-in adapters use the same YAML format as community adapters.** No Go-coded
-   privileged path for GitHub/Slack.
+   privileged path for a built-in.
 4. **No partial commit.** One decision for the whole session. Partial commits create
    states nobody can reason about (`notified_at` set, mail never sent).
 5. **Default to rollback.** Any crash, panic, or lost connection ends the session as
