@@ -283,9 +283,13 @@ func TestRestoreCommandForcedBaselineDirectoryReportsUnrecordedUserFileUntouched
 	if code == 0 {
 		t.Fatalf("forced baseline directory exited zero\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
 	}
-	line := "left untouched  " + userFile + " — not in the recorded baseline; it may be later user work\n"
+	line := "left untouched  " + userFile + " — not in the recorded baseline\n"
 	if !strings.Contains(stdout.String(), line) {
 		t.Fatalf("unrecorded user file whole line missing:\n%s", stdout.String())
+	}
+	// The origin is unknown, so the output must not lean toward either answer.
+	if strings.Contains(stdout.String(), "may be later user work") {
+		t.Fatalf("left-untouched output suggests a single origin:\n%s", stdout.String())
 	}
 	assertTestFile(t, userFile, "literal CLI later user bytes\n")
 }

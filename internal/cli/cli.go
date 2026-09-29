@@ -3090,6 +3090,12 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		}
 		results = append(results, baselineResults...)
 	}
+	createdBySession := make(map[string]bool, len(record.Files.Changes))
+	for _, change := range record.Files.Changes {
+		if change.Before == nil {
+			createdBySession[filepath.Clean(change.Path)] = true
+		}
+	}
 	exitCode := 0
 	for _, result := range results {
 		if restoreAll && result.Status == "skipped" {
@@ -3102,7 +3108,13 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		}
 		switch result.Status {
 		case "restored":
-			fmt.Fprintf(stdout, "restored  %s\n", humanPath(result.Path))
+			if createdBySession[filepath.Clean(result.Path)] {
+				// Undoing a creation removes the path. Saying "restored" here
+				// reads as if something came back, when the file is now gone.
+				fmt.Fprintf(stdout, "removed   %s — created during the session\n", humanPath(result.Path))
+			} else {
+				fmt.Fprintf(stdout, "restored  %s\n", humanPath(result.Path))
+			}
 		case "already-restored":
 			fmt.Fprintf(stdout, "already restored  %s\n", humanPath(result.Path))
 		case "skipped":
@@ -3113,7 +3125,7 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "recorded baseline already present  %s — change list incomplete; unring cannot confirm what the session did to this path\n", humanPath(result.Path))
 		case "recorded-baseline-unrecorded-present":
 			exitCode = internalErrorExitCode
-			fmt.Fprintf(stdout, "left untouched  %s — not in the recorded baseline; it may be later user work\n", humanPath(result.Path))
+			fmt.Fprintf(stdout, "left untouched  %s — not in the recorded baseline\n", humanPath(result.Path))
 			fmt.Fprintf(stdout, "decision required  %s — unring cannot tell whether the session or the user created this path; it was left in place; the user must decide what to do with it\n", humanPath(result.Path))
 		case "recorded-baseline-refused":
 			exitCode = internalErrorExitCode
