@@ -57,8 +57,12 @@ func TestRestoreCommandResolvesRelativeSelectionOnceAcrossIncompleteRoutes(t *te
 	if code != 0 {
 		t.Fatalf("relative forced restore exit = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
 	}
-	if countCLIOutputLine(stdout.String(), "restored  "+created) != 1 {
-		t.Fatalf("resolved created path was not reported exactly once:\n%s", stdout.String())
+	if countCLIOutputLine(stdout.String(), "removed   "+created+" — created during the session") != 1 {
+		t.Fatalf("resolved created path was not reported exactly once as removed:\n%s", stdout.String())
+	}
+	// Undoing a creation removes the file; it must not read as if something came back.
+	if countCLIOutputLine(stdout.String(), "restored  "+created) != 0 {
+		t.Fatalf("removed created path was reported as restored:\n%s", stdout.String())
 	}
 	if strings.Contains(stdout.String(), "already restored  "+created+"\n") {
 		t.Fatalf("resolved created path was also reported already restored:\n%s", stdout.String())
@@ -163,7 +167,7 @@ func TestRestoreCommandParentOfWatchedRootReportsCurrentOnlyPaths(t *testing.T) 
 	if code == 0 {
 		t.Fatalf("unknown current-only path exited zero\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
 	}
-	leftLine := "left untouched  " + currentOnly + " — not in the recorded baseline; it may be later user work\n"
+	leftLine := "left untouched  " + currentOnly + " — not in the recorded baseline\n"
 	decisionLine := "decision required  " + currentOnly + " — unring cannot tell whether the session or the user created this path; it was left in place; the user must decide what to do with it\n"
 	for _, line := range []string{leftLine, decisionLine} {
 		if !strings.Contains(stdout.String(), line) {
