@@ -168,6 +168,86 @@ func TestCLIReportsAndRestoresWidenedSnapshotOnlyDeletion(t *testing.T) {
 	}
 }
 
+func TestCLIReportsEverySnapshotOnlyDirectoryDescendant(t *testing.T) {
+	t.Setenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP", "")
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("UNRING_STATE_DIR", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cloneRoot := t.TempDir()
+	directory := filepath.Join(home, "archive")
+	nested := filepath.Join(directory, "nested")
+	if err := os.MkdirAll(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	first := filepath.Join(directory, "first.txt")
+	second := filepath.Join(nested, "second.txt")
+	writeTestFile(t, first, "literal CLI volume first\n")
+	writeTestFile(t, second, "literal CLI volume second\n")
+	platform := &cliBackstopPlatform{excluded: map[string]bool{}}
+	restorePlatform := localrollback.SetVolumeSnapshotPlatformForTest(platform)
+	defer restorePlatform()
+
+	var runStdout, runStderr bytes.Buffer
+	code := Main([]string{
+		"run", "--watch", cloneRoot, "--", "/bin/sh", "-c", `rm -rf "$1"`, "unring-test", directory,
+	}, strings.NewReader(""), &runStdout, &runStderr)
+	if code != 0 {
+		t.Fatalf("snapshot-only directory run exit = %d\nstdout:\n%s\nstderr:\n%s", code, runStdout.String(), runStderr.String())
+	}
+	store, err := audit.OpenStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.List()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("snapshot-only directory records = %#v, %v", records, err)
+	}
+	restoreDirectory := ""
+	for _, change := range records[0].Files.Changes {
+		if filepath.Base(change.Path) == "archive" && change.Before != nil && change.Before.Type == "directory" {
+			restoreDirectory = change.Path
+		}
+	}
+	if restoreDirectory == "" {
+		t.Fatalf("snapshot-only directory root missing from real change list: %#v", records[0].Files.Changes)
+	}
+	selected, err := localrollback.ChangesForRestore(records[0].Files.Changes, []string{restoreDirectory})
+	if err != nil || len(selected) != 4 {
+		t.Fatalf("snapshot-only directory changes = %#v, %v; want four paths", selected, err)
+	}
+	for _, change := range selected {
+		if change.RestoreSource != localrollback.RestoreSourceVolume {
+			t.Fatalf("snapshot-only directory change = %#v", change)
+		}
+	}
+	restoreFirst := filepath.Join(restoreDirectory, "first.txt")
+	restoreNested := filepath.Join(restoreDirectory, "nested")
+	restoreSecond := filepath.Join(restoreNested, "second.txt")
+	platform.snapshotFiles = map[string]string{
+		restoreFirst: "literal CLI volume first\n", restoreSecond: "literal CLI volume second\n",
+	}
+
+	var stdout, stderr bytes.Buffer
+	code = Main([]string{"restore", records[0].ID, restoreDirectory}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("snapshot-only directory restore exit = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	for _, path := range []string{restoreDirectory, restoreNested, restoreFirst, restoreSecond} {
+		if !strings.Contains(stderr.String(), "unring: snapshot-only path: "+path+"\n") {
+			t.Fatalf("snapshot-only warning whole line missing for %s:\n%s", path, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "restored  "+path+"\n") {
+			t.Fatalf("snapshot-only result whole line missing for %s:\n%s", path, stdout.String())
+		}
+		if strings.Contains(stdout.String(), "already restored  "+path+"\n") {
+			t.Fatalf("snapshot-only result was also reported already restored for %s:\n%s", path, stdout.String())
+		}
+	}
+	assertTestFile(t, first, "literal CLI volume first\n")
+	assertTestFile(t, second, "literal CLI volume second\n")
+}
+
 func TestCLINoTimeMachineWarningAndExcludedWatchAreProminent(t *testing.T) {
 	t.Setenv("UNRING_TEST_DISABLE_VOLUME_BACKSTOP", "")
 	t.Setenv("DATABASE_URL", "")

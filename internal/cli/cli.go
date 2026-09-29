@@ -1935,6 +1935,45 @@ func isAgentStateChange(change localrollback.Change, roots []string) bool {
 	return localrollback.IsAgentStatePathWithin(change.Path, roots)
 }
 
+func explicitlySelectedAgentStateChange(path string, selections, roots []string) bool {
+	for _, root := range roots {
+		if path != root && !strings.HasPrefix(path, root+string(os.PathSeparator)) {
+			continue
+		}
+		for _, selection := range selections {
+			absolute := selection
+			if !filepath.IsAbs(absolute) {
+				var err error
+				absolute, err = filepath.Abs(absolute)
+				if err != nil {
+					continue
+				}
+			}
+			absolute = filepath.Clean(absolute)
+			if (absolute == root || strings.HasPrefix(absolute, root+string(os.PathSeparator))) &&
+				(path == absolute || strings.HasPrefix(path, absolute+string(os.PathSeparator))) {
+				return true
+			}
+
+			if filepath.IsAbs(selection) {
+				continue
+			}
+			cleanSelection := filepath.Clean(selection)
+			for candidate := filepath.Clean(path); ; candidate = filepath.Dir(candidate) {
+				if (candidate == cleanSelection || strings.HasSuffix(candidate, string(os.PathSeparator)+cleanSelection)) &&
+					(candidate == root || strings.HasPrefix(candidate, root+string(os.PathSeparator))) {
+					return true
+				}
+				parent := filepath.Dir(candidate)
+				if parent == candidate {
+					break
+				}
+			}
+		}
+	}
+	return false
+}
+
 func printOutboundDisabled(output io.Writer) {
 	fmt.Fprintln(output, "\nOUTBOUND INTERCEPTION DISABLED — HTTPS, adapters, and the gh shim were not started.")
 	fmt.Fprintln(output, "Use --outbound on a future session to opt in; restoring files cannot recall data already sent.")
@@ -2920,9 +2959,9 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 	if !restoreAll && !record.Files.Complete && record.Files.Retained {
 		fmt.Fprintln(stdout, "For another named path in the retained recorded baseline, unring can recover that baseline without inferring a change; conflicts are refused unless --force is supplied.")
 	}
+	agentStateRoots, inferredAgentStateRoots := agentStateGroupingRoots(record.Files.AgentStateRoots)
 	if restoreAll {
 		var skippedAgentState []localrollback.Change
-		agentStateRoots, inferredAgentStateRoots := agentStateGroupingRoots(record.Files.AgentStateRoots)
 		if inferredAgentStateRoots {
 			printAgentStateGroupingInference(stdout, "", agentStateRoots)
 		}
@@ -2942,14 +2981,26 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	var baselineSelections []string
+	var baselineExcludedPaths []string
 	var selectionFailures []localrollback.RestoreResult
 	if !restoreAll {
 		observedSelections := make([]string, 0, len(selections))
 		for _, selection := range selections {
-			selected, selectionErr := localrollback.ChangesForRestore(record.Files.Changes, []string{selection})
+			resolvedSelection, selected, selectionErr := localrollback.ResolveChangesForRestore(record.Files.Changes, selection)
 			if selectionErr != nil {
 				if !record.Files.Complete {
-					baselineSelections = append(baselineSelections, selection)
+					if !record.Files.Retained {
+						baselineSelections = append(baselineSelections, selection)
+						continue
+					}
+					resolvedBaseline, baselineErr := localrollback.ResolveRecordedBaselineForRestore(store.StateDir(), record.ID, selection)
+					if baselineErr != nil {
+						selectionFailures = append(selectionFailures, localrollback.RestoreResult{
+							Path: selection, Status: "unavailable", Err: baselineErr,
+						})
+					} else {
+						baselineSelections = append(baselineSelections, resolvedBaseline)
+					}
 				} else {
 					selectionFailures = append(selectionFailures, localrollback.RestoreResult{
 						Path: selection, Status: "unavailable", Err: selectionErr,
@@ -2957,7 +3008,13 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 				}
 				continue
 			}
-			observedSelections = append(observedSelections, selected[0].Path)
+			observedSelections = append(observedSelections, resolvedSelection)
+			if !record.Files.Complete {
+				baselineSelections = append(baselineSelections, resolvedSelection)
+				for _, change := range selected {
+					baselineExcludedPaths = append(baselineExcludedPaths, change.Path)
+				}
+			}
 		}
 		selections = observedSelections
 	}
@@ -2968,6 +3025,10 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	rootWarningPrinted := false
 	for _, change := range selectedChanges {
+		if isAgentStateChange(change, agentStateRoots) &&
+			!explicitlySelectedAgentStateChange(change.Path, selections, agentStateRoots) {
+			continue
+		}
 		if change.RestoreSource != localrollback.RestoreSourceVolume {
 			continue
 		}
@@ -2979,9 +3040,24 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "unring: snapshot-only path: %s\n", humanPath(change.Path))
 	}
 	results := append([]localrollback.RestoreResult(nil), selectionFailures...)
-	if len(selections) > 0 {
+	combinedIncompleteRestore := len(baselineSelections) > 0 && record.Files.Retained
+	if combinedIncompleteRestore {
+		combinedResults, combinedErr := localrollback.RestoreRecordedAndBaselines(
+			store.StateDir(), record.ID, selections, baselineSelections, baselineExcludedPaths, agentStateRoots, force,
+		)
+		if combinedErr != nil {
+			for _, selection := range append(append([]string(nil), selections...), baselineSelections...) {
+				combinedResults = append(combinedResults, localrollback.RestoreResult{
+					Path: selection, Status: "error", Err: combinedErr,
+				})
+			}
+		}
+		results = append(results, combinedResults...)
+	} else if len(selections) > 0 {
 		var observedResults []localrollback.RestoreResult
-		observedResults, err = localrollback.RestoreRecorded(store.StateDir(), record.ID, record.Files, selections, force)
+		restoreSummary := record.Files
+		restoreSummary.AgentStateRoots = agentStateRoots
+		observedResults, err = localrollback.RestoreRecorded(store.StateDir(), record.ID, restoreSummary, selections, force)
 		if err != nil {
 			for _, selection := range selections {
 				observedResults = append(observedResults, localrollback.RestoreResult{
@@ -2991,10 +3067,12 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		}
 		results = append(results, observedResults...)
 	}
-	if len(baselineSelections) > 0 {
+	if len(baselineSelections) > 0 && !combinedIncompleteRestore {
 		var baselineResults []localrollback.RestoreResult
 		if record.Files.Retained {
-			baselineResults, err = localrollback.RestoreRecordedBaselines(store.StateDir(), record.ID, baselineSelections, force)
+			baselineResults, err = localrollback.RestoreRecordedBaselinesExcluding(
+				store.StateDir(), record.ID, baselineSelections, baselineExcludedPaths, agentStateRoots, force,
+			)
 			if err != nil {
 				for _, selection := range baselineSelections {
 					baselineResults = append(baselineResults, localrollback.RestoreResult{
@@ -3014,6 +3092,11 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 	}
 	exitCode := 0
 	for _, result := range results {
+		if restoreAll && result.Status == "skipped" {
+			// restore --all reports its excluded agent own-state paths above,
+			// before executing the selected regular changes.
+			continue
+		}
 		restoreEvent := localrollback.RestoreRecord{
 			Path: result.Path, Status: result.Status, Sidecar: result.Sidecar, RestoredAt: time.Now().UTC(),
 		}
@@ -3022,10 +3105,16 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "restored  %s\n", humanPath(result.Path))
 		case "already-restored":
 			fmt.Fprintf(stdout, "already restored  %s\n", humanPath(result.Path))
+		case "skipped":
+			fmt.Fprintf(stdout, "skipped   %s — agent own-state is excluded unless that path or directory is explicitly named\n", humanPath(result.Path))
 		case "recorded-baseline-restored":
 			fmt.Fprintf(stdout, "recorded baseline written back  %s — change list incomplete; unring cannot confirm what the session did to this path\n", humanPath(result.Path))
 		case "recorded-baseline-already-present":
 			fmt.Fprintf(stdout, "recorded baseline already present  %s — change list incomplete; unring cannot confirm what the session did to this path\n", humanPath(result.Path))
+		case "recorded-baseline-unrecorded-present":
+			exitCode = internalErrorExitCode
+			fmt.Fprintf(stdout, "left untouched  %s — not in the recorded baseline; it may be later user work\n", humanPath(result.Path))
+			fmt.Fprintf(stdout, "decision required  %s — unring cannot tell whether the session or the user created this path; it was left in place; the user must decide what to do with it\n", humanPath(result.Path))
 		case "recorded-baseline-refused":
 			exitCode = internalErrorExitCode
 			if result.Err != nil {
