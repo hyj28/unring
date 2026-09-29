@@ -54,6 +54,11 @@ func TestRestoreCommandNamedDirectoryReportsAndRestoresEveryRecordedPathOnce(t *
 			t.Fatalf("restore output omitted whole line %q\nstdout:\n%s\nstderr:\n%s", line, stdout.String(), stderr.String())
 		}
 	}
+	for _, path := range []string{nested, y} {
+		if strings.Contains(stdout.String(), "already restored  "+path+"\n") {
+			t.Fatalf("restored descendant was also reported already restored for %s:\n%s", path, stdout.String())
+		}
+	}
 	assertTestFile(t, x, "literal later x\n")
 	assertTestFile(t, y, "literal cli y\n")
 	store, err := audit.OpenStoreAt(stateDir)
@@ -237,9 +242,21 @@ func TestRestoreCommandIncompleteNonEmptyDirectoryMergesObservedAndBaselineDesce
 	if !strings.Contains(stdout.String(), "restored  "+observed+"\n") {
 		t.Fatalf("observed descendant whole line missing:\n%s", stdout.String())
 	}
+	if countCLIOutputLine(stdout.String(), "restored  "+observed) != 1 ||
+		strings.Contains(stdout.String(), "already restored  "+observed+"\n") ||
+		strings.Contains(stdout.String(), "recorded baseline written back  "+observed+" ") ||
+		strings.Contains(stdout.String(), "recorded baseline already present  "+observed+" ") {
+		t.Fatalf("observed descendant was not reported exactly once by the observed route:\n%s", stdout.String())
+	}
 	baselineLine := "recorded baseline written back  " + baselineOnly + " — change list incomplete; unring cannot confirm what the session did to this path\n"
 	if !strings.Contains(stdout.String(), baselineLine) {
 		t.Fatalf("baseline-only descendant whole line missing:\n%s", stdout.String())
+	}
+	for _, path := range []string{directory, subdirectory} {
+		line := "recorded baseline already present  " + path + " — change list incomplete; unring cannot confirm what the session did to this path\n"
+		if !strings.Contains(stdout.String(), line) {
+			t.Fatalf("baseline directory whole line %q missing:\n%s", line, stdout.String())
+		}
 	}
 	assertTestFile(t, observed, "literal q1 baseline\n")
 	assertTestFile(t, baselineOnly, "literal r baseline\n")
@@ -263,8 +280,8 @@ func TestRestoreCommandForcedBaselineDirectoryReportsUnrecordedUserFileUntouched
 
 	var stdout, stderr strings.Builder
 	code := Main([]string{"restore", "--force", record.ID, directory}, strings.NewReader(""), &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("forced baseline directory exit = %d\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	if code == 0 {
+		t.Fatalf("forced baseline directory exited zero\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
 	}
 	line := "left untouched  " + userFile + " — not in the recorded baseline; it may be later user work\n"
 	if !strings.Contains(stdout.String(), line) {
@@ -450,4 +467,14 @@ func assertUniqueCLIRestoreEvents(t *testing.T, events []localrollback.RestoreRe
 	if len(events) != want {
 		t.Fatalf("restore events = %#v, want %d unique paths", events, want)
 	}
+}
+
+func countCLIOutputLine(output, want string) int {
+	count := 0
+	for _, line := range strings.Split(strings.TrimSuffix(output, "\n"), "\n") {
+		if line == want {
+			count++
+		}
+	}
+	return count
 }

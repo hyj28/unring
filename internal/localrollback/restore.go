@@ -43,6 +43,51 @@ func RestoreRecordedBaselines(stateDir, sessionID string, selections []string, f
 	return restoreRecordedBaselines(stateDir, sessionID, selections, nil, nil, force)
 }
 
+// ResolveRecordedBaselineForRestore resolves one selection against the
+// retained baseline without changing the filesystem.
+func ResolveRecordedBaselineForRestore(stateDir, sessionID, selection string) (string, error) {
+	resolved, err := resolveSessionID(stateDir, sessionID)
+	if err != nil {
+		return "", err
+	}
+	unlock, err := acquireSnapshotLock(stateDir, resolved, unix.LOCK_SH)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	value, err := readManifest(filepath.Join(stateDir, "snapshots", resolved))
+	if err != nil {
+		return "", err
+	}
+	paths := recordedBaselinePaths(value)
+	selectionRoot, matched, err := resolveSelectionRoot(paths, selection, "recorded baseline")
+	if err != nil {
+		return "", err
+	}
+	if matched {
+		return selectionRoot, nil
+	}
+	absolute := requestedAbsolutePath(selection)
+	root, found := manifestRootFor(value, absolute)
+	if !found {
+		return "", fmt.Errorf("%q is outside the recorded snapshot roots for this session", selection)
+	}
+	if reason := recordedBaselineCoverageGap(value, root, absolute); reason != "" {
+		return "", fmt.Errorf("%q has no recorded baseline because snapshot coverage was unavailable: %s", selection, reason)
+	}
+	return absolute, nil
+}
+
+func recordedBaselinePaths(value manifest) []string {
+	var paths []string
+	for _, root := range value.Roots {
+		for path := range root.Before {
+			paths = append(paths, filepath.Clean(path))
+		}
+	}
+	return paths
+}
+
 // RestoreRecordedBaselinesExcluding restores baseline descendants other than
 // paths already handled from the observed change list. agentStateRoots is the
 // caller's resolved legacy-compatible classification.
@@ -76,6 +121,20 @@ func restoreRecordedBaselines(
 	if value.EndedAt.IsZero() {
 		return nil, fmt.Errorf("snapshot %s is incomplete because capture is still in progress and cannot be restored", sessionID)
 	}
+	execution := newRestoreExecution()
+	results := restoreRecordedBaselinesFromManifest(
+		value, snapshotRoot, selections, excludedPaths, agentStateRoots, force, execution,
+	)
+	return finishRestoreExecution(execution, results), nil
+}
+
+func restoreRecordedBaselinesFromManifest(
+	value manifest,
+	snapshotRoot string,
+	selections, excludedPaths, agentStateRoots []string,
+	force bool,
+	execution *restoreExecution,
+) []RestoreResult {
 	effectiveAgentStateRoots := value.AgentStateRoots
 	if len(agentStateRoots) > 0 {
 		effectiveAgentStateRoots = agentStateRoots
@@ -127,7 +186,6 @@ func restoreRecordedBaselines(
 		selected = append(selected, orderRestoreChanges(group)...)
 	}
 	results := make([]RestoreResult, 0, len(selected))
-	execution := newRestoreExecution()
 	for _, change := range selected {
 		if change.Kind == "unrecorded-present" {
 			results = append(results, RestoreResult{Path: change.Path, Status: "recorded-baseline-unrecorded-present"})
@@ -145,8 +203,7 @@ func restoreRecordedBaselines(
 		}
 		results = append(results, restoreRecordedBaselineOne(snapshotRoot, value, change.Path, change.Before, force, execution))
 	}
-	finishRestoreExecution(execution, results)
-	return results, nil
+	return results
 }
 
 type recordedBaselineSelection struct {
@@ -156,12 +213,11 @@ type recordedBaselineSelection struct {
 }
 
 func selectRecordedBaselines(value manifest, selection string) ([]recordedBaselineSelection, error) {
-	paths := make([]string, 0)
+	paths := recordedBaselinePaths(value)
 	entries := make(map[string]Entry)
 	for _, root := range value.Roots {
 		for path, entry := range root.Before {
 			path = filepath.Clean(path)
-			paths = append(paths, path)
 			entries[path] = entry
 		}
 	}
@@ -178,22 +234,23 @@ func selectRecordedBaselines(value manifest, selection string) ([]recordedBaseli
 			entryCopy := entry
 			selected = append(selected, recordedBaselineSelection{path: path, entry: &entryCopy})
 		}
-		if entry, exists := entries[selectionRoot]; exists && entry.Type == "directory" {
-			walkErr := filepath.WalkDir(selectionRoot, func(path string, _ fs.DirEntry, walkErr error) error {
+		walkRoots := recordedWalkRoots(value, entries, selectionRoot)
+		for _, walkRoot := range walkRoots {
+			walkErr := filepath.WalkDir(walkRoot, func(path string, _ fs.DirEntry, walkErr error) error {
 				if walkErr != nil {
 					return walkErr
 				}
 				path = filepath.Clean(path)
-				if path == selectionRoot {
+				if path == walkRoot {
 					return nil
 				}
-				if _, recorded := entries[path]; !recorded {
+				if _, recorded := entries[path]; !recorded && !isRestoreSidecar(path) {
 					selected = append(selected, recordedBaselineSelection{path: path, unrecordedPresent: true})
 				}
 				return nil
 			})
 			if walkErr != nil && !errors.Is(walkErr, os.ErrNotExist) {
-				return nil, fmt.Errorf("inspect current descendants of %s: %w", selectionRoot, walkErr)
+				return nil, fmt.Errorf("inspect current descendants of %s: %w", walkRoot, walkErr)
 			}
 		}
 		return selected, nil
@@ -208,6 +265,49 @@ func selectRecordedBaselines(value manifest, selection string) ([]recordedBaseli
 		return nil, fmt.Errorf("%q has no recorded baseline because snapshot coverage was unavailable: %s", selection, reason)
 	}
 	return []recordedBaselineSelection{{path: absolute}}, nil
+}
+
+func recordedWalkRoots(value manifest, entries map[string]Entry, selectionRoot string) []string {
+	if entry, exists := entries[selectionRoot]; exists && entry.Type == "directory" {
+		return []string{selectionRoot}
+	}
+	var roots []string
+	for _, root := range value.Roots {
+		rootPath := filepath.Clean(root.Path)
+		entry, exists := entries[rootPath]
+		if exists && entry.Type == "directory" && pathWithin(rootPath, selectionRoot) {
+			roots = append(roots, rootPath)
+		}
+	}
+	sort.Strings(roots)
+	return roots
+}
+
+func isRestoreSidecar(path string) bool {
+	const marker = ".unring-"
+	name := filepath.Base(path)
+	index := strings.LastIndex(name, marker)
+	if index < 1 {
+		return false
+	}
+	remainder := name[index+len(marker):]
+	snapshotIndex := strings.Index(remainder, ".snapshot")
+	if snapshotIndex < 1 {
+		return false
+	}
+	suffix := remainder[snapshotIndex+len(".snapshot"):]
+	if suffix == "" {
+		return true
+	}
+	if !strings.HasPrefix(suffix, ".") || len(suffix) == 1 {
+		return false
+	}
+	for _, character := range suffix[1:] {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func recordedBaselineCoverageGap(value manifest, root rootManifest, path string) string {
@@ -350,6 +450,21 @@ func restoreWithAgentStateRoots(stateDir, sessionID string, selections, agentSta
 	if value.EndedAt.IsZero() {
 		return nil, fmt.Errorf("snapshot %s is incomplete because capture is still in progress and cannot be restored", sessionID)
 	}
+	execution := newRestoreExecution()
+	results, err := restoreChangesFromManifest(value, filepath.Join(stateDir, "snapshots", value.SessionID), selections, agentStateRoots, force, execution)
+	if err != nil {
+		return nil, err
+	}
+	return finishRestoreExecution(execution, results), nil
+}
+
+func restoreChangesFromManifest(
+	value manifest,
+	rootDirectory string,
+	selections, agentStateRoots []string,
+	force bool,
+	execution *restoreExecution,
+) ([]RestoreResult, error) {
 	selected, err := selectChanges(value.Changes, selections)
 	if err != nil {
 		return nil, err
@@ -360,14 +475,11 @@ func restoreWithAgentStateRoots(stateDir, sessionID string, selections, agentSta
 	}
 	selected, skipped := excludeImplicitAgentState(selected, selections, effectiveAgentStateRoots)
 	selected = orderRestoreChanges(selected)
-	rootDirectory := filepath.Join(stateDir, "snapshots", value.SessionID)
 	platform := currentSnapshotPlatform()
-	execution := newRestoreExecution()
 	results := restoreSelection(platform, selected, force, func(change Change) RestoreResult {
 		// Manifests written before restore-source tagging are clone-backed.
 		return restoreOne(rootDirectory, value, change, force, execution)
 	})
-	finishRestoreExecution(execution, results)
 	return append(results, skipped...), nil
 }
 
@@ -403,6 +515,48 @@ func RestoreRecorded(stateDir, sessionID string, summary Summary, selections []s
 		}
 	})
 	return append(results, skipped...), nil
+}
+
+// RestoreRecordedAndBaselines restores observed changes and the remaining
+// recorded baseline descendants with one command-scoped execution state. It is
+// used only for incomplete retained sessions.
+func RestoreRecordedAndBaselines(
+	stateDir, sessionID string,
+	observedSelections, baselineSelections, baselineExcludedPaths, agentStateRoots []string,
+	force bool,
+) ([]RestoreResult, error) {
+	resolved, err := resolveSessionID(stateDir, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	unlock, err := acquireSnapshotLock(stateDir, resolved, unix.LOCK_SH)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	snapshotRoot := filepath.Join(stateDir, "snapshots", resolved)
+	value, err := readManifest(snapshotRoot)
+	if err != nil {
+		return nil, err
+	}
+	if value.EndedAt.IsZero() {
+		return nil, fmt.Errorf("snapshot %s is incomplete because capture is still in progress and cannot be restored", sessionID)
+	}
+	execution := newRestoreExecution()
+	var results []RestoreResult
+	if len(observedSelections) > 0 {
+		observed, restoreErr := restoreChangesFromManifest(
+			value, snapshotRoot, observedSelections, agentStateRoots, force, execution,
+		)
+		if restoreErr != nil {
+			return nil, restoreErr
+		}
+		results = append(results, observed...)
+	}
+	results = append(results, restoreRecordedBaselinesFromManifest(
+		value, snapshotRoot, baselineSelections, baselineExcludedPaths, agentStateRoots, force, execution,
+	)...)
+	return finishRestoreExecution(execution, results), nil
 }
 
 func excludeImplicitAgentState(changes []Change, selections, agentStateRoots []string) ([]Change, []RestoreResult) {
@@ -693,7 +847,7 @@ func restoreMountedSnapshotObject(snapshotPath, destination string, metadata *En
 				return inspectErr
 			}
 			if !info.IsDir() {
-				return fmt.Errorf("restore directory %s: existing path has type %s", destination, info.Mode().Type())
+				return fmt.Errorf("restore directory %s: existing path has type %s; it is %s, not a directory", destination, fileTypeName(info.Mode()), fileTypeDescription(info.Mode()))
 			}
 		}
 		return applyMetadata(destination, *metadata)
@@ -946,6 +1100,32 @@ func selectChanges(changes []Change, selections []string) ([]Change, error) {
 	return selected, nil
 }
 
+// ResolveChangesForRestore resolves one user selection to the single absolute
+// path scope used by Restore and returns the recorded changes beneath it.
+func ResolveChangesForRestore(changes []Change, selection string) (string, []Change, error) {
+	paths := make([]string, 0, len(changes))
+	byAbsolute := make(map[string]Change, len(changes))
+	for _, change := range changes {
+		path := filepath.Clean(change.Path)
+		paths = append(paths, path)
+		byAbsolute[path] = change
+	}
+	selectionRoot, matched, err := resolveSelectionRoot(paths, selection, "changed path")
+	if err != nil {
+		return "", nil, err
+	}
+	if !matched {
+		return "", nil, fmt.Errorf("%q is not a changed path in this session", selection)
+	}
+	selected := make([]Change, 0)
+	for _, path := range paths {
+		if pathWithin(path, selectionRoot) {
+			selected = append(selected, byAbsolute[path])
+		}
+	}
+	return selectionRoot, selected, nil
+}
+
 func resolveSelectionRoot(paths []string, selection, noun string) (string, bool, error) {
 	absolute := selection
 	if !filepath.IsAbs(absolute) {
@@ -1094,9 +1274,9 @@ func newRestoreExecution() *restoreExecution {
 	}
 }
 
-func finishRestoreExecution(execution *restoreExecution, results []RestoreResult) {
+func finishRestoreExecution(execution *restoreExecution, results []RestoreResult) []RestoreResult {
 	if execution == nil {
-		return
+		return results
 	}
 	entries := make(map[string]Entry, len(execution.created)+len(execution.temporary))
 	for path, entry := range execution.temporary {
@@ -1120,21 +1300,27 @@ func finishRestoreExecution(execution *restoreExecution, results []RestoreResult
 		return paths[i] < paths[j]
 	})
 	for _, path := range paths {
+		observeRestoreMetadata(path)
 		if err := applyMetadata(path, entries[path]); err != nil {
-			attachRestoreFinalizationError(results, path, err)
+			results = attachRestoreFinalizationError(results, path, err)
 		}
 	}
+	return results
 }
 
-func attachRestoreFinalizationError(results []RestoreResult, directory string, err error) {
+func attachRestoreFinalizationError(results []RestoreResult, directory string, err error) []RestoreResult {
 	for index := range results {
-		if results[index].Path != directory && !pathWithin(results[index].Path, directory) {
+		if results[index].Path != directory {
 			continue
 		}
 		results[index].Status = "error"
 		results[index].Err = errors.Join(results[index].Err, fmt.Errorf("apply restored directory metadata for %s: %w", directory, err))
-		return
+		return results
 	}
+	return append(results, RestoreResult{
+		Path: directory, Status: "error",
+		Err: fmt.Errorf("apply restored directory metadata for %s: %w", directory, err),
+	})
 }
 
 func restoreSnapshotObject(snapshotPath, destination string, metadata *Entry, value manifest, execution *restoreExecution) error {
@@ -1155,7 +1341,7 @@ func restoreSnapshotObject(snapshotPath, destination string, metadata *Entry, va
 				return inspectErr
 			}
 			if !info.IsDir() {
-				return fmt.Errorf("restore directory %s: existing path has type %s", destination, info.Mode().Type())
+				return fmt.Errorf("restore directory %s: existing path has type %s; it is %s, not a directory", destination, fileTypeName(info.Mode()), fileTypeDescription(info.Mode()))
 			}
 		} else if execution != nil {
 			execution.created[destination] = *metadata
@@ -1169,6 +1355,32 @@ func restoreSnapshotObject(snapshotPath, destination string, metadata *Entry, va
 		return nil
 	}
 	return restoreSnapshotAtomically(snapshotPath, destination, metadata)
+}
+
+func fileTypeDescription(mode fs.FileMode) string {
+	switch {
+	case mode.IsRegular():
+		return "a regular file"
+	case mode.IsDir():
+		return "a directory"
+	case mode&os.ModeSymlink != 0:
+		return "a symlink"
+	case mode&os.ModeNamedPipe != 0:
+		return "a named pipe"
+	case mode&os.ModeSocket != 0:
+		return "a socket"
+	case mode&os.ModeDevice != 0 && mode&os.ModeCharDevice != 0:
+		return "a character device"
+	case mode&os.ModeDevice != 0:
+		return "a block device"
+	default:
+		return "an unsupported filesystem object"
+	}
+}
+
+func fileTypeName(mode fs.FileMode) string {
+	description := fileTypeDescription(mode)
+	return strings.TrimPrefix(strings.TrimPrefix(description, "a "), "an ")
 }
 
 func applyCreatedParentMetadata(created []restoredParent) error {

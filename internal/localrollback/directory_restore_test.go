@@ -222,6 +222,111 @@ func TestRestoreChildrenBeforeRevertingExistingDirectoryToWritableMode(t *testin
 	assertRollbackMode(t, directory, 0o700)
 }
 
+func TestRestoreNamedFileRestoresUnselectedReadOnlyAncestorMode(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(stateDir, func(path string, entry os.DirEntry, _ error) error {
+			if entry != nil && entry.IsDir() {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+	})
+	root := t.TempDir()
+	directory := filepath.Join(root, "read-only-ancestor")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(directory, "child.txt")
+	writeRollbackTestFile(t, file, "literal unselected ancestor baseline\n")
+	if err := os.Chmod(directory, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(directory, 0o700) })
+	session, _, err := StartScope(stateDir, "unselected-read-only-ancestor", Scope{Watched: []string{root}}, 1<<30, time.Unix(10, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRollbackTestFile(t, file, "literal unselected ancestor session bytes\n")
+	summary := session.Seal(time.Unix(20, 0))
+	if !summary.Complete || len(summary.Changes) != 1 || summary.Changes[0].Path != file {
+		t.Fatalf("read-only ancestor fixture = %#v, want one independently observed file change", summary)
+	}
+
+	results, err := Restore(stateDir, "unselected-read-only-ancestor", []string{file}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Path != file || results[0].Status != "restored" {
+		t.Fatalf("named-file results = %#v, want one restored file", results)
+	}
+	assertRollbackTestFile(t, file, "literal unselected ancestor baseline\n")
+	assertRollbackMode(t, directory, 0o555)
+}
+
+func TestDirectoryMetadataFailureHasItsOwnResult(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(stateDir, func(path string, entry os.DirEntry, _ error) error {
+			if entry != nil && entry.IsDir() {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+	})
+	root := t.TempDir()
+	directory := filepath.Join(root, "metadata-failure")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(directory, "child.txt")
+	writeRollbackTestFile(t, file, "literal metadata failure baseline\n")
+	if err := os.Chmod(directory, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	session, _, err := StartScope(stateDir, "metadata-failure-result", Scope{Watched: []string{root}}, 1<<30, time.Unix(10, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRollbackTestFile(t, file, "literal metadata failure session bytes\n")
+	summary := session.Seal(time.Unix(20, 0))
+	if !summary.Complete || len(summary.Changes) != 1 || summary.Changes[0].Path != file {
+		t.Fatalf("metadata failure fixture = %#v, want one independently observed file change", summary)
+	}
+
+	var bytesBeforeFailure string
+	restoreHook := SetRestoreMetadataHookForTest(func(path string) {
+		if path != directory {
+			return
+		}
+		data, readErr := os.ReadFile(file)
+		if readErr != nil {
+			t.Errorf("read child before metadata failure: %v", readErr)
+			return
+		}
+		bytesBeforeFailure = string(data)
+		if removeErr := os.RemoveAll(directory); removeErr != nil {
+			t.Errorf("remove directory before metadata application: %v", removeErr)
+		}
+	})
+	defer restoreHook()
+	results, err := Restore(stateDir, "metadata-failure-result", []string{file}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytesBeforeFailure != "literal metadata failure baseline\n" {
+		t.Fatalf("child bytes before metadata failure = %q, want literal baseline", bytesBeforeFailure)
+	}
+	byPath := restoreResultsByPath(results)
+	if byPath[file].Status != "restored" || byPath[file].Err != nil {
+		t.Fatalf("restored child result was rewritten: %#v", byPath[file])
+	}
+	if byPath[directory].Status != "error" || byPath[directory].Err == nil ||
+		!strings.Contains(byPath[directory].Err.Error(), "apply restored directory metadata") {
+		t.Fatalf("directory metadata result = %#v, want its own error", byPath[directory])
+	}
+}
+
 func TestRestoreNamedUnchangedDirectoryTouchesOnlyChangedDescendants(t *testing.T) {
 	stateDir := t.TempDir()
 	root := t.TempDir()

@@ -2986,10 +2986,21 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 	if !restoreAll {
 		observedSelections := make([]string, 0, len(selections))
 		for _, selection := range selections {
-			selected, selectionErr := localrollback.ChangesForRestore(record.Files.Changes, []string{selection})
+			resolvedSelection, selected, selectionErr := localrollback.ResolveChangesForRestore(record.Files.Changes, selection)
 			if selectionErr != nil {
 				if !record.Files.Complete {
-					baselineSelections = append(baselineSelections, selection)
+					if !record.Files.Retained {
+						baselineSelections = append(baselineSelections, selection)
+						continue
+					}
+					resolvedBaseline, baselineErr := localrollback.ResolveRecordedBaselineForRestore(store.StateDir(), record.ID, selection)
+					if baselineErr != nil {
+						selectionFailures = append(selectionFailures, localrollback.RestoreResult{
+							Path: selection, Status: "unavailable", Err: baselineErr,
+						})
+					} else {
+						baselineSelections = append(baselineSelections, resolvedBaseline)
+					}
 				} else {
 					selectionFailures = append(selectionFailures, localrollback.RestoreResult{
 						Path: selection, Status: "unavailable", Err: selectionErr,
@@ -2997,9 +3008,9 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 				}
 				continue
 			}
-			observedSelections = append(observedSelections, selection)
+			observedSelections = append(observedSelections, resolvedSelection)
 			if !record.Files.Complete {
-				baselineSelections = append(baselineSelections, selection)
+				baselineSelections = append(baselineSelections, resolvedSelection)
 				for _, change := range selected {
 					baselineExcludedPaths = append(baselineExcludedPaths, change.Path)
 				}
@@ -3029,7 +3040,20 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "unring: snapshot-only path: %s\n", humanPath(change.Path))
 	}
 	results := append([]localrollback.RestoreResult(nil), selectionFailures...)
-	if len(selections) > 0 {
+	combinedIncompleteRestore := len(baselineSelections) > 0 && record.Files.Retained
+	if combinedIncompleteRestore {
+		combinedResults, combinedErr := localrollback.RestoreRecordedAndBaselines(
+			store.StateDir(), record.ID, selections, baselineSelections, baselineExcludedPaths, agentStateRoots, force,
+		)
+		if combinedErr != nil {
+			for _, selection := range append(append([]string(nil), selections...), baselineSelections...) {
+				combinedResults = append(combinedResults, localrollback.RestoreResult{
+					Path: selection, Status: "error", Err: combinedErr,
+				})
+			}
+		}
+		results = append(results, combinedResults...)
+	} else if len(selections) > 0 {
 		var observedResults []localrollback.RestoreResult
 		restoreSummary := record.Files
 		restoreSummary.AgentStateRoots = agentStateRoots
@@ -3043,7 +3067,7 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		}
 		results = append(results, observedResults...)
 	}
-	if len(baselineSelections) > 0 {
+	if len(baselineSelections) > 0 && !combinedIncompleteRestore {
 		var baselineResults []localrollback.RestoreResult
 		if record.Files.Retained {
 			baselineResults, err = localrollback.RestoreRecordedBaselinesExcluding(
@@ -3088,7 +3112,9 @@ func restoreCommand(args []string, stdout, stderr io.Writer) int {
 		case "recorded-baseline-already-present":
 			fmt.Fprintf(stdout, "recorded baseline already present  %s — change list incomplete; unring cannot confirm what the session did to this path\n", humanPath(result.Path))
 		case "recorded-baseline-unrecorded-present":
+			exitCode = internalErrorExitCode
 			fmt.Fprintf(stdout, "left untouched  %s — not in the recorded baseline; it may be later user work\n", humanPath(result.Path))
+			fmt.Fprintf(stdout, "decision required  %s — unring cannot tell whether the session or the user created this path; it was left in place; the user must decide what to do with it\n", humanPath(result.Path))
 		case "recorded-baseline-refused":
 			exitCode = internalErrorExitCode
 			if result.Err != nil {

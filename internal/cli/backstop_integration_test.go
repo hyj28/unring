@@ -240,6 +240,9 @@ func TestCLIReportsEverySnapshotOnlyDirectoryDescendant(t *testing.T) {
 		if !strings.Contains(stdout.String(), "restored  "+path+"\n") {
 			t.Fatalf("snapshot-only result whole line missing for %s:\n%s", path, stdout.String())
 		}
+		if strings.Contains(stdout.String(), "already restored  "+path+"\n") {
+			t.Fatalf("snapshot-only result was also reported already restored for %s:\n%s", path, stdout.String())
+		}
 	}
 	assertTestFile(t, first, "literal CLI volume first\n")
 	assertTestFile(t, second, "literal CLI volume second\n")
